@@ -240,7 +240,7 @@ async function convert() {
 """
 
 
-# ── VTK-based WRL loader ──────────────────────────────────────────────────────────
+# ── VTK-based WRL loader ─────────────────────────────────────────────────────────
 
 def _load_wrl_with_vtk(src: Path):
     import vtk
@@ -251,7 +251,7 @@ def _load_wrl_with_vtk(src: Path):
 
     importer = vtk.vtkVRMLImporter()
     importer.SetFileName(str(src))
-    importer.Read()
+    importer.Update()  # correct method in modern VTK
 
     renderer = importer.GetRenderer()
     if not renderer:
@@ -268,7 +268,6 @@ def _load_wrl_with_vtk(src: Path):
             mapper.Update()
             pd = mapper.GetOutput()
             if pd and pd.GetNumberOfPoints() > 0:
-                # triangulate
                 tri = vtk.vtkTriangleFilter()
                 tri.SetInputData(pd)
                 tri.Update()
@@ -299,8 +298,6 @@ def _load_wrl_with_vtk(src: Path):
 
 
 def _load_and_simplify(src: Path, max_faces: int):
-    import trimesh
-
     mesh = _load_wrl_with_vtk(src)
 
     if len(mesh.faces) > max_faces:
