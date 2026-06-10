@@ -1,5 +1,5 @@
 """
-VRML / WRL → GLB / OBJ / STL Converter  (streaming parser v3)
+VRML / WRL → GLB / OBJ / STL Converter
 Usage:
     pip install flask trimesh[easy] numpy
     python app.py
@@ -22,7 +22,6 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024 * 1024
 
-# ── HTML ───────────────────────────────────────────────────────────────────
 HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -69,26 +68,26 @@ HTML = """
 <body>
 <div class="card">
   <h1>&#127922; VRML / WRL Converter</h1>
-  <p class="sub">Runs locally on CPU &mdash; no GPU needed &mdash; converts .wrl to .glb / .obj / .stl</p>
+  <p class="sub">Runs locally on CPU &mdash; no GPU needed</p>
   <label>1. Choose your WRL / VRML file</label>
   <div class="drop-zone" id="dropZone" onclick="document.getElementById('fileInput').click()">
     <input type="file" id="fileInput" accept=".wrl,.vrml" onchange="onFileChosen(this)"/>
     <div class="icon">&#128196;</div>
     <div>Click to browse or drag &amp; drop</div>
-    <div class="hint">Supports .wrl &amp; .vrml &mdash; any size</div>
+    <div class="hint">Supports .wrl &amp; .vrml</div>
     <div class="chosen" id="chosenName"></div>
   </div>
   <div class="row">
     <div class="field">
       <label>2. Output format</label>
       <select id="outFmt">
-        <option value="glb">GLB (recommended for 3D viewers)</option>
-        <option value="obj">OBJ (compatible with most apps)</option>
+        <option value="glb">GLB</option>
+        <option value="obj">OBJ</option>
         <option value="stl">STL</option>
       </select>
     </div>
     <div class="field">
-      <label>3. Max faces after simplify</label>
+      <label>3. Max faces</label>
       <input type="number" id="maxFaces" value="200000" min="5000" max="5000000" step="10000"/>
     </div>
   </div>
@@ -106,30 +105,30 @@ dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('dragover
 dz.addEventListener('dragleave',()=>dz.classList.remove('dragover'));
 dz.addEventListener('drop',e=>{e.preventDefault();dz.classList.remove('dragover');const f=e.dataTransfer.files[0];if(f)setFile(f);});
 function onFileChosen(i){if(i.files[0])setFile(i.files[0]);}
-function setFile(f){chosenFile=f;document.getElementById('chosenName').textContent=f.name+'  ('+formatBytes(f.size)+')';document.getElementById('convertBtn').disabled=false;}
-function formatBytes(b){if(b>1e9)return(b/1e9).toFixed(1)+' GB';if(b>1e6)return(b/1e6).toFixed(1)+' MB';return(b/1e3).toFixed(0)+' KB';}
+function setFile(f){chosenFile=f;document.getElementById('chosenName').textContent=f.name+'  ('+fmt(f.size)+')';document.getElementById('convertBtn').disabled=false;}
+function fmt(b){if(b>1e9)return(b/1e9).toFixed(1)+' GB';if(b>1e6)return(b/1e6).toFixed(1)+' MB';return(b/1e3).toFixed(0)+' KB';}
 async function convert(){
   if(!chosenFile)return;
   const btn=document.getElementById('convertBtn'),pw=document.getElementById('progressWrap'),
-        pf=document.getElementById('progressFill'),pl=document.getElementById('progressLabel'),
-        rb=document.getElementById('resultBox');
-  btn.disabled=true;rb.style.display='none';pw.style.display='block';pf.style.width='5%';pl.textContent='Uploading file…';
-  const fmt=document.getElementById('outFmt').value,maxFaces=parseInt(document.getElementById('maxFaces').value)||200000,form=new FormData();
-  form.append('file',chosenFile);form.append('out_format',fmt);form.append('max_faces',maxFaces);
+    pf=document.getElementById('progressFill'),pl=document.getElementById('progressLabel'),rb=document.getElementById('resultBox');
+  btn.disabled=true;rb.style.display='none';pw.style.display='block';pf.style.width='5%';pl.textContent='Uploading…';
+  const form=new FormData();
+  form.append('file',chosenFile);
+  form.append('out_format',document.getElementById('outFmt').value);
+  form.append('max_faces',document.getElementById('maxFaces').value);
   const xhr=new XMLHttpRequest();xhr.open('POST','/convert');xhr.responseType='blob';
   xhr.upload.onprogress=e=>{if(e.lengthComputable){const p=Math.round(e.loaded/e.total*50);pf.style.width=p+'%';pl.textContent='Uploading… '+p+'%';}};
-  let fakeP=50;
-  const ticker=setInterval(()=>{fakeP=Math.min(fakeP+(fakeP<70?2:fakeP<88?.8:.2),94);pf.style.width=fakeP+'%';pl.textContent='Converting… '+Math.round(fakeP)+'%';},600);
+  let fp=50;const tk=setInterval(()=>{fp=Math.min(fp+(fp<70?2:fp<88?.8:.2),94);pf.style.width=fp+'%';pl.textContent='Converting… '+Math.round(fp)+'%';},600);
   xhr.onload=()=>{
-    clearInterval(ticker);pf.style.width='100%';pl.textContent='Done!';btn.disabled=false;
+    clearInterval(tk);pf.style.width='100%';pl.textContent='Done!';btn.disabled=false;
     if(xhr.status===200){
       const url=URL.createObjectURL(xhr.response),base=chosenFile.name.replace(/\\.[^.]+$/,''),a=document.createElement('a');
-      a.href=url;a.download=base+'.'+fmt;a.click();URL.revokeObjectURL(url);
+      a.href=url;a.download=base+'.'+document.getElementById('outFmt').value;a.click();URL.revokeObjectURL(url);
       rb.className='result ok';rb.style.display='block';
-      rb.innerHTML='&#9989; Conversion complete! Download started.<br/><span class="stats">Output: '+formatBytes(xhr.response.size)+'</span>';
-    }else{xhr.response.text().then(txt=>{let msg='Conversion failed.';try{msg=JSON.parse(txt).detail||msg;}catch(_){}rb.className='result err';rb.style.display='block';rb.textContent='✗ '+msg;});}
+      rb.innerHTML='&#9989; Done! Download started. <span class="stats">'+fmt(xhr.response.size)+'</span>';
+    }else{xhr.response.text().then(t=>{let m='Conversion failed.';try{m=JSON.parse(t).detail||m;}catch(_){}rb.className='result err';rb.style.display='block';rb.textContent='✗ '+m;});}
   };
-  xhr.onerror=()=>{clearInterval(ticker);btn.disabled=false;rb.className='result err';rb.style.display='block';rb.textContent='✗ Network error.';};
+  xhr.onerror=()=>{clearInterval(tk);btn.disabled=false;rb.className='result err';rb.style.display='block';rb.textContent='✗ Network error.';};
   xhr.send(form);
 }
 </script>
@@ -137,284 +136,224 @@ async function convert(){
 """
 
 
-# ── Streaming VRML parser v3 ──────────────────────────────────────────────────────────
+# ── VRML parser: find every IndexedFaceSet regardless of nesting ─────────────────
 #
-# v3 fix: when '[' is encountered, fall back to _last_word if no keyword
-# appears before '[' on the current line.  This handles the common VRML
-# pattern where 'point' or 'coordIndex' sits on its own line and '[' is
-# on the next line.
+# Strategy that worked before:
+#   1. Read whole file into memory (fast for 102 MB; feasible for 2 GB on modern HW)
+#   2. Find every IndexedFaceSet { } block with balanced-brace extraction
+#   3. Inside each block find coordIndex [ ] and the nearest Coordinate point [ ]
+#   4. Also search backwards a small window for Material diffuseColor
 
-_NUM_RE  = re.compile(r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?')
-_WORD_RE = re.compile(r'[A-Za-z_]\w*')
+def _balanced_brackets(text: str, start: int) -> str:
+    """Return content of [ ] block opening at or after start."""
+    p = text.find('[', start)
+    if p == -1:
+        return ''
+    depth = 0
+    for i in range(p, len(text)):
+        if text[i] == '[': depth += 1
+        elif text[i] == ']':
+            depth -= 1
+            if depth == 0:
+                return text[p+1:i]
+    return ''
 
 
-def _last_word_before(line: str, pos: int) -> str:
-    m = re.search(r'([A-Za-z_]\w*)\s*$', line[:pos])
-    return m.group(1) if m else ''
+def _balanced_braces(text: str, start: int) -> tuple:
+    """Return (content, end_pos) of { } block opening at or after start."""
+    p = text.find('{', start)
+    if p == -1:
+        return '', -1
+    depth = 0
+    for i in range(p, len(text)):
+        if text[i] == '{': depth += 1
+        elif text[i] == '}':
+            depth -= 1
+            if depth == 0:
+                return text[p+1:i], i
+    return '', -1
 
 
-def _faces_from_coord_index(indices):
+def _parse_floats(s: str) -> list:
+    return [float(x) for x in re.findall(
+        r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?', s)]
+
+
+def _parse_ints(s: str) -> list:
+    return [int(x) for x in re.findall(r'-?\d+', s)]
+
+
+def _build_faces(indices: list) -> np.ndarray:
     faces, fan = [], []
     for idx in indices:
         if idx < 0:
             if len(fan) >= 3:
-                for j in range(1, len(fan) - 1):
-                    faces.append((fan[0], fan[j], fan[j + 1]))
+                for j in range(1, len(fan)-1):
+                    faces.append((fan[0], fan[j], fan[j+1]))
             fan = []
         else:
             fan.append(idx)
     if len(fan) >= 3:
-        for j in range(1, len(fan) - 1):
-            faces.append((fan[0], fan[j], fan[j + 1]))
-    return faces
+        for j in range(1, len(fan)-1):
+            faces.append((fan[0], fan[j], fan[j+1]))
+    return np.array(faces, dtype=np.int64) if faces else np.empty((0,3), dtype=np.int64)
 
-
-class _VRMLParser:
-
-    def __init__(self):
-        self._stack     = []
-        self._last_word = ''   # last identifier seen on any line
-
-        # bracket accumulator
-        self._bdepth = 0
-        self._bctx   = None   # 'point' | 'coordIndex' | None(skip)
-        self._bbuf   = []
-
-        # per-Shape data
-        self._points      = None
-        self._coord_index = None
-        self._color       = [200, 200, 200, 255]
-
-        # context flags
-        self._in_shape      = False
-        self._in_ifs        = False
-        self._in_appearance = False
-        self._in_material   = False
-        self._in_coordinate = False
-
-        self.meshes = []
-
-    def _stack_top(self):
-        return self._stack[-1] if self._stack else ''
-
-    def _emit(self):
-        import trimesh
-        if self._points and self._coord_index:
-            verts = np.array(self._points, dtype=np.float64).reshape(-1, 3)
-            face_list = _faces_from_coord_index(self._coord_index)
-            if face_list:
-                faces = np.array(face_list, dtype=np.int64)
-                valid = np.all((faces >= 0) & (faces < len(verts)), axis=1)
-                faces = faces[valid]
-                if len(faces):
-                    m = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
-                    m.visual.face_colors = list(self._color)
-                    self.meshes.append(m)
-                    logger.info("  Shape: %d verts  %d faces  rgba=%s",
-                                len(verts), len(faces), self._color)
-        self._points      = None
-        self._coord_index = None
-        self._color       = [200, 200, 200, 255]
-        self._in_shape      = False
-        self._in_ifs        = False
-        self._in_appearance = False
-        self._in_material   = False
-        self._in_coordinate = False
-
-    def feed_line(self, raw: str):
-        c = raw.find('#')
-        line = raw[:c] if c != -1 else raw
-
-        i = 0
-        n = len(line)
-
-        while i < n:
-            ch = line[i]
-
-            # ---- inside bracket accumulator ----
-            if self._bdepth > 0:
-                if ch == '[':
-                    self._bdepth += 1
-                elif ch == ']':
-                    self._bdepth -= 1
-                    if self._bdepth == 0:
-                        raw_buf = ''.join(self._bbuf)
-                        if self._bctx == 'point':
-                            self._points = [float(x) for x in _NUM_RE.findall(raw_buf)]
-                        elif self._bctx == 'coordIndex':
-                            self._coord_index = [int(x) for x in re.findall(r'-?\d+', raw_buf)]
-                        self._bbuf = []
-                        self._bctx = None
-                else:
-                    self._bbuf.append(ch)
-                i += 1
-                continue
-
-            # ---- brace open ----
-            if ch == '{':
-                kw = _last_word_before(line, i) or self._last_word
-                self._stack.append(kw)
-                if kw == 'Shape':
-                    self._in_shape = True
-                elif kw == 'IndexedFaceSet' and self._in_shape:
-                    self._in_ifs = True
-                elif kw == 'Appearance' and self._in_shape:
-                    self._in_appearance = True
-                elif kw == 'Material' and self._in_appearance:
-                    self._in_material = True
-                elif kw == 'Coordinate' and self._in_ifs:
-                    self._in_coordinate = True
-                i += 1
-                continue
-
-            # ---- brace close ----
-            if ch == '}':
-                top = self._stack_top()
-                if top == 'Shape':
-                    self._emit()
-                elif top == 'IndexedFaceSet':
-                    self._in_ifs = False
-                elif top == 'Appearance':
-                    self._in_appearance = False
-                elif top == 'Material':
-                    self._in_material = False
-                elif top == 'Coordinate':
-                    self._in_coordinate = False
-                if self._stack:
-                    self._stack.pop()
-                i += 1
-                continue
-
-            # ---- bracket open ----
-            if ch == '[':
-                self._bdepth = 1
-                self._bbuf   = []
-                # KEY FIX v3: fall back to _last_word when '[' is on its own line
-                field = _last_word_before(line, i) or self._last_word
-                if field == 'point' and (self._in_coordinate or self._in_ifs):
-                    self._bctx = 'point'
-                elif field == 'coordIndex' and self._in_ifs:
-                    self._bctx = 'coordIndex'
-                else:
-                    self._bctx = None
-                i += 1
-                continue
-
-            i += 1
-
-        # update last_word from this line
-        words = _WORD_RE.findall(line)
-        if words:
-            self._last_word = words[-1]
-
-        # material properties
-        if self._in_material:
-            m = re.search(
-                r'diffuseColor\s+([\d.eE+\-]+)\s+([\d.eE+\-]+)\s+([\d.eE+\-]+)', line)
-            if m:
-                self._color = [
-                    int(float(m.group(1)) * 255),
-                    int(float(m.group(2)) * 255),
-                    int(float(m.group(3)) * 255),
-                    self._color[3],
-                ]
-            t = re.search(r'transparency\s+([\d.eE+\-]+)', line)
-            if t:
-                self._color[3] = max(0, min(255, int((1.0 - float(t.group(1))) * 255)))
-
-    def parse_file(self, src: Path):
-        logger.info("Streaming %s  (%.1f MB) …", src.name, src.stat().st_size / 1e6)
-        with src.open(encoding='utf-8', errors='replace') as fh:
-            for lineno, line in enumerate(fh, 1):
-                self.feed_line(line)
-                if lineno % 500_000 == 0:
-                    logger.info("  … %dM lines  %d shapes so far",
-                                lineno // 1_000_000, len(self.meshes))
-        if self._in_shape:
-            self._emit()
-        logger.info("Parse done: %d shapes", len(self.meshes))
-
-
-# ── Load + simplify ───────────────────────────────────────────────────────────────
 
 def _parse_vrml(src: Path):
     import trimesh
-    p = _VRMLParser()
-    p.parse_file(src)
-    if not p.meshes:
-        raise ValueError("No IndexedFaceSet geometry found in the WRL file.")
-    combined = trimesh.util.concatenate(p.meshes)
-    logger.info("Combined: %d faces  %d verts", len(combined.faces), len(combined.vertices))
+
+    logger.info('Reading %s (%.1f MB) …', src.name, src.stat().st_size/1e6)
+    text = src.read_text(encoding='utf-8', errors='replace')
+    logger.info('Scanning for IndexedFaceSet blocks …')
+
+    meshes = []
+    search_pos = 0
+
+    for m in re.finditer(r'\bIndexedFaceSet\s*\{', text):
+        ifs_start = m.start()
+        block, end_pos = _balanced_braces(text, ifs_start)
+        if not block:
+            continue
+
+        # ---- coordIndex ----
+        ci_m = re.search(r'\bcoordIndex\s*\[', block)
+        if not ci_m:
+            continue
+        ci_content = _balanced_brackets(block, ci_m.start())
+        indices = _parse_ints(ci_content)
+        if not indices:
+            continue
+
+        # ---- point (inside this block or in Coordinate just before) ----
+        pt_content = ''
+        pt_m = re.search(r'\bpoint\s*\[', block)
+        if pt_m:
+            pt_content = _balanced_brackets(block, pt_m.start())
+        else:
+            # look backwards up to 50 000 chars for a Coordinate block
+            window_start = max(0, ifs_start - 50000)
+            window = text[window_start:ifs_start]
+            # find the LAST 'point [' in that window
+            for pm in re.finditer(r'\bpoint\s*\[', window):
+                pass
+            else:
+                pm = None
+            for pm in re.finditer(r'\bpoint\s*\[', window):
+                last_pm = pm
+            # use last match
+            try:
+                pt_content = _balanced_brackets(window, last_pm.start())
+            except Exception:
+                continue
+
+        floats = _parse_floats(pt_content)
+        if len(floats) < 9 or len(floats) % 3 != 0:
+            continue
+        verts = np.array(floats, dtype=np.float64).reshape(-1, 3)
+
+        faces = _build_faces(indices)
+        if len(faces) == 0:
+            continue
+        valid = np.all((faces >= 0) & (faces < len(verts)), axis=1)
+        faces = faces[valid]
+        if len(faces) == 0:
+            continue
+
+        mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+
+        # ---- material colour (search backwards 10 000 chars) ----
+        color = [200, 200, 200, 255]
+        back = text[max(0, ifs_start-10000):ifs_start]
+        dc = re.search(
+            r'diffuseColor\s+([\d.eE+\-]+)\s+([\d.eE+\-]+)\s+([\d.eE+\-]+)',
+            back)
+        if dc:
+            color = [
+                int(float(dc.group(1))*255),
+                int(float(dc.group(2))*255),
+                int(float(dc.group(3))*255),
+                255,
+            ]
+            tr = re.search(r'transparency\s+([\d.eE+\-]+)', back)
+            if tr:
+                color[3] = max(0, min(255, int((1-float(tr.group(1)))*255)))
+
+        mesh.visual.face_colors = color
+        meshes.append(mesh)
+        logger.info('  IFS: %d verts  %d faces  rgba=%s', len(verts), len(faces), color)
+
+    if not meshes:
+        raise ValueError('No IndexedFaceSet geometry found in the WRL file.')
+
+    combined = trimesh.util.concatenate(meshes)
+    logger.info('Combined: %d faces  %d verts  from %d meshes',
+                len(combined.faces), len(combined.vertices), len(meshes))
     return combined
 
 
 def _simplify(mesh, max_faces: int):
     if len(mesh.faces) <= max_faces:
         return mesh
-    logger.info("Simplifying to ~%d faces …", max_faces)
+    logger.info('Simplifying to ~%d faces …', max_faces)
     for method in ('simplify_quadric_decimation', 'simplify_quadratic_decimation'):
         if hasattr(mesh, method):
             try:
                 r = getattr(mesh, method)(max_faces)
-                logger.info("After simplification: %d faces", len(r.faces))
+                logger.info('After simplification: %d faces', len(r.faces))
                 return r
             except Exception as exc:
-                logger.warning("Simplification skipped: %s", exc)
+                logger.warning('Simplification skipped: %s', exc)
                 return mesh
     return mesh
-
-
-def _load_and_simplify(src: Path, max_faces: int):
-    return _simplify(_parse_vrml(src), max_faces)
 
 
 def _to_bytes(out) -> bytes:
     return out.encode('utf-8') if isinstance(out, str) else bytes(out)
 
 
-# ── Routes ─────────────────────────────────────────────────────────────────────
+# ── Routes ────────────────────────────────────────────────────────────────────
 
-@app.route("/")
+@app.route('/')
 def index():
     return render_template_string(HTML)
 
 
-@app.route("/convert", methods=["POST"])
+@app.route('/convert', methods=['POST'])
 def convert():
-    f = request.files.get("file")
+    f = request.files.get('file')
     if not f or not f.filename:
-        return jsonify(detail="No file received."), 400
-    ext = f.filename.rsplit(".", 1)[-1].lower()
-    if ext not in ("wrl", "vrml"):
-        return jsonify(detail=f"Only .wrl/.vrml supported (got .{ext})."), 400
-    out_format = request.form.get("out_format", "glb").lower()
-    if out_format not in ("glb", "obj", "stl"):
-        out_format = "glb"
-    max_faces = max(5000, min(int(request.form.get("max_faces", 200000)), 5_000_000))
+        return jsonify(detail='No file received.'), 400
+    ext = f.filename.rsplit('.', 1)[-1].lower()
+    if ext not in ('wrl', 'vrml'):
+        return jsonify(detail=f'Only .wrl/.vrml supported (got .{ext}).'), 400
+    out_format = request.form.get('out_format', 'glb').lower()
+    if out_format not in ('glb', 'obj', 'stl'):
+        out_format = 'glb'
+    max_faces = max(5000, min(int(request.form.get('max_faces', 200000)), 5_000_000))
 
     tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(suffix=f'.{ext}', delete=False) as tmp:
             tmp_path = Path(tmp.name)
             f.save(tmp)
-        mesh = _load_and_simplify(tmp_path, max_faces)
-        raw  = mesh.export(file_type=out_format)
+        mesh = _simplify(_parse_vrml(tmp_path), max_faces)
+        raw = mesh.export(file_type=out_format)
         out_bytes = _to_bytes(raw)
-        logger.info("Output: %.2f MB  %s", len(out_bytes) / 1e6, out_format)
-        mime = {"glb": "model/gltf-binary", "obj": "text/plain", "stl": "application/octet-stream"}[out_format]
+        logger.info('Output: %.2f MB  %s', len(out_bytes)/1e6, out_format)
+        mime = {'glb': 'model/gltf-binary', 'obj': 'text/plain', 'stl': 'application/octet-stream'}[out_format]
         return send_file(io.BytesIO(out_bytes), mimetype=mime,
-                         as_attachment=True, download_name=f"{Path(f.filename).stem}.{out_format}")
+                         as_attachment=True, download_name=f'{Path(f.filename).stem}.{out_format}')
     except ValueError as ve:
         return jsonify(detail=str(ve)), 422
     except Exception:
         logger.error(traceback.format_exc())
-        return jsonify(detail="Conversion failed — check terminal."), 500
+        return jsonify(detail='Conversion failed — check terminal.'), 500
     finally:
         if tmp_path and tmp_path.exists():
             try: tmp_path.unlink()
             except Exception: pass
 
 
-if __name__ == "__main__":
-    print("\n  VRML / WRL Converter  →  http://localhost:5555\n")
-    app.run(host="0.0.0.0", port=5555, debug=False)
+if __name__ == '__main__':
+    print('\n  VRML / WRL Converter  →  http://localhost:5555\n')
+    app.run(host='0.0.0.0', port=5555, debug=False)
