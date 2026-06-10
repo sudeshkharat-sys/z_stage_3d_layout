@@ -1,15 +1,14 @@
 """
-VRML / WRL → GLB / OBJ Converter
+VRML / WRL → GLB / OBJ / STL Converter
 Standalone local web app — runs on CPU, no GPU needed.
 Usage:
-    pip install flask trimesh[easy] numpy
+    pip install flask trimesh[easy] numpy vtk
     python app.py
 Then open http://localhost:5555 in your browser.
 """
 
 import io
 import logging
-import os
 import tempfile
 import traceback
 from pathlib import Path
@@ -20,9 +19,9 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024 * 1024  # allow up to 4 GB
+app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024 * 1024  # 4 GB
 
-# ── HTML page ──────────────────────────────────────────────────────────────────
+# ── HTML ──────────────────────────────────────────────────────────────────────
 
 HTML = """
 <!DOCTYPE html>
@@ -54,9 +53,7 @@ HTML = """
   }
   h1 { font-size: 1.6rem; color: #7dd3fc; margin-bottom: .25rem; }
   .sub { color: #94a3b8; font-size: .9rem; margin-bottom: 2rem; }
-
   label { display: block; font-size: .85rem; color: #94a3b8; margin-bottom: .4rem; }
-
   .drop-zone {
     border: 2px dashed #334155;
     border-radius: 12px;
@@ -66,15 +63,11 @@ HTML = """
     transition: border-color .2s, background .2s;
     margin-bottom: 1.5rem;
   }
-  .drop-zone:hover, .drop-zone.dragover {
-    border-color: #7dd3fc;
-    background: #0f172a;
-  }
+  .drop-zone:hover, .drop-zone.dragover { border-color: #7dd3fc; background: #0f172a; }
   .drop-zone input[type=file] { display: none; }
   .drop-zone .icon { font-size: 2.5rem; margin-bottom: .5rem; }
   .drop-zone .hint { color: #64748b; font-size: .85rem; margin-top: .4rem; }
   .drop-zone .chosen { color: #7dd3fc; font-weight: 600; margin-top: .6rem; font-size: .95rem; }
-
   .row { display: flex; gap: 1rem; margin-bottom: 1.5rem; }
   .field { flex: 1; }
   select, input[type=number] {
@@ -86,11 +79,7 @@ HTML = """
     padding: .55rem .75rem;
     font-size: .9rem;
   }
-  select:focus, input[type=number]:focus {
-    outline: none;
-    border-color: #7dd3fc;
-  }
-
+  select:focus, input[type=number]:focus { outline: none; border-color: #7dd3fc; }
   button {
     width: 100%;
     background: #0284c7;
@@ -105,15 +94,8 @@ HTML = """
   }
   button:hover { background: #0369a1; }
   button:disabled { background: #334155; color: #64748b; cursor: not-allowed; }
-
   .progress-wrap { margin-top: 1.5rem; display: none; }
-  .progress-bar {
-    background: #1e3a5f;
-    border-radius: 8px;
-    height: 10px;
-    overflow: hidden;
-    margin-bottom: .5rem;
-  }
+  .progress-bar { background: #1e3a5f; border-radius: 8px; height: 10px; overflow: hidden; margin-bottom: .5rem; }
   .progress-fill {
     height: 100%;
     background: linear-gradient(90deg, #0284c7, #7dd3fc);
@@ -122,24 +104,16 @@ HTML = """
     transition: width .3s ease;
   }
   .progress-label { font-size: .85rem; color: #94a3b8; text-align: center; }
-
-  .result {
-    margin-top: 1.5rem;
-    padding: 1rem 1.25rem;
-    border-radius: 10px;
-    font-size: .9rem;
-    display: none;
-  }
+  .result { margin-top: 1.5rem; padding: 1rem 1.25rem; border-radius: 10px; font-size: .9rem; display: none; }
   .result.ok  { background: #052e16; border: 1px solid #16a34a; color: #86efac; }
   .result.err { background: #2d0a0a; border: 1px solid #dc2626; color: #fca5a5; }
-
   .stats { margin-top: .6rem; font-size: .82rem; color: #64748b; }
 </style>
 </head>
 <body>
 <div class="card">
   <h1>&#127922; VRML / WRL Converter</h1>
-  <p class="sub">Runs locally on CPU &mdash; no GPU needed &mdash; converts .wrl to .glb or .obj</p>
+  <p class="sub">Runs locally on CPU &mdash; no GPU needed &mdash; converts .wrl to .glb / .obj / .stl</p>
 
   <label>1. Choose your WRL / VRML file</label>
   <div class="drop-zone" id="dropZone" onclick="document.getElementById('fileInput').click()">
@@ -171,14 +145,11 @@ HTML = """
     <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
     <div class="progress-label" id="progressLabel">Uploading…</div>
   </div>
-
   <div class="result" id="resultBox"></div>
 </div>
 
 <script>
 let chosenFile = null;
-
-// Drag-and-drop
 const dz = document.getElementById('dropZone');
 dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('dragover'); });
 dz.addEventListener('dragleave', () => dz.classList.remove('dragover'));
@@ -187,23 +158,17 @@ dz.addEventListener('drop', e => {
   const f = e.dataTransfer.files[0];
   if (f) setFile(f);
 });
-
-function onFileChosen(input) {
-  if (input.files[0]) setFile(input.files[0]);
-}
-
+function onFileChosen(input) { if (input.files[0]) setFile(input.files[0]); }
 function setFile(f) {
   chosenFile = f;
   document.getElementById('chosenName').textContent = f.name + '  (' + formatBytes(f.size) + ')';
   document.getElementById('convertBtn').disabled = false;
 }
-
 function formatBytes(b) {
   if (b > 1e9) return (b/1e9).toFixed(1) + ' GB';
   if (b > 1e6) return (b/1e6).toFixed(1) + ' MB';
   return (b/1e3).toFixed(0) + ' KB';
 }
-
 async function convert() {
   if (!chosenFile) return;
   const btn = document.getElementById('convertBtn');
@@ -211,56 +176,44 @@ async function convert() {
   const pf  = document.getElementById('progressFill');
   const pl  = document.getElementById('progressLabel');
   const rb  = document.getElementById('resultBox');
-
   btn.disabled = true;
   rb.style.display = 'none';
   pw.style.display = 'block';
   pf.style.width = '5%';
   pl.textContent = 'Uploading file…';
-
   const fmt      = document.getElementById('outFmt').value;
   const maxFaces = parseInt(document.getElementById('maxFaces').value) || 80000;
   const form     = new FormData();
   form.append('file', chosenFile);
   form.append('out_format', fmt);
   form.append('max_faces', maxFaces);
-
-  // Simulate progress while waiting (XHR gives real upload progress)
   const xhr = new XMLHttpRequest();
   xhr.open('POST', '/convert');
   xhr.responseType = 'blob';
-
   xhr.upload.onprogress = e => {
     if (e.lengthComputable) {
-      const pct = Math.round((e.loaded / e.total) * 50);  // upload = 0-50%
+      const pct = Math.round((e.loaded / e.total) * 50);
       pf.style.width = pct + '%';
       pl.textContent = 'Uploading… ' + pct + '%';
     }
   };
-
-  // Fake server-side progress 50→95%
   let fakeP = 50;
   const ticker = setInterval(() => {
     fakeP = Math.min(fakeP + (fakeP < 70 ? 2 : fakeP < 88 ? 0.8 : 0.2), 94);
     pf.style.width = fakeP + '%';
     pl.textContent = 'Converting on server… ' + Math.round(fakeP) + '%';
   }, 600);
-
   xhr.onload = () => {
     clearInterval(ticker);
     pf.style.width = '100%';
     pl.textContent = 'Done!';
     btn.disabled = false;
-
     if (xhr.status === 200) {
       const url  = URL.createObjectURL(xhr.response);
       const base = chosenFile.name.replace(/\\.[^.]+$/, '');
       const a    = document.createElement('a');
-      a.href     = url;
-      a.download = base + '.' + fmt;
-      a.click();
+      a.href = url; a.download = base + '.' + fmt; a.click();
       URL.revokeObjectURL(url);
-
       rb.className = 'result ok';
       rb.style.display = 'block';
       rb.innerHTML = '&#9989; Conversion complete! Download started.<br/>'
@@ -269,21 +222,16 @@ async function convert() {
       xhr.response.text().then(txt => {
         let msg = 'Conversion failed.';
         try { msg = JSON.parse(txt).detail || msg; } catch(_) {}
-        rb.className = 'result err';
-        rb.style.display = 'block';
+        rb.className = 'result err'; rb.style.display = 'block';
         rb.textContent = '✗ ' + msg;
       });
     }
   };
-
   xhr.onerror = () => {
-    clearInterval(ticker);
-    btn.disabled = false;
-    rb.className = 'result err';
-    rb.style.display = 'block';
+    clearInterval(ticker); btn.disabled = false;
+    rb.className = 'result err'; rb.style.display = 'block';
     rb.textContent = '✗ Network error. Is the server running?';
   };
-
   xhr.send(form);
 }
 </script>
@@ -292,25 +240,68 @@ async function convert() {
 """
 
 
-# ── Conversion logic ───────────────────────────────────────────────────────────
+# ── VTK-based WRL loader ──────────────────────────────────────────────────────────
+
+def _load_wrl_with_vtk(src: Path):
+    import vtk
+    import trimesh
+    import numpy as np
+
+    logger.info("Loading %s via VTK (%.1f MB) …", src.name, src.stat().st_size / 1e6)
+
+    importer = vtk.vtkVRMLImporter()
+    importer.SetFileName(str(src))
+    importer.Read()
+
+    renderer = importer.GetRenderer()
+    if not renderer:
+        raise ValueError("VTK could not read the VRML file.")
+
+    actors = renderer.GetActors()
+    actors.InitTraversal()
+
+    meshes = []
+    actor = actors.GetNextActor()
+    while actor:
+        mapper = actor.GetMapper()
+        if mapper:
+            mapper.Update()
+            pd = mapper.GetOutput()
+            if pd and pd.GetNumberOfPoints() > 0:
+                # triangulate
+                tri = vtk.vtkTriangleFilter()
+                tri.SetInputData(pd)
+                tri.Update()
+                pd = tri.GetOutput()
+
+                pts = pd.GetPoints()
+                n_pts = pts.GetNumberOfPoints()
+                verts = np.array([pts.GetPoint(i) for i in range(n_pts)], dtype=np.float64)
+
+                cells = pd.GetPolys()
+                cells.InitTraversal()
+                id_list = vtk.vtkIdList()
+                faces = []
+                while cells.GetNextCell(id_list):
+                    if id_list.GetNumberOfIds() == 3:
+                        faces.append([id_list.GetId(j) for j in range(3)])
+
+                if faces:
+                    meshes.append(trimesh.Trimesh(vertices=verts, faces=np.array(faces, dtype=np.int64)))
+        actor = actors.GetNextActor()
+
+    if not meshes:
+        raise ValueError("No renderable geometry found in the WRL file.")
+
+    combined = trimesh.util.concatenate(meshes)
+    logger.info("Loaded: %d faces, %d vertices", len(combined.faces), len(combined.vertices))
+    return combined
+
 
 def _load_and_simplify(src: Path, max_faces: int):
     import trimesh
 
-    logger.info("Loading %s  (%.1f MB) …", src.name, src.stat().st_size / 1e6)
-    scene = trimesh.load(str(src), force="scene")
-
-    if isinstance(scene, trimesh.Scene):
-        meshes = [g for g in scene.geometry.values() if isinstance(g, trimesh.Trimesh)]
-        if not meshes:
-            raise ValueError("No renderable geometry found in the WRL file.")
-        mesh = trimesh.util.concatenate(meshes)
-    elif isinstance(scene, trimesh.Trimesh):
-        mesh = scene
-    else:
-        raise ValueError(f"Unexpected trimesh type: {type(scene)}")
-
-    logger.info("Loaded: %d faces, %d vertices", len(mesh.faces), len(mesh.vertices))
+    mesh = _load_wrl_with_vtk(src)
 
     if len(mesh.faces) > max_faces:
         logger.info("Simplifying to ~%d faces …", max_faces)
