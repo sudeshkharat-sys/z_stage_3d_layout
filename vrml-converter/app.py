@@ -209,7 +209,6 @@ async function convert() {
 # ── VRML text parser ──────────────────────────────────────────────────────────────
 
 def _extract_bracket_content(text: str, start: int) -> str:
-    """Return text inside the [ ] block starting at or after `start`."""
     open_pos = text.find('[', start)
     if open_pos == -1:
         return ""
@@ -225,9 +224,7 @@ def _extract_bracket_content(text: str, start: int) -> str:
 
 
 def _parse_floats(s: str) -> np.ndarray:
-    return np.fromstring(
-        re.sub(r'[,\n\r\t]', ' ', s), dtype=np.float64, sep=' '
-    )
+    return np.fromstring(re.sub(r'[,\n\r\t]', ' ', s), dtype=np.float64, sep=' ')
 
 
 def _parse_ints(s: str) -> list:
@@ -235,7 +232,6 @@ def _parse_ints(s: str) -> list:
 
 
 def _faces_from_index(indices: list) -> np.ndarray:
-    """Convert VRML coordIndex (with -1 sentinels) to triangles."""
     faces = []
     fan = []
     for idx in indices:
@@ -260,12 +256,9 @@ def _parse_vrml(src: Path):
     logger.info("File loaded into memory, parsing geometry …")
 
     meshes = []
-
-    # Find every IndexedFaceSet block
     for m in re.finditer(r'IndexedFaceSet\s*\{', text):
         block_start = m.end()
 
-        # find coordIndex
         ci_match = re.search(r'coordIndex\s*\[', text[block_start:block_start + 200000])
         if not ci_match:
             continue
@@ -275,7 +268,6 @@ def _parse_vrml(src: Path):
         if not indices:
             continue
 
-        # find Coordinate point block (search backwards a bit, then forwards)
         search_zone = text[max(0, block_start - 5000): block_start + 500000]
         pt_match = re.search(r'point\s*\[', search_zone)
         if not pt_match:
@@ -291,7 +283,6 @@ def _parse_vrml(src: Path):
         if len(faces) == 0:
             continue
 
-        # clamp out-of-range indices
         valid = np.all((faces >= 0) & (faces < len(verts)), axis=1)
         faces = faces[valid]
         if len(faces) == 0:
@@ -311,18 +302,34 @@ def _parse_vrml(src: Path):
     return combined
 
 
+def _simplify(mesh, max_faces: int):
+    if len(mesh.faces) <= max_faces:
+        return mesh
+    logger.info("Simplifying to ~%d faces …", max_faces)
+    # try both method names across trimesh versions
+    for method in ('simplify_quadric_decimation', 'simplify_quadratic_decimation'):
+        if hasattr(mesh, method):
+            try:
+                result = getattr(mesh, method)(max_faces)
+                logger.info("After simplification: %d faces", len(result.faces))
+                return result
+            except Exception as exc:
+                logger.warning("Simplification failed (%s) — using original mesh", exc)
+                return mesh
+    logger.warning("No simplification method available — using original mesh")
+    return mesh
+
+
 def _load_and_simplify(src: Path, max_faces: int):
     mesh = _parse_vrml(src)
+    return _simplify(mesh, max_faces)
 
-    if len(mesh.faces) > max_faces:
-        logger.info("Simplifying to ~%d faces …", max_faces)
-        try:
-            mesh = mesh.simplify_quadratic_decimation(max_faces)
-            logger.info("After simplification: %d faces", len(mesh.faces))
-        except Exception as exc:
-            logger.warning("Simplification failed (%s) — using original mesh", exc)
 
-    return mesh
+def _to_bytes(out, fmt: str) -> bytes:
+    """Export trimesh to bytes, handling formats that return str."""
+    if isinstance(out, str):
+        return out.encode('utf-8')
+    return bytes(out)
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
@@ -357,7 +364,8 @@ def convert():
 
         mesh = _load_and_simplify(tmp_path, max_faces)
 
-        out_bytes = mesh.export(file_type=out_format)
+        raw = mesh.export(file_type=out_format)
+        out_bytes = _to_bytes(raw, out_format)
         logger.info("Output: %.2f MB  format=%s", len(out_bytes) / 1e6, out_format)
 
         mime = {
