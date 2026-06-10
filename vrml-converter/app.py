@@ -1,4 +1,4 @@
-"""VRML / WRL → GLB / OBJ / STL Converter  (DEF/USE support, fast brace-index)
+"""VRML / WRL → GLB / OBJ / STL Converter  (DEF/USE, LOD, Collision, bare USE)
 Usage:
     pip install flask trimesh[easy] numpy
     python app.py
@@ -138,7 +138,20 @@ async function convert(){
 # ── Compiled patterns ─────────────────────────────────────────────────────────────────────
 
 _FLT        = r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?'
-_NODE_RE    = re.compile(r'\b(Transform|Group|Separator|Switch|Shape|IndexedFaceSet)\s*\{')
+
+# Container nodes we descend into (added LOD, Collision, Billboard, Anchor, Inline-like)
+_CONTAINER  = frozenset({
+    'Transform','Group','Separator','Switch',
+    'LOD','Collision','Billboard','Anchor','Detail',
+})
+_SHAPE_LIKE = frozenset({'Shape','IndexedFaceSet'})
+
+_NODE_RE    = re.compile(
+    r'\b(Transform|Group|Separator|Switch|LOD|Collision|Billboard|Anchor|Detail'
+    r'|Shape|IndexedFaceSet)\s*\{'
+)
+# bare USE at statement level:  USE SomeName  (not inside a field value)
+_STMT_USE_RE = re.compile(r'(?:^|\n)\s*USE\s+(\S+)')
 _IFS_RE     = re.compile(r'\bIndexedFaceSet\s*\{')
 _CI_RE      = re.compile(r'\bcoordIndex\s*\[')
 _PT_RE      = re.compile(r'\bpoint\s*\[')
@@ -150,11 +163,8 @@ _DC_RE      = re.compile(rf'diffuseColor\s+({_FLT})\s+({_FLT})\s+({_FLT})')
 _TP_RE      = re.compile(rf'transparency\s+({_FLT})')
 _BRACE_RE   = re.compile(r'[{}]')
 _BRACKET_RE = re.compile(r'[\[\]]')
-# DEF name Coordinate / DEF name IndexedFaceSet
-_DEF_RE     = re.compile(r'\bDEF\s+(\S+)\s+(Coordinate|IndexedFaceSet|Shape)\s*\{')
-# USE name  (as value of coord / geometry field)
+_DEF_RE     = re.compile(r'\bDEF\s+(\S+)\s+(\w+)\s*\{')
 _USE_RE     = re.compile(r'\bUSE\s+(\S+)')
-# coord Coordinate { point [...] }   or   coord DEF name Coordinate { ... }
 _COORD_RE   = re.compile(r'\bcoord\b')
 
 
@@ -180,22 +190,23 @@ def _build_bracket_index(text):
     return index
 
 
-# ── DEF registry: scan entire file once for named nodes ──────────────────────────────
+# ── DEF registry ─────────────────────────────────────────────────────────────────────────
 
 def _build_def_registry(text, brace_idx):
     """
-    Returns {name: (content_start, content_end)} for every
-    DEF <name> Coordinate / IndexedFaceSet / Shape block.
+    {name: (node_type, content_start, content_end)}
+    Covers ALL DEF nodes so we can resolve any USE reference.
     """
     logger.info('Building DEF registry …')
     registry = {}
     for m in _DEF_RE.finditer(text):
-        name = m.group(1)
+        name      = m.group(1)
+        node_type = m.group(2)
         brace_start = text.find('{', m.start())
         if brace_start == -1: continue
         close = brace_idx.get(brace_start)
         if close is None: continue
-        registry[name] = (brace_start + 1, close)
+        registry[name] = (node_type, brace_start + 1, close)
     logger.info('DEF registry: %d named nodes', len(registry))
     return registry
 
@@ -247,23 +258,14 @@ def _bracket_pos(text, start, end, bracket_idx):
     return (p+1, close)
 
 
-# ── Point extraction (handles inline + DEF/USE) ───────────────────────────────────
+# ── Point extraction ──────────────────────────────────────────────────────────────────────
 
 def _get_points(text, cs, ce, brace_idx, bracket_idx, def_registry):
-    """
-    Find the vertex array for an IndexedFaceSet block (cs..ce).
-    Strategy:
-      1. Look for inline  coord Coordinate { point [...] }
-      2. Look for         coord USE <name>  then resolve from def_registry
-      3. Backwards search up to 200k chars for a bare  point [
-    Returns numpy float array or None.
-    """
-    # 1. inline Coordinate block inside IFS
+    # 1. inline point inside block
     pt_m = _PT_RE.search(text, cs, ce)
     if pt_m:
         pt_pos = _bracket_pos(text, pt_m.start(), ce, bracket_idx)
-        if pt_pos:
-            return _parse_floats(text, pt_pos)
+        if pt_pos: return _parse_floats(text, pt_pos)
 
     # 2. coord USE <name>
     coord_m = _COORD_RE.search(text, cs, ce)
@@ -272,32 +274,28 @@ def _get_points(text, cs, ce, brace_idx, bracket_idx, def_registry):
         if use_m:
             name = use_m.group(1)
             if name in def_registry:
-                dcs, dce = def_registry[name]
+                _, dcs, dce = def_registry[name]
                 pt_m2 = _PT_RE.search(text, dcs, dce)
                 if pt_m2:
                     pt_pos2 = _bracket_pos(text, pt_m2.start(), dce, bracket_idx)
-                    if pt_pos2:
-                        return _parse_floats(text, pt_pos2)
+                    if pt_pos2: return _parse_floats(text, pt_pos2)
 
-    # 3. backwards search (bare Coordinate node before IFS)
+    # 3. backwards search up to 200k
     ws = max(0, cs - 200000)
     last = None
     for lm in _PT_RE.finditer(text, ws, cs):
         last = lm
     if last:
         pt_pos3 = _bracket_pos(text, last.start(), last.start() + 200000, bracket_idx)
-        if pt_pos3:
-            return _parse_floats(text, pt_pos3)
+        if pt_pos3: return _parse_floats(text, pt_pos3)
 
     return None
 
 
 def _parse_floats(text, pos_tuple):
-    raw = text[pos_tuple[0]:pos_tuple[1]]
-    arr = np.fromiter((_NUM_RE.findall(raw)), dtype=object)
-    if len(arr) == 0: return None
-    floats = np.array(arr, dtype=np.float64)
-    return floats
+    nums = _NUM_RE.findall(text[pos_tuple[0]:pos_tuple[1]])
+    if not nums: return None
+    return np.array(nums, dtype=np.float64)
 
 
 # ── Geometry extraction ──────────────────────────────────────────────────────────────
@@ -317,32 +315,27 @@ def _build_faces(indices):
 
 
 def _extract_ifs(text, cs, ce, brace_idx, bracket_idx, def_registry):
-    # coordIndex
+    # coordIndex — try inline then USE
     ci_m = _CI_RE.search(text, cs, ce)
-    if not ci_m:
-        # Maybe coord USE points to an IFS DEF — check def_registry for coordIndex
-        coord_m = _COORD_RE.search(text, cs, ce)
-        if coord_m:
-            use_m = _USE_RE.search(text, coord_m.start(), min(coord_m.start()+100, ce))
-            if use_m and use_m.group(1) in def_registry:
-                dcs, dce = def_registry[use_m.group(1)]
-                ci_m = _CI_RE.search(text, dcs, dce)
-                if ci_m:
-                    ci_pos = _bracket_pos(text, ci_m.start(), dce, bracket_idx)
-                    if ci_pos:
-                        indices = [int(x) for x in re.findall(r'-?\d+', text[ci_pos[0]:ci_pos[1]])]
-                    else:
-                        return None
-                else:
-                    return None
+    if ci_m:
+        ci_pos = _bracket_pos(text, ci_m.start(), ce, bracket_idx)
+        if not ci_pos: return None
+        indices = [int(x) for x in re.findall(r'-?\d+', text[ci_pos[0]:ci_pos[1]])]
+    else:
+        # try geometry USE <name> pointing to another IFS
+        use_m = _USE_RE.search(text, cs, min(cs+200, ce))
+        if use_m and use_m.group(1) in def_registry:
+            _, dcs, dce = def_registry[use_m.group(1)]
+            ci_m2 = _CI_RE.search(text, dcs, dce)
+            if ci_m2:
+                ci_pos2 = _bracket_pos(text, ci_m2.start(), dce, bracket_idx)
+                if not ci_pos2: return None
+                indices = [int(x) for x in re.findall(r'-?\d+', text[ci_pos2[0]:ci_pos2[1]])]
+                cs, ce = dcs, dce  # switch context to DEF block for point lookup
             else:
                 return None
         else:
             return None
-    else:
-        ci_pos = _bracket_pos(text, ci_m.start(), ce, bracket_idx)
-        if not ci_pos: return None
-        indices = [int(x) for x in re.findall(r'-?\d+', text[ci_pos[0]:ci_pos[1]])]
 
     if not indices: return None
 
@@ -360,8 +353,56 @@ def _extract_ifs(text, cs, ce, brace_idx, bracket_idx, def_registry):
 
 # ── Iterative tree walker ───────────────────────────────────────────────────────────────────
 
-def _walk(text, meshes, brace_idx, bracket_idx, def_registry):
+def _process_shape(text, cs, ce, matrix, meshes, brace_idx, bracket_idx, def_registry, shape_pos):
     import trimesh
+    ifs_cs, ifs_ce = cs, ce
+
+    ifs_m = _IFS_RE.search(text, cs, ce)
+    if ifs_m:
+        bp2 = _brace_pos(text, ifs_m.start(), brace_idx)
+        if bp2: ifs_cs, ifs_ce = bp2
+    else:
+        # geometry USE <name>
+        use_m = _USE_RE.search(text, cs, min(cs+500, ce))
+        if use_m and use_m.group(1) in def_registry:
+            node_type, dcs, dce = def_registry[use_m.group(1)]
+            if node_type == 'IndexedFaceSet':
+                ifs_cs, ifs_ce = dcs, dce
+            elif node_type == 'Shape':
+                # recurse into the DEF'd Shape
+                _process_shape(text, dcs, dce, matrix, meshes,
+                               brace_idx, bracket_idx, def_registry, shape_pos)
+                return
+            else:
+                return
+        else:
+            return
+
+    result = _extract_ifs(text, ifs_cs, ifs_ce, brace_idx, bracket_idx, def_registry)
+    if not result: return
+
+    verts, faces = result
+    mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+    if not np.allclose(matrix, np.eye(4)):
+        mesh.apply_transform(matrix)
+
+    color = [200, 200, 200, 255]
+    back_s = max(0, shape_pos - 10000)
+    dc = _DC_RE.search(text, back_s, shape_pos)
+    if dc:
+        color = [int(float(dc.group(i))*255) for i in (1,2,3)] + [255]
+        tr2 = _TP_RE.search(text, back_s, shape_pos)
+        if tr2:
+            color[3] = max(0, min(255, int((1-float(tr2.group(1)))*255)))
+
+    mesh.visual.face_colors = color
+    meshes.append(mesh)
+    logger.info('  part: %d verts  %d faces  t=[%.2f,%.2f,%.2f]',
+                len(verts), len(faces), matrix[0,3], matrix[1,3], matrix[2,3])
+
+
+def _walk(text, meshes, brace_idx, bracket_idx, def_registry):
+    seen_use = set()  # avoid processing same DEF geometry twice via multiple USE refs
     stack = [(0, len(text), np.eye(4))]
 
     while stack:
@@ -369,15 +410,53 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_registry):
         pos = start
 
         while pos < end:
-            m = _NODE_RE.search(text, pos, end)
-            if not m: break
+            # Check for bare USE statement (e.g. children containing USE NodeName)
+            next_node = _NODE_RE.search(text, pos, end)
+            next_use  = _STMT_USE_RE.search(text, pos, end)
 
+            # Pick whichever comes first
+            use_first = (next_use and
+                         (next_node is None or next_use.start() < next_node.start()))
+
+            if use_first:
+                name = next_use.group(1)
+                if name in def_registry and name not in seen_use:
+                    seen_use.add(name)
+                    node_type, dcs, dce = def_registry[name]
+                    if node_type in _CONTAINER:
+                        child_matrix = matrix
+                        if node_type == 'Transform':
+                            child_matrix = matrix @ _transform_matrix(text, dcs, dce)
+                        stack.append((dcs, dce, child_matrix))
+                    elif node_type == 'Shape':
+                        _process_shape(text, dcs, dce, matrix, meshes,
+                                       brace_idx, bracket_idx, def_registry,
+                                       next_use.start())
+                    elif node_type == 'IndexedFaceSet':
+                        result = _extract_ifs(text, dcs, dce, brace_idx, bracket_idx, def_registry)
+                        if result:
+                            import trimesh
+                            verts, faces = result
+                            mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+                            if not np.allclose(matrix, np.eye(4)):
+                                mesh.apply_transform(matrix)
+                            mesh.visual.face_colors = [200, 200, 200, 255]
+                            meshes.append(mesh)
+                pos = next_use.end()
+                continue
+
+            if next_node is None:
+                break
+
+            m = next_node
             node = m.group(1)
             bp = _brace_pos(text, m.start(), brace_idx)
-            if not bp: break
+            if not bp:
+                pos = m.end()
+                continue
             cs, ce = bp
 
-            if node in ('Transform', 'Group', 'Separator', 'Switch'):
+            if node in _CONTAINER:
                 child_matrix = matrix
                 if node == 'Transform':
                     child_matrix = matrix @ _transform_matrix(text, cs, ce)
@@ -385,44 +464,28 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_registry):
                 pos = ce + 1
                 continue
 
-            elif node in ('Shape', 'IndexedFaceSet'):
+            elif node in _SHAPE_LIKE:
                 ifs_cs, ifs_ce = cs, ce
                 if node == 'Shape':
-                    ifs_m = _IFS_RE.search(text, cs, ce)
-                    if ifs_m:
-                        bp2 = _brace_pos(text, ifs_m.start(), brace_idx)
-                        if bp2: ifs_cs, ifs_ce = bp2
-                    else:
-                        # Shape with USE geometry reference
-                        use_m = _USE_RE.search(text, cs, min(cs+500, ce))
-                        if use_m and use_m.group(1) in def_registry:
-                            ifs_cs, ifs_ce = def_registry[use_m.group(1)]
-                        else:
-                            pos = ce + 1
-                            continue
-
-                result = _extract_ifs(text, ifs_cs, ifs_ce, brace_idx, bracket_idx, def_registry)
-                if result:
-                    verts, faces = result
-                    mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
-                    if not np.allclose(matrix, np.eye(4)):
-                        mesh.apply_transform(matrix)
-
-                    color = [200, 200, 200, 255]
-                    back_s = max(0, m.start() - 10000)
-                    dc = _DC_RE.search(text, back_s, m.start())
-                    if dc:
-                        color = [int(float(dc.group(i))*255) for i in (1,2,3)] + [255]
-                        tr2 = _TP_RE.search(text, back_s, m.start())
-                        if tr2:
-                            color[3] = max(0, min(255, int((1-float(tr2.group(1)))*255)))
-
-                    mesh.visual.face_colors = color
-                    meshes.append(mesh)
-                    logger.info('  part: %d verts  %d faces  t=[%.2f,%.2f,%.2f]',
-                                len(verts), len(faces),
-                                matrix[0,3], matrix[1,3], matrix[2,3])
-
+                    _process_shape(text, cs, ce, matrix, meshes,
+                                   brace_idx, bracket_idx, def_registry, m.start())
+                else:  # IndexedFaceSet directly
+                    result = _extract_ifs(text, cs, ce, brace_idx, bracket_idx, def_registry)
+                    if result:
+                        import trimesh
+                        verts, faces = result
+                        mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+                        if not np.allclose(matrix, np.eye(4)):
+                            mesh.apply_transform(matrix)
+                        color = [200, 200, 200, 255]
+                        back_s = max(0, m.start() - 10000)
+                        dc = _DC_RE.search(text, back_s, m.start())
+                        if dc:
+                            color = [int(float(dc.group(i))*255) for i in (1,2,3)] + [255]
+                        mesh.visual.face_colors = color
+                        meshes.append(mesh)
+                        logger.info('  part: %d verts  %d faces  t=[%.2f,%.2f,%.2f]',
+                                    len(verts), len(faces), matrix[0,3], matrix[1,3], matrix[2,3])
                 pos = ce + 1
                 continue
 
@@ -433,10 +496,10 @@ def _parse_vrml(src: Path):
     import trimesh
     logger.info('Reading %s (%.1f MB) …', src.name, src.stat().st_size/1e6)
     text = src.read_text(encoding='utf-8', errors='replace')
-    brace_idx   = _build_brace_index(text)
-    bracket_idx = _build_bracket_index(text)
+    brace_idx    = _build_brace_index(text)
+    bracket_idx  = _build_bracket_index(text)
     def_registry = _build_def_registry(text, brace_idx)
-    logger.info('Walking VRML tree (iterative) …')
+    logger.info('Walking VRML tree …')
     meshes = []
     _walk(text, meshes, brace_idx, bracket_idx, def_registry)
     if not meshes:
