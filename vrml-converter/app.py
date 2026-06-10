@@ -1,5 +1,5 @@
 """
-VRML / WRL → GLB / OBJ / STL Converter  (streaming parser v2)
+VRML / WRL → GLB / OBJ / STL Converter  (streaming parser v3)
 Usage:
     pip install flask trimesh[easy] numpy
     python app.py
@@ -23,7 +23,6 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024 * 1024
 
 # ── HTML ───────────────────────────────────────────────────────────────────
-
 HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -138,20 +137,18 @@ async function convert(){
 """
 
 
-# ── Streaming VRML parser v2 ──────────────────────────────────────────────────────────
+# ── Streaming VRML parser v3 ──────────────────────────────────────────────────────────
 #
-# Key fix: when we hit '{', look BACKWARDS on the current line for the
-# last identifier.  If the line is just '{', fall back to _last_word
-# carried from the previous line.  This avoids the off-by-one bug in v1
-# where _pending_keyword was set at end-of-line, after the '{' was
-# already processed.
+# v3 fix: when '[' is encountered, fall back to _last_word if no keyword
+# appears before '[' on the current line.  This handles the common VRML
+# pattern where 'point' or 'coordIndex' sits on its own line and '[' is
+# on the next line.
 
 _NUM_RE  = re.compile(r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?')
 _WORD_RE = re.compile(r'[A-Za-z_]\w*')
 
 
 def _last_word_before(line: str, pos: int) -> str:
-    """Last identifier on `line` strictly before index `pos`."""
     m = re.search(r'([A-Za-z_]\w*)\s*$', line[:pos])
     return m.group(1) if m else ''
 
@@ -175,41 +172,36 @@ def _faces_from_coord_index(indices):
 class _VRMLParser:
 
     def __init__(self):
-        self._stack     = []       # keyword pushed for each '{'
-        self._last_word = ''       # last identifier seen (for next-line '{')
+        self._stack     = []
+        self._last_word = ''   # last identifier seen on any line
 
         # bracket accumulator
         self._bdepth = 0
-        self._bctx   = None        # 'point' | 'coordIndex' | None
+        self._bctx   = None   # 'point' | 'coordIndex' | None(skip)
         self._bbuf   = []
 
-        # current Shape state
+        # per-Shape data
         self._points      = None
         self._coord_index = None
         self._color       = [200, 200, 200, 255]
 
-        # context flags (derived from stack)
+        # context flags
         self._in_shape      = False
-        self._in_ifs        = False   # IndexedFaceSet
+        self._in_ifs        = False
         self._in_appearance = False
         self._in_material   = False
         self._in_coordinate = False
 
         self.meshes = []
 
-    # ------------------------------------------------------------------ #
-
     def _stack_top(self):
         return self._stack[-1] if self._stack else ''
 
     def _emit(self):
-        """Build mesh from accumulated Shape data."""
         import trimesh
-        pts = self._points
-        idx = self._coord_index
-        if pts and idx:
-            verts = np.array(pts, dtype=np.float64).reshape(-1, 3)
-            face_list = _faces_from_coord_index(idx)
+        if self._points and self._coord_index:
+            verts = np.array(self._points, dtype=np.float64).reshape(-1, 3)
+            face_list = _faces_from_coord_index(self._coord_index)
             if face_list:
                 faces = np.array(face_list, dtype=np.int64)
                 valid = np.all((faces >= 0) & (faces < len(verts)), axis=1)
@@ -220,7 +212,6 @@ class _VRMLParser:
                     self.meshes.append(m)
                     logger.info("  Shape: %d verts  %d faces  rgba=%s",
                                 len(verts), len(faces), self._color)
-        # reset per-shape data
         self._points      = None
         self._coord_index = None
         self._color       = [200, 200, 200, 255]
@@ -230,10 +221,7 @@ class _VRMLParser:
         self._in_material   = False
         self._in_coordinate = False
 
-    # ------------------------------------------------------------------ #
-
     def feed_line(self, raw: str):
-        # strip comment
         c = raw.find('#')
         line = raw[:c] if c != -1 else raw
 
@@ -255,8 +243,8 @@ class _VRMLParser:
                             self._points = [float(x) for x in _NUM_RE.findall(raw_buf)]
                         elif self._bctx == 'coordIndex':
                             self._coord_index = [int(x) for x in re.findall(r'-?\d+', raw_buf)]
-                        self._bbuf  = []
-                        self._bctx  = None
+                        self._bbuf = []
+                        self._bctx = None
                 else:
                     self._bbuf.append(ch)
                 i += 1
@@ -266,7 +254,6 @@ class _VRMLParser:
             if ch == '{':
                 kw = _last_word_before(line, i) or self._last_word
                 self._stack.append(kw)
-
                 if kw == 'Shape':
                     self._in_shape = True
                 elif kw == 'IndexedFaceSet' and self._in_shape:
@@ -277,7 +264,6 @@ class _VRMLParser:
                     self._in_material = True
                 elif kw == 'Coordinate' and self._in_ifs:
                     self._in_coordinate = True
-
                 i += 1
                 continue
 
@@ -303,24 +289,25 @@ class _VRMLParser:
             if ch == '[':
                 self._bdepth = 1
                 self._bbuf   = []
-                field = _last_word_before(line, i)
+                # KEY FIX v3: fall back to _last_word when '[' is on its own line
+                field = _last_word_before(line, i) or self._last_word
                 if field == 'point' and (self._in_coordinate or self._in_ifs):
                     self._bctx = 'point'
                 elif field == 'coordIndex' and self._in_ifs:
                     self._bctx = 'coordIndex'
                 else:
-                    self._bctx = None   # skip
+                    self._bctx = None
                 i += 1
                 continue
 
             i += 1
 
-        # track last word on this line (used when next line is just '{')
+        # update last_word from this line
         words = _WORD_RE.findall(line)
         if words:
             self._last_word = words[-1]
 
-        # material properties (only meaningful inside Material {})
+        # material properties
         if self._in_material:
             m = re.search(
                 r'diffuseColor\s+([\d.eE+\-]+)\s+([\d.eE+\-]+)\s+([\d.eE+\-]+)', line)
@@ -335,21 +322,20 @@ class _VRMLParser:
             if t:
                 self._color[3] = max(0, min(255, int((1.0 - float(t.group(1))) * 255)))
 
-    # ------------------------------------------------------------------ #
-
     def parse_file(self, src: Path):
         logger.info("Streaming %s  (%.1f MB) …", src.name, src.stat().st_size / 1e6)
         with src.open(encoding='utf-8', errors='replace') as fh:
             for lineno, line in enumerate(fh, 1):
                 self.feed_line(line)
                 if lineno % 500_000 == 0:
-                    logger.info("  … %d lines  %d shapes so far", lineno, len(self.meshes))
-        if self._in_shape:      # flush unclosed Shape at EOF
+                    logger.info("  … %dM lines  %d shapes so far",
+                                lineno // 1_000_000, len(self.meshes))
+        if self._in_shape:
             self._emit()
         logger.info("Parse done: %d shapes", len(self.meshes))
 
 
-# ── Load + simplify ─────────────────────────────────────────────────────────────────
+# ── Load + simplify ───────────────────────────────────────────────────────────────
 
 def _parse_vrml(src: Path):
     import trimesh
