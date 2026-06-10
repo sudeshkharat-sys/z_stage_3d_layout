@@ -2,17 +2,19 @@
 VRML / WRL → GLB / OBJ / STL Converter
 Standalone local web app — runs on CPU, no GPU needed.
 Usage:
-    pip install flask trimesh[easy] numpy vtk
+    pip install flask trimesh[easy] numpy
     python app.py
 Then open http://localhost:5555 in your browser.
 """
 
 import io
 import logging
+import re
 import tempfile
 import traceback
 from pathlib import Path
 
+import numpy as np
 from flask import Flask, jsonify, render_template_string, request, send_file
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
@@ -21,7 +23,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024 * 1024  # 4 GB
 
-# ── HTML ──────────────────────────────────────────────────────────────────────
+# ── HTML ─────────────────────────────────────────────────────────────────────
 
 HTML = """
 <!DOCTYPE html>
@@ -34,34 +36,23 @@ HTML = """
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
     font-family: 'Segoe UI', sans-serif;
-    background: #0f172a;
-    color: #e2e8f0;
-    min-height: 100vh;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 2rem;
+    background: #0f172a; color: #e2e8f0;
+    min-height: 100vh; display: flex;
+    align-items: center; justify-content: center; padding: 2rem;
   }
   .card {
-    background: #1e293b;
-    border: 1px solid #334155;
-    border-radius: 16px;
-    padding: 2.5rem;
-    width: 100%;
-    max-width: 560px;
+    background: #1e293b; border: 1px solid #334155;
+    border-radius: 16px; padding: 2.5rem;
+    width: 100%; max-width: 560px;
     box-shadow: 0 20px 60px rgba(0,0,0,0.5);
   }
   h1 { font-size: 1.6rem; color: #7dd3fc; margin-bottom: .25rem; }
   .sub { color: #94a3b8; font-size: .9rem; margin-bottom: 2rem; }
   label { display: block; font-size: .85rem; color: #94a3b8; margin-bottom: .4rem; }
   .drop-zone {
-    border: 2px dashed #334155;
-    border-radius: 12px;
-    padding: 2.5rem;
-    text-align: center;
-    cursor: pointer;
-    transition: border-color .2s, background .2s;
-    margin-bottom: 1.5rem;
+    border: 2px dashed #334155; border-radius: 12px;
+    padding: 2.5rem; text-align: center; cursor: pointer;
+    transition: border-color .2s, background .2s; margin-bottom: 1.5rem;
   }
   .drop-zone:hover, .drop-zone.dragover { border-color: #7dd3fc; background: #0f172a; }
   .drop-zone input[type=file] { display: none; }
@@ -71,37 +62,22 @@ HTML = """
   .row { display: flex; gap: 1rem; margin-bottom: 1.5rem; }
   .field { flex: 1; }
   select, input[type=number] {
-    width: 100%;
-    background: #0f172a;
-    border: 1px solid #334155;
-    border-radius: 8px;
-    color: #e2e8f0;
-    padding: .55rem .75rem;
-    font-size: .9rem;
+    width: 100%; background: #0f172a; border: 1px solid #334155;
+    border-radius: 8px; color: #e2e8f0; padding: .55rem .75rem; font-size: .9rem;
   }
   select:focus, input[type=number]:focus { outline: none; border-color: #7dd3fc; }
   button {
-    width: 100%;
-    background: #0284c7;
-    color: #fff;
-    border: none;
-    border-radius: 10px;
-    padding: .85rem;
-    font-size: 1rem;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background .2s;
+    width: 100%; background: #0284c7; color: #fff; border: none;
+    border-radius: 10px; padding: .85rem; font-size: 1rem;
+    font-weight: 600; cursor: pointer; transition: background .2s;
   }
   button:hover { background: #0369a1; }
   button:disabled { background: #334155; color: #64748b; cursor: not-allowed; }
   .progress-wrap { margin-top: 1.5rem; display: none; }
   .progress-bar { background: #1e3a5f; border-radius: 8px; height: 10px; overflow: hidden; margin-bottom: .5rem; }
   .progress-fill {
-    height: 100%;
-    background: linear-gradient(90deg, #0284c7, #7dd3fc);
-    border-radius: 8px;
-    width: 0%;
-    transition: width .3s ease;
+    height: 100%; background: linear-gradient(90deg, #0284c7, #7dd3fc);
+    border-radius: 8px; width: 0%; transition: width .3s ease;
   }
   .progress-label { font-size: .85rem; color: #94a3b8; text-align: center; }
   .result { margin-top: 1.5rem; padding: 1rem 1.25rem; border-radius: 10px; font-size: .9rem; display: none; }
@@ -155,8 +131,7 @@ dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('dra
 dz.addEventListener('dragleave', () => dz.classList.remove('dragover'));
 dz.addEventListener('drop', e => {
   e.preventDefault(); dz.classList.remove('dragover');
-  const f = e.dataTransfer.files[0];
-  if (f) setFile(f);
+  const f = e.dataTransfer.files[0]; if (f) setFile(f);
 });
 function onFileChosen(input) { if (input.files[0]) setFile(input.files[0]); }
 function setFile(f) {
@@ -172,29 +147,25 @@ function formatBytes(b) {
 async function convert() {
   if (!chosenFile) return;
   const btn = document.getElementById('convertBtn');
-  const pw  = document.getElementById('progressWrap');
-  const pf  = document.getElementById('progressFill');
-  const pl  = document.getElementById('progressLabel');
-  const rb  = document.getElementById('resultBox');
-  btn.disabled = true;
-  rb.style.display = 'none';
-  pw.style.display = 'block';
-  pf.style.width = '5%';
+  const pw = document.getElementById('progressWrap');
+  const pf = document.getElementById('progressFill');
+  const pl = document.getElementById('progressLabel');
+  const rb = document.getElementById('resultBox');
+  btn.disabled = true; rb.style.display = 'none';
+  pw.style.display = 'block'; pf.style.width = '5%';
   pl.textContent = 'Uploading file…';
-  const fmt      = document.getElementById('outFmt').value;
+  const fmt = document.getElementById('outFmt').value;
   const maxFaces = parseInt(document.getElementById('maxFaces').value) || 80000;
-  const form     = new FormData();
+  const form = new FormData();
   form.append('file', chosenFile);
   form.append('out_format', fmt);
   form.append('max_faces', maxFaces);
   const xhr = new XMLHttpRequest();
-  xhr.open('POST', '/convert');
-  xhr.responseType = 'blob';
+  xhr.open('POST', '/convert'); xhr.responseType = 'blob';
   xhr.upload.onprogress = e => {
     if (e.lengthComputable) {
       const pct = Math.round((e.loaded / e.total) * 50);
-      pf.style.width = pct + '%';
-      pl.textContent = 'Uploading… ' + pct + '%';
+      pf.style.width = pct + '%'; pl.textContent = 'Uploading… ' + pct + '%';
     }
   };
   let fakeP = 50;
@@ -204,26 +175,21 @@ async function convert() {
     pl.textContent = 'Converting on server… ' + Math.round(fakeP) + '%';
   }, 600);
   xhr.onload = () => {
-    clearInterval(ticker);
-    pf.style.width = '100%';
-    pl.textContent = 'Done!';
-    btn.disabled = false;
+    clearInterval(ticker); pf.style.width = '100%'; pl.textContent = 'Done!'; btn.disabled = false;
     if (xhr.status === 200) {
-      const url  = URL.createObjectURL(xhr.response);
+      const url = URL.createObjectURL(xhr.response);
       const base = chosenFile.name.replace(/\\.[^.]+$/, '');
-      const a    = document.createElement('a');
+      const a = document.createElement('a');
       a.href = url; a.download = base + '.' + fmt; a.click();
       URL.revokeObjectURL(url);
-      rb.className = 'result ok';
-      rb.style.display = 'block';
+      rb.className = 'result ok'; rb.style.display = 'block';
       rb.innerHTML = '&#9989; Conversion complete! Download started.<br/>'
         + '<span class="stats">Output size: ' + formatBytes(xhr.response.size) + '</span>';
     } else {
       xhr.response.text().then(txt => {
         let msg = 'Conversion failed.';
         try { msg = JSON.parse(txt).detail || msg; } catch(_) {}
-        rb.className = 'result err'; rb.style.display = 'block';
-        rb.textContent = '✗ ' + msg;
+        rb.className = 'result err'; rb.style.display = 'block'; rb.textContent = '✗ ' + msg;
       });
     }
   };
@@ -240,65 +206,113 @@ async function convert() {
 """
 
 
-# ── VTK-based WRL loader ─────────────────────────────────────────────────────────
+# ── VRML text parser ──────────────────────────────────────────────────────────────
 
-def _load_wrl_with_vtk(src: Path):
-    import vtk
+def _extract_bracket_content(text: str, start: int) -> str:
+    """Return text inside the [ ] block starting at or after `start`."""
+    open_pos = text.find('[', start)
+    if open_pos == -1:
+        return ""
+    depth = 0
+    for i in range(open_pos, len(text)):
+        if text[i] == '[':
+            depth += 1
+        elif text[i] == ']':
+            depth -= 1
+            if depth == 0:
+                return text[open_pos + 1:i]
+    return ""
+
+
+def _parse_floats(s: str) -> np.ndarray:
+    return np.fromstring(
+        re.sub(r'[,\n\r\t]', ' ', s), dtype=np.float64, sep=' '
+    )
+
+
+def _parse_ints(s: str) -> list:
+    return [int(x) for x in re.findall(r'-?\d+', s)]
+
+
+def _faces_from_index(indices: list) -> np.ndarray:
+    """Convert VRML coordIndex (with -1 sentinels) to triangles."""
+    faces = []
+    fan = []
+    for idx in indices:
+        if idx == -1:
+            if len(fan) >= 3:
+                for j in range(1, len(fan) - 1):
+                    faces.append([fan[0], fan[j], fan[j + 1]])
+            fan = []
+        else:
+            fan.append(idx)
+    if len(fan) >= 3:
+        for j in range(1, len(fan) - 1):
+            faces.append([fan[0], fan[j], fan[j + 1]])
+    return np.array(faces, dtype=np.int64) if faces else np.empty((0, 3), dtype=np.int64)
+
+
+def _parse_vrml(src: Path):
     import trimesh
-    import numpy as np
 
-    logger.info("Loading %s via VTK (%.1f MB) …", src.name, src.stat().st_size / 1e6)
-
-    importer = vtk.vtkVRMLImporter()
-    importer.SetFileName(str(src))
-    importer.Update()  # correct method in modern VTK
-
-    renderer = importer.GetRenderer()
-    if not renderer:
-        raise ValueError("VTK could not read the VRML file.")
-
-    actors = renderer.GetActors()
-    actors.InitTraversal()
+    logger.info("Reading %s (%.1f MB) …", src.name, src.stat().st_size / 1e6)
+    text = src.read_text(encoding='utf-8', errors='replace')
+    logger.info("File loaded into memory, parsing geometry …")
 
     meshes = []
-    actor = actors.GetNextActor()
-    while actor:
-        mapper = actor.GetMapper()
-        if mapper:
-            mapper.Update()
-            pd = mapper.GetOutput()
-            if pd and pd.GetNumberOfPoints() > 0:
-                tri = vtk.vtkTriangleFilter()
-                tri.SetInputData(pd)
-                tri.Update()
-                pd = tri.GetOutput()
 
-                pts = pd.GetPoints()
-                n_pts = pts.GetNumberOfPoints()
-                verts = np.array([pts.GetPoint(i) for i in range(n_pts)], dtype=np.float64)
+    # Find every IndexedFaceSet block
+    for m in re.finditer(r'IndexedFaceSet\s*\{', text):
+        block_start = m.end()
 
-                cells = pd.GetPolys()
-                cells.InitTraversal()
-                id_list = vtk.vtkIdList()
-                faces = []
-                while cells.GetNextCell(id_list):
-                    if id_list.GetNumberOfIds() == 3:
-                        faces.append([id_list.GetId(j) for j in range(3)])
+        # find coordIndex
+        ci_match = re.search(r'coordIndex\s*\[', text[block_start:block_start + 200000])
+        if not ci_match:
+            continue
+        ci_abs = block_start + ci_match.start()
+        ci_content = _extract_bracket_content(text, ci_abs)
+        indices = _parse_ints(ci_content)
+        if not indices:
+            continue
 
-                if faces:
-                    meshes.append(trimesh.Trimesh(vertices=verts, faces=np.array(faces, dtype=np.int64)))
-        actor = actors.GetNextActor()
+        # find Coordinate point block (search backwards a bit, then forwards)
+        search_zone = text[max(0, block_start - 5000): block_start + 500000]
+        pt_match = re.search(r'point\s*\[', search_zone)
+        if not pt_match:
+            continue
+        pt_abs = max(0, block_start - 5000) + pt_match.start()
+        pt_content = _extract_bracket_content(text, pt_abs)
+        floats = _parse_floats(pt_content)
+        if floats.size < 9 or floats.size % 3 != 0:
+            continue
+        verts = floats.reshape(-1, 3)
+
+        faces = _faces_from_index(indices)
+        if len(faces) == 0:
+            continue
+
+        # clamp out-of-range indices
+        valid = np.all((faces >= 0) & (faces < len(verts)), axis=1)
+        faces = faces[valid]
+        if len(faces) == 0:
+            continue
+
+        meshes.append(trimesh.Trimesh(vertices=verts, faces=faces, process=False))
+        logger.info("  Mesh: %d verts, %d faces", len(verts), len(faces))
 
     if not meshes:
-        raise ValueError("No renderable geometry found in the WRL file.")
+        raise ValueError(
+            "No IndexedFaceSet geometry found in the WRL file. "
+            "The file may use a different VRML geometry type."
+        )
 
     combined = trimesh.util.concatenate(meshes)
-    logger.info("Loaded: %d faces, %d vertices", len(combined.faces), len(combined.vertices))
+    logger.info("Total: %d faces, %d vertices", len(combined.faces), len(combined.vertices))
     return combined
 
 
 def _load_and_simplify(src: Path, max_faces: int):
-    mesh = _load_wrl_with_vtk(src)
+    mesh = _parse_vrml(src)
 
     if len(mesh.faces) > max_faces:
         logger.info("Simplifying to ~%d faces …", max_faces)
