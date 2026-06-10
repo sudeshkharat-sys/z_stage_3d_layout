@@ -1,4 +1,8 @@
-"""VRML / WRL → GLB / OBJ / STL Converter  (DEF/USE, LOD, Collision, bare USE)
+"""VRML 1.0 / WRL → GLB / OBJ / STL Converter
+
+Supports VRML 1.0 (Open Inventor) format:
+  Separator { MatrixTransform { matrix 16f } Coordinate3 { point [...] } IndexedFaceSet { coordIndex [...] } }
+
 Usage:
     pip install flask trimesh[easy] numpy
     python app.py
@@ -73,7 +77,7 @@ HTML = """
     <input type="file" id="fileInput" accept=".wrl,.vrml" onchange="onFileChosen(this)"/>
     <div class="icon">&#128196;</div>
     <div>Click to browse or drag &amp; drop</div>
-    <div class="hint">Supports .wrl &amp; .vrml</div>
+    <div class="hint">Supports .wrl &amp; .vrml &mdash; VRML 1.0 &amp; 2.0</div>
     <div class="chosen" id="chosenName"></div>
   </div>
   <div class="row">
@@ -135,89 +139,97 @@ async function convert(){
 """
 
 
-# ── Compiled patterns ─────────────────────────────────────────────────────────────────────
+# ── Compiled patterns ──────────────────────────────────────────────────────
 
-_FLT        = r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?'
+_FLT         = r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?'
+_NUM_RE      = re.compile(r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?')
+_BRACE_RE    = re.compile(r'[{}]')
+_BRACKET_RE  = re.compile(r'[\[\]]')
 
-# Container nodes we descend into (added LOD, Collision, Billboard, Anchor, Inline-like)
-_CONTAINER  = frozenset({
-    'Transform','Group','Separator','Switch',
-    'LOD','Collision','Billboard','Anchor','Detail',
-})
-_SHAPE_LIKE = frozenset({'Shape','IndexedFaceSet'})
+# VRML 1.0 node patterns
+_SEP_RE      = re.compile(r'\b(Separator|Group|LOD|Switch|TransformSeparator)\s*\{')
+_MTX_RE      = re.compile(r'\bMatrixTransform\s*\{')
+_TRANS_RE    = re.compile(r'\bTransform\s*\{')          # VRML 1.0 Transform (different from 2.0)
+_COORD3_RE   = re.compile(r'\bCoordinate3\s*\{')
+_IFS_RE      = re.compile(r'\bIndexedFaceSet\s*\{')
+_MAT_RE      = re.compile(r'\bMaterial\s*\{')
+_PT_RE       = re.compile(r'\bpoint\s*\[')
+_CI_RE       = re.compile(r'\bcoordIndex\s*\[')
 
-_NODE_RE    = re.compile(
-    r'\b(Transform|Group|Separator|Switch|LOD|Collision|Billboard|Anchor|Detail'
-    r'|Shape|IndexedFaceSet)\s*\{'
-)
-# bare USE at statement level:  USE SomeName  (not inside a field value)
-_STMT_USE_RE = re.compile(r'(?:^|\n)\s*USE\s+(\S+)')
-_IFS_RE     = re.compile(r'\bIndexedFaceSet\s*\{')
-_CI_RE      = re.compile(r'\bcoordIndex\s*\[')
-_PT_RE      = re.compile(r'\bpoint\s*\[')
-_NUM_RE     = re.compile(r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?')
-_TR_RE      = re.compile(rf'\btranslation\s+({_FLT})\s+({_FLT})\s+({_FLT})')
-_SC_RE      = re.compile(rf'\bscale\s+({_FLT})\s+({_FLT})\s+({_FLT})')
-_RO_RE      = re.compile(rf'\brotation\s+({_FLT})\s+({_FLT})\s+({_FLT})\s+({_FLT})')
-_DC_RE      = re.compile(rf'diffuseColor\s+({_FLT})\s+({_FLT})\s+({_FLT})')
-_TP_RE      = re.compile(rf'transparency\s+({_FLT})')
-_BRACE_RE   = re.compile(r'[{}]')
-_BRACKET_RE = re.compile(r'[\[\]]')
-_DEF_RE     = re.compile(r'\bDEF\s+(\S+)\s+(\w+)\s*\{')
-_USE_RE     = re.compile(r'\bUSE\s+(\S+)')
-_COORD_RE   = re.compile(r'\bcoord\b')
+# VRML 1.0 MatrixTransform: 16 floats after 'matrix'
+_FLT16       = r'\s+'.join([rf'({_FLT})'] * 16)
+_MTX_VALS_RE = re.compile(r'\bmatrix\s+' + _FLT16)
+
+# VRML 1.0 Material colors
+_DC_RE       = re.compile(rf'diffuseColor\s+({_FLT})\s+({_FLT})\s+({_FLT})')
+
+# VRML 1.0 Transform fields
+_TR1_RE      = re.compile(rf'\btranslation\s+({_FLT})\s+({_FLT})\s+({_FLT})')
+_SC1_RE      = re.compile(rf'\bscaleFactor\s+({_FLT})(?:\s+({_FLT})\s+({_FLT}))?')
+_RO1_RE      = re.compile(rf'\brotation\s+({_FLT})\s+({_FLT})\s+({_FLT})\s+({_FLT})')
+
+# DEF / USE
+_DEF_RE      = re.compile(r'\bDEF\s+(\S+)\s+(\w+)\s*\{')
+_USE_RE      = re.compile(r'\bUSE\s+(\S+)')
 
 
-# ── Brace / bracket index ────────────────────────────────────────────────────────────────
+# ── Index builders ──────────────────────────────────────────────────────────────────
 
 def _build_brace_index(text):
     logger.info('Building brace index …')
-    index = {}
-    stack = []
+    idx, stack = {}, []
     for m in _BRACE_RE.finditer(text):
         if m.group() == '{': stack.append(m.start())
-        elif stack:           index[stack.pop()] = m.start()
-    logger.info('Brace index: %d pairs', len(index))
-    return index
+        elif stack: idx[stack.pop()] = m.start()
+    logger.info('Brace index: %d pairs', len(idx))
+    return idx
 
 
 def _build_bracket_index(text):
-    index = {}
-    stack = []
+    idx, stack = {}, []
     for m in _BRACKET_RE.finditer(text):
         if m.group() == '[': stack.append(m.start())
-        elif stack:          index[stack.pop()] = m.start()
-    return index
+        elif stack: idx[stack.pop()] = m.start()
+    return idx
 
-
-# ── DEF registry ─────────────────────────────────────────────────────────────────────────
 
 def _build_def_registry(text, brace_idx):
-    """
-    {name: (node_type, content_start, content_end)}
-    Covers ALL DEF nodes so we can resolve any USE reference.
-    """
     logger.info('Building DEF registry …')
-    registry = {}
+    reg = {}
     for m in _DEF_RE.finditer(text):
-        name      = m.group(1)
-        node_type = m.group(2)
-        brace_start = text.find('{', m.start())
-        if brace_start == -1: continue
-        close = brace_idx.get(brace_start)
-        if close is None: continue
-        registry[name] = (node_type, brace_start + 1, close)
-    logger.info('DEF registry: %d named nodes', len(registry))
-    return registry
+        name = m.group(1)
+        bp = text.find('{', m.start())
+        if bp == -1: continue
+        cl = brace_idx.get(bp)
+        if cl is None: continue
+        reg[name] = (m.group(2), bp + 1, cl)
+    logger.info('DEF registry: %d entries', len(reg))
+    return reg
 
 
-# ── Transform math ────────────────────────────────────────────────────────────────────────
+# ── Brace / bracket position helpers ──────────────────────────────────────────────
 
-def _axis_angle_matrix(x, y, z, angle):
+def _brace_pos(text, start, brace_idx):
+    p = text.find('{', start)
+    if p == -1: return None
+    cl = brace_idx.get(p)
+    return (p + 1, cl) if cl is not None else None
+
+
+def _bracket_pos(text, start, end, bracket_idx):
+    p = text.find('[', start)
+    if p == -1 or p >= end: return None
+    cl = bracket_idx.get(p)
+    return (p + 1, cl) if (cl is not None and cl <= end) else None
+
+
+# ── Matrix helpers ─────────────────────────────────────────────────────────────────────────
+
+def _axis_angle_to_mat4(x, y, z, angle):
     L = np.sqrt(x*x + y*y + z*z)
     if L < 1e-10: return np.eye(4)
     x, y, z = x/L, y/L, z/L
-    c, s, t = np.cos(angle), np.sin(angle), 1-np.cos(angle)
+    c, s, t = np.cos(angle), np.sin(angle), 1 - np.cos(angle)
     m = np.eye(4)
     m[0,0]=t*x*x+c;   m[0,1]=t*x*y-s*z; m[0,2]=t*x*z+s*y
     m[1,0]=t*x*y+s*z; m[1,1]=t*y*y+c;   m[1,2]=t*y*z-s*x
@@ -225,271 +237,213 @@ def _axis_angle_matrix(x, y, z, angle):
     return m
 
 
-def _transform_matrix(text, cs, ce):
-    hdr = text[cs: min(cs+2000, ce)]
+def _extract_matrix_transform(text, cs, ce, brace_idx):
+    """Extract MatrixTransform inside a Separator block (VRML 1.0)."""
+    mm = _MTX_RE.search(text, cs, ce)
+    if not mm: return None
+    bp = _brace_pos(text, mm.start(), brace_idx)
+    if not bp: return None
+    vm = _MTX_VALS_RE.search(text, bp[0], bp[1])
+    if not vm: return None
+    mat = np.array([float(vm.group(i)) for i in range(1, 17)], dtype=np.float64).reshape(4, 4)
+    return mat
+
+
+def _extract_transform1(text, cs, ce, brace_idx):
+    """Extract VRML 1.0 Transform node inside a Separator."""
+    tm = _TRANS_RE.search(text, cs, ce)
+    if not tm: return None
+    bp = _brace_pos(text, tm.start(), brace_idx)
+    if not bp: return None
+    hdr = text[bp[0]: min(bp[0]+1000, bp[1])]
     M = np.eye(4)
-    tr = _TR_RE.search(hdr)
+    tr = _TR1_RE.search(hdr)
     if tr: M[0,3]=float(tr.group(1)); M[1,3]=float(tr.group(2)); M[2,3]=float(tr.group(3))
-    S = np.eye(4)
-    sc = _SC_RE.search(hdr)
-    if sc: S[0,0]=float(sc.group(1)); S[1,1]=float(sc.group(2)); S[2,2]=float(sc.group(3))
-    R = np.eye(4)
-    ro = _RO_RE.search(hdr)
-    if ro: R = _axis_angle_matrix(float(ro.group(1)),float(ro.group(2)),
-                                   float(ro.group(3)),float(ro.group(4)))
-    return M @ R @ S
+    sc = _SC1_RE.search(hdr)
+    if sc:
+        sx = float(sc.group(1))
+        sy = float(sc.group(2)) if sc.group(2) else sx
+        sz = float(sc.group(3)) if sc.group(3) else sx
+        S = np.diag([sx, sy, sz, 1.0])
+        M = M @ S
+    ro = _RO1_RE.search(hdr)
+    if ro:
+        R = _axis_angle_to_mat4(float(ro.group(1)), float(ro.group(2)),
+                                 float(ro.group(3)), float(ro.group(4)))
+        M = M @ R
+    return M
 
 
-# ── Position helpers ─────────────────────────────────────────────────────────────────────
-
-def _brace_pos(text, start, brace_idx):
-    p = text.find('{', start)
-    if p == -1: return None
-    close = brace_idx.get(p)
-    if close is None: return None
-    return (p+1, close)
-
-
-def _bracket_pos(text, start, end, bracket_idx):
-    p = text.find('[', start)
-    if p == -1 or p >= end: return None
-    close = bracket_idx.get(p)
-    if close is None or close > end: return None
-    return (p+1, close)
+def _get_separator_matrix(text, cs, ce, brace_idx):
+    """Get the local transform for a Separator block (VRML 1.0)."""
+    mat = _extract_matrix_transform(text, cs, ce, brace_idx)
+    if mat is not None: return mat
+    mat = _extract_transform1(text, cs, ce, brace_idx)
+    if mat is not None: return mat
+    return np.eye(4)
 
 
-# ── Point extraction ──────────────────────────────────────────────────────────────────────
-
-def _get_points(text, cs, ce, brace_idx, bracket_idx, def_registry):
-    # 1. inline point inside block
-    pt_m = _PT_RE.search(text, cs, ce)
-    if pt_m:
-        pt_pos = _bracket_pos(text, pt_m.start(), ce, bracket_idx)
-        if pt_pos: return _parse_floats(text, pt_pos)
-
-    # 2. coord USE <name>
-    coord_m = _COORD_RE.search(text, cs, ce)
-    if coord_m:
-        use_m = _USE_RE.search(text, coord_m.start(), min(coord_m.start()+100, ce))
-        if use_m:
-            name = use_m.group(1)
-            if name in def_registry:
-                _, dcs, dce = def_registry[name]
-                pt_m2 = _PT_RE.search(text, dcs, dce)
-                if pt_m2:
-                    pt_pos2 = _bracket_pos(text, pt_m2.start(), dce, bracket_idx)
-                    if pt_pos2: return _parse_floats(text, pt_pos2)
-
-    # 3. backwards search up to 200k
-    ws = max(0, cs - 200000)
-    last = None
-    for lm in _PT_RE.finditer(text, ws, cs):
-        last = lm
-    if last:
-        pt_pos3 = _bracket_pos(text, last.start(), last.start() + 200000, bracket_idx)
-        if pt_pos3: return _parse_floats(text, pt_pos3)
-
-    return None
-
+# ── Vertex extraction ───────────────────────────────────────────────────────────────────────
 
 def _parse_floats(text, pos_tuple):
     nums = _NUM_RE.findall(text[pos_tuple[0]:pos_tuple[1]])
-    if not nums: return None
-    return np.array(nums, dtype=np.float64)
+    return np.array(nums, dtype=np.float64) if nums else None
 
 
-# ── Geometry extraction ──────────────────────────────────────────────────────────────
+def _get_coord3(text, scope_start, ifs_pos, brace_idx, bracket_idx):
+    """
+    VRML 1.0: find the Coordinate3 { point [...] } that precedes this
+    IndexedFaceSet within the same Separator scope.
+    Searches backwards from ifs_pos to scope_start.
+    """
+    last = None
+    for m in _COORD3_RE.finditer(text, scope_start, ifs_pos):
+        last = m
+    if last is None: return None
+    bp = _brace_pos(text, last.start(), brace_idx)
+    if bp is None: return None
+    pt_m = _PT_RE.search(text, bp[0], bp[1])
+    if pt_m is None: return None
+    pp = _bracket_pos(text, pt_m.start(), bp[1], bracket_idx)
+    if pp is None: return None
+    floats = _parse_floats(text, pp)
+    if floats is None or len(floats) < 9 or len(floats) % 3 != 0: return None
+    return floats.reshape(-1, 3)
+
+
+# ── Face builder ────────────────────────────────────────────────────────────────────────────
 
 def _build_faces(indices):
     faces, fan = [], []
     for idx in indices:
         if idx < 0:
             if len(fan) >= 3:
-                for j in range(1, len(fan)-1): faces.append((fan[0],fan[j],fan[j+1]))
+                for j in range(1, len(fan)-1):
+                    faces.append((fan[0], fan[j], fan[j+1]))
             fan = []
         else:
             fan.append(idx)
     if len(fan) >= 3:
-        for j in range(1, len(fan)-1): faces.append((fan[0],fan[j],fan[j+1]))
-    return np.array(faces, dtype=np.int64) if faces else np.empty((0,3),dtype=np.int64)
+        for j in range(1, len(fan)-1):
+            faces.append((fan[0], fan[j], fan[j+1]))
+    return np.array(faces, dtype=np.int64) if faces else np.empty((0, 3), dtype=np.int64)
 
 
-def _extract_ifs(text, cs, ce, brace_idx, bracket_idx, def_registry):
-    # coordIndex — try inline then USE
-    ci_m = _CI_RE.search(text, cs, ce)
-    if ci_m:
-        ci_pos = _bracket_pos(text, ci_m.start(), ce, bracket_idx)
-        if not ci_pos: return None
-        indices = [int(x) for x in re.findall(r'-?\d+', text[ci_pos[0]:ci_pos[1]])]
-    else:
-        # try geometry USE <name> pointing to another IFS
-        use_m = _USE_RE.search(text, cs, min(cs+200, ce))
-        if use_m and use_m.group(1) in def_registry:
-            _, dcs, dce = def_registry[use_m.group(1)]
-            ci_m2 = _CI_RE.search(text, dcs, dce)
-            if ci_m2:
-                ci_pos2 = _bracket_pos(text, ci_m2.start(), dce, bracket_idx)
-                if not ci_pos2: return None
-                indices = [int(x) for x in re.findall(r'-?\d+', text[ci_pos2[0]:ci_pos2[1]])]
-                cs, ce = dcs, dce  # switch context to DEF block for point lookup
-            else:
-                return None
-        else:
-            return None
+# ── Color extraction ─────────────────────────────────────────────────────────────────────
 
-    if not indices: return None
+def _get_color(text, scope_start, ifs_pos, brace_idx, bracket_idx):
+    """
+    VRML 1.0: Material { diffuseColor r g b } precedes IFS in same Separator.
+    Search backwards from ifs_pos within scope.
+    """
+    last_mat = None
+    for m in _MAT_RE.finditer(text, scope_start, ifs_pos):
+        last_mat = m
+    if last_mat is None:
+        # fallback: search 20k chars before IFS
+        ws = max(0, ifs_pos - 20000)
+        for m in _MAT_RE.finditer(text, ws, ifs_pos):
+            last_mat = m
+    if last_mat is None: return [200, 200, 200, 255]
 
-    floats = _get_points(text, cs, ce, brace_idx, bracket_idx, def_registry)
-    if floats is None or len(floats) < 9 or len(floats) % 3 != 0: return None
-    verts = floats.reshape(-1, 3)
-
-    faces = _build_faces(indices)
-    if len(faces) == 0: return None
-    valid = np.all((faces >= 0) & (faces < len(verts)), axis=1)
-    faces = faces[valid]
-    if len(faces) == 0: return None
-    return verts, faces
+    bp = _brace_pos(text, last_mat.start(), brace_idx)
+    if bp is None: return [200, 200, 200, 255]
+    hdr = text[bp[0]: min(bp[0]+500, bp[1])]
+    dc = _DC_RE.search(hdr)
+    if dc is None: return [200, 200, 200, 255]
+    return [int(float(dc.group(i))*255) for i in (1, 2, 3)] + [255]
 
 
-# ── Iterative tree walker ───────────────────────────────────────────────────────────────────
-
-def _process_shape(text, cs, ce, matrix, meshes, brace_idx, bracket_idx, def_registry, shape_pos):
-    import trimesh
-    ifs_cs, ifs_ce = cs, ce
-
-    ifs_m = _IFS_RE.search(text, cs, ce)
-    if ifs_m:
-        bp2 = _brace_pos(text, ifs_m.start(), brace_idx)
-        if bp2: ifs_cs, ifs_ce = bp2
-    else:
-        # geometry USE <name>
-        use_m = _USE_RE.search(text, cs, min(cs+500, ce))
-        if use_m and use_m.group(1) in def_registry:
-            node_type, dcs, dce = def_registry[use_m.group(1)]
-            if node_type == 'IndexedFaceSet':
-                ifs_cs, ifs_ce = dcs, dce
-            elif node_type == 'Shape':
-                # recurse into the DEF'd Shape
-                _process_shape(text, dcs, dce, matrix, meshes,
-                               brace_idx, bracket_idx, def_registry, shape_pos)
-                return
-            else:
-                return
-        else:
-            return
-
-    result = _extract_ifs(text, ifs_cs, ifs_ce, brace_idx, bracket_idx, def_registry)
-    if not result: return
-
-    verts, faces = result
-    mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
-    if not np.allclose(matrix, np.eye(4)):
-        mesh.apply_transform(matrix)
-
-    color = [200, 200, 200, 255]
-    back_s = max(0, shape_pos - 10000)
-    dc = _DC_RE.search(text, back_s, shape_pos)
-    if dc:
-        color = [int(float(dc.group(i))*255) for i in (1,2,3)] + [255]
-        tr2 = _TP_RE.search(text, back_s, shape_pos)
-        if tr2:
-            color[3] = max(0, min(255, int((1-float(tr2.group(1)))*255)))
-
-    mesh.visual.face_colors = color
-    meshes.append(mesh)
-    logger.info('  part: %d verts  %d faces  t=[%.2f,%.2f,%.2f]',
-                len(verts), len(faces), matrix[0,3], matrix[1,3], matrix[2,3])
-
+# ── VRML 1.0 iterative walker ─────────────────────────────────────────────────────────
 
 def _walk(text, meshes, brace_idx, bracket_idx, def_registry):
-    seen_use = set()  # avoid processing same DEF geometry twice via multiple USE refs
+    import trimesh
+
+    # stack entries: (scope_start, scope_end, parent_matrix)
     stack = [(0, len(text), np.eye(4))]
 
     while stack:
-        start, end, matrix = stack.pop()
-        pos = start
+        scope_start, scope_end, parent_matrix = stack.pop()
+        pos = scope_start
 
-        while pos < end:
-            # Check for bare USE statement (e.g. children containing USE NodeName)
-            next_node = _NODE_RE.search(text, pos, end)
-            next_use  = _STMT_USE_RE.search(text, pos, end)
+        while pos < scope_end:
+            # Look for next Separator-like container or IFS
+            sep_m = _SEP_RE.search(text, pos, scope_end)
+            ifs_m = _IFS_RE.search(text, pos, scope_end)
 
             # Pick whichever comes first
-            use_first = (next_use and
-                         (next_node is None or next_use.start() < next_node.start()))
-
-            if use_first:
-                name = next_use.group(1)
-                if name in def_registry and name not in seen_use:
-                    seen_use.add(name)
-                    node_type, dcs, dce = def_registry[name]
-                    if node_type in _CONTAINER:
-                        child_matrix = matrix
-                        if node_type == 'Transform':
-                            child_matrix = matrix @ _transform_matrix(text, dcs, dce)
-                        stack.append((dcs, dce, child_matrix))
-                    elif node_type == 'Shape':
-                        _process_shape(text, dcs, dce, matrix, meshes,
-                                       brace_idx, bracket_idx, def_registry,
-                                       next_use.start())
-                    elif node_type == 'IndexedFaceSet':
-                        result = _extract_ifs(text, dcs, dce, brace_idx, bracket_idx, def_registry)
-                        if result:
-                            import trimesh
-                            verts, faces = result
-                            mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
-                            if not np.allclose(matrix, np.eye(4)):
-                                mesh.apply_transform(matrix)
-                            mesh.visual.face_colors = [200, 200, 200, 255]
-                            meshes.append(mesh)
-                pos = next_use.end()
-                continue
-
-            if next_node is None:
+            if sep_m is None and ifs_m is None:
                 break
 
-            m = next_node
-            node = m.group(1)
-            bp = _brace_pos(text, m.start(), brace_idx)
-            if not bp:
-                pos = m.end()
-                continue
-            cs, ce = bp
+            if sep_m is not None and (ifs_m is None or sep_m.start() < ifs_m.start()):
+                # ---- Process Separator ----
+                bp = _brace_pos(text, sep_m.start(), brace_idx)
+                if bp is None:
+                    pos = sep_m.end()
+                    continue
+                cs, ce = bp
 
-            if node in _CONTAINER:
-                child_matrix = matrix
-                if node == 'Transform':
-                    child_matrix = matrix @ _transform_matrix(text, cs, ce)
+                # Compute local matrix (MatrixTransform or Transform inside)
+                local_mat = _get_separator_matrix(text, cs, ce, brace_idx)
+                child_matrix = parent_matrix @ local_mat
+
                 stack.append((cs, ce, child_matrix))
                 pos = ce + 1
-                continue
 
-            elif node in _SHAPE_LIKE:
-                ifs_cs, ifs_ce = cs, ce
-                if node == 'Shape':
-                    _process_shape(text, cs, ce, matrix, meshes,
-                                   brace_idx, bracket_idx, def_registry, m.start())
-                else:  # IndexedFaceSet directly
-                    result = _extract_ifs(text, cs, ce, brace_idx, bracket_idx, def_registry)
-                    if result:
-                        import trimesh
-                        verts, faces = result
-                        mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
-                        if not np.allclose(matrix, np.eye(4)):
-                            mesh.apply_transform(matrix)
-                        color = [200, 200, 200, 255]
-                        back_s = max(0, m.start() - 10000)
-                        dc = _DC_RE.search(text, back_s, m.start())
-                        if dc:
-                            color = [int(float(dc.group(i))*255) for i in (1,2,3)] + [255]
-                        mesh.visual.face_colors = color
-                        meshes.append(mesh)
-                        logger.info('  part: %d verts  %d faces  t=[%.2f,%.2f,%.2f]',
-                                    len(verts), len(faces), matrix[0,3], matrix[1,3], matrix[2,3])
-                pos = ce + 1
-                continue
+            else:
+                # ---- Process IndexedFaceSet ----
+                bp = _brace_pos(text, ifs_m.start(), brace_idx)
+                if bp is None:
+                    pos = ifs_m.end()
+                    continue
+                ifs_cs, ifs_ce = bp
 
-            pos = ce + 1
+                # coordIndex
+                ci_m = _CI_RE.search(text, ifs_cs, ifs_ce)
+                if ci_m is None:
+                    pos = ifs_ce + 1
+                    continue
+                ci_pp = _bracket_pos(text, ci_m.start(), ifs_ce, bracket_idx)
+                if ci_pp is None:
+                    pos = ifs_ce + 1
+                    continue
+                indices = [int(x) for x in re.findall(r'-?\d+', text[ci_pp[0]:ci_pp[1]])]
+                if not indices:
+                    pos = ifs_ce + 1
+                    continue
+
+                # vertices: Coordinate3 before this IFS in current scope
+                verts = _get_coord3(text, scope_start, ifs_m.start(),
+                                    brace_idx, bracket_idx)
+                if verts is None:
+                    pos = ifs_ce + 1
+                    continue
+
+                # faces
+                faces = _build_faces(indices)
+                if len(faces) == 0:
+                    pos = ifs_ce + 1
+                    continue
+                valid = np.all((faces >= 0) & (faces < len(verts)), axis=1)
+                faces = faces[valid]
+                if len(faces) == 0:
+                    pos = ifs_ce + 1
+                    continue
+
+                # color
+                color = _get_color(text, scope_start, ifs_m.start(),
+                                   brace_idx, bracket_idx)
+
+                mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+                if not np.allclose(parent_matrix, np.eye(4)):
+                    mesh.apply_transform(parent_matrix)
+                mesh.visual.face_colors = color
+                meshes.append(mesh)
+                logger.info('  part: %d verts  %d faces  color=%s  t=[%.1f,%.1f,%.1f]',
+                            len(verts), len(faces), color[:3],
+                            parent_matrix[0,3], parent_matrix[1,3], parent_matrix[2,3])
+
+                pos = ifs_ce + 1
 
 
 def _parse_vrml(src: Path):
@@ -499,11 +453,11 @@ def _parse_vrml(src: Path):
     brace_idx    = _build_brace_index(text)
     bracket_idx  = _build_bracket_index(text)
     def_registry = _build_def_registry(text, brace_idx)
-    logger.info('Walking VRML tree …')
+    logger.info('Walking VRML 1.0 tree …')
     meshes = []
     _walk(text, meshes, brace_idx, bracket_idx, def_registry)
     if not meshes:
-        raise ValueError('No IndexedFaceSet geometry found in the WRL file.')
+        raise ValueError('No geometry found. Check terminal for details.')
     combined = trimesh.util.concatenate(meshes)
     logger.info('Combined: %d faces  %d verts  from %d parts',
                 len(combined.faces), len(combined.vertices), len(meshes))
@@ -529,11 +483,12 @@ def _to_bytes(out):
     return out.encode('utf-8') if isinstance(out, str) else bytes(out)
 
 
-# ── Routes ─────────────────────────────────────────────────────────────────────────────
+# ── Routes ───────────────────────────────────────────────────────────────────────────
 
 @app.route('/')
 def index():
     return render_template_string(HTML)
+
 
 @app.route('/convert', methods=['POST'])
 def convert():
@@ -553,12 +508,14 @@ def convert():
             tmp_path = Path(tmp.name)
             f.save(tmp)
         mesh = _simplify(_parse_vrml(tmp_path), max_faces)
-        raw = mesh.export(file_type=out_format)
+        raw  = mesh.export(file_type=out_format)
         out_bytes = _to_bytes(raw)
         logger.info('Output: %.2f MB  %s', len(out_bytes)/1e6, out_format)
-        mime = {'glb':'model/gltf-binary','obj':'text/plain','stl':'application/octet-stream'}[out_format]
+        mime = {'glb': 'model/gltf-binary', 'obj': 'text/plain',
+                'stl': 'application/octet-stream'}[out_format]
         return send_file(io.BytesIO(out_bytes), mimetype=mime,
-                         as_attachment=True, download_name=f'{Path(f.filename).stem}.{out_format}')
+                         as_attachment=True,
+                         download_name=f'{Path(f.filename).stem}.{out_format}')
     except ValueError as ve:
         return jsonify(detail=str(ve)), 422
     except Exception:
