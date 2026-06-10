@@ -1,5 +1,4 @@
-"""
-VRML / WRL → GLB / OBJ / STL Converter  (position-based, no string copies)
+"""VRML / WRL → GLB / OBJ / STL Converter  (fast brace-index, no string copies)
 Usage:
     pip install flask trimesh[easy] numpy
     python app.py
@@ -136,7 +135,7 @@ async function convert(){
 """
 
 
-# ── Compiled patterns (required for .search(text, pos, endpos)) ──────────────────
+# ── Compiled patterns (required for .search(text, pos, endpos)) ──────────────────────
 
 _FLT     = r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?'
 _NODE_RE = re.compile(r'\b(Transform|Group|Separator|Switch|Shape|IndexedFaceSet)\s*\{')
@@ -149,9 +148,39 @@ _SC_RE   = re.compile(rf'\bscale\s+({_FLT})\s+({_FLT})\s+({_FLT})')
 _RO_RE   = re.compile(rf'\brotation\s+({_FLT})\s+({_FLT})\s+({_FLT})\s+({_FLT})')
 _DC_RE   = re.compile(rf'diffuseColor\s+({_FLT})\s+({_FLT})\s+({_FLT})')
 _TP_RE   = re.compile(rf'transparency\s+({_FLT})')
+_BRACE_RE = re.compile(r'[{}]')
+_BRACKET_RE = re.compile(r'[\[\]]')
 
 
-# ── Transform math ───────────────────────────────────────────────────────────────────
+# ── Brace / bracket index (built once per file) ─────────────────────────────────────
+
+def _build_brace_index(text):
+    """Scan file once with C-level regex; return {open_pos: close_pos}."""
+    logger.info('Building brace index …')
+    index = {}
+    stack = []
+    for m in _BRACE_RE.finditer(text):
+        if m.group() == '{':
+            stack.append(m.start())
+        elif stack:
+            index[stack.pop()] = m.start()
+    logger.info('Brace index: %d pairs', len(index))
+    return index
+
+
+def _build_bracket_index(text):
+    """Same but for [ ] brackets."""
+    index = {}
+    stack = []
+    for m in _BRACKET_RE.finditer(text):
+        if m.group() == '[':
+            stack.append(m.start())
+        elif stack:
+            index[stack.pop()] = m.start()
+    return index
+
+
+# ── Transform math ────────────────────────────────────────────────────────────────────────
 
 def _axis_angle_matrix(x, y, z, angle):
     L = np.sqrt(x*x + y*y + z*z)
@@ -180,33 +209,25 @@ def _transform_matrix(text, cs, ce):
     return M @ R @ S
 
 
-# ── Position-based brace/bracket helpers ───────────────────────────────────────────
+# ── Fast position-based brace/bracket helpers (use pre-built index) ───────────────
 
-def _brace_pos(text, start):
+def _brace_pos(text, start, brace_idx):
     p = text.find('{', start)
     if p == -1: return None
-    depth = 0
-    for i in range(p, len(text)):
-        if text[i] == '{': depth += 1
-        elif text[i] == '}':
-            depth -= 1
-            if depth == 0: return (p+1, i)
-    return None
+    close = brace_idx.get(p)
+    if close is None: return None
+    return (p+1, close)
 
 
-def _bracket_pos(text, start, end):
+def _bracket_pos(text, start, end, bracket_idx):
     p = text.find('[', start)
     if p == -1 or p >= end: return None
-    depth = 0
-    for i in range(p, end):
-        if text[i] == '[': depth += 1
-        elif text[i] == ']':
-            depth -= 1
-            if depth == 0: return (p+1, i)
-    return None
+    close = bracket_idx.get(p)
+    if close is None or close > end: return None
+    return (p+1, close)
 
 
-# ── Geometry extraction ───────────────────────────────────────────────────────────────
+# ── Geometry extraction ──────────────────────────────────────────────────────────────
 
 def _build_faces(indices):
     faces, fan = [], []
@@ -222,32 +243,32 @@ def _build_faces(indices):
     return np.array(faces, dtype=np.int64) if faces else np.empty((0,3),dtype=np.int64)
 
 
-def _extract_ifs(text, cs, ce):
-    # coordIndex
-    ci_m = _CI_RE.search(text, cs, ce)          # compiled pattern: pos/endpos OK
+def _extract_ifs(text, cs, ce, brace_idx, bracket_idx):
+    ci_m = _CI_RE.search(text, cs, ce)
     if not ci_m: return None
-    ci_pos = _bracket_pos(text, ci_m.start(), ce)
+    ci_pos = _bracket_pos(text, ci_m.start(), ce, bracket_idx)
     if not ci_pos: return None
     indices = [int(x) for x in re.findall(r'-?\d+', text[ci_pos[0]:ci_pos[1]])]
     if not indices: return None
 
-    # point — inside block first
-    pt_m = _PT_RE.search(text, cs, ce)           # compiled pattern: pos/endpos OK
+    pt_m = _PT_RE.search(text, cs, ce)
     if pt_m:
-        pt_pos = _bracket_pos(text, pt_m.start(), ce)
+        pt_pos = _bracket_pos(text, pt_m.start(), ce, bracket_idx)
     else:
-        # search backwards up to 60 000 chars
         ws = max(0, cs - 60000)
         last = None
-        for lm in _PT_RE.finditer(text, ws, cs):  # compiled pattern: pos/endpos OK
+        for lm in _PT_RE.finditer(text, ws, cs):
             last = lm
         if not last: return None
-        pt_pos = _bracket_pos(text, last.start(), cs + 500)
+        pt_pos = _bracket_pos(text, last.start(), cs + 500, bracket_idx)
 
     if not pt_pos: return None
-    floats = [float(x) for x in _NUM_RE.findall(text[pt_pos[0]:pt_pos[1]])]
+    floats = np.fromiter(
+        (float(x) for x in _NUM_RE.findall(text[pt_pos[0]:pt_pos[1]])),
+        dtype=np.float64
+    )
     if len(floats) < 9 or len(floats) % 3 != 0: return None
-    verts = np.array(floats, dtype=np.float64).reshape(-1, 3)
+    verts = floats.reshape(-1, 3)
 
     faces = _build_faces(indices)
     if len(faces) == 0: return None
@@ -257,9 +278,9 @@ def _extract_ifs(text, cs, ce):
     return verts, faces
 
 
-# ── Iterative tree walker ─────────────────────────────────────────────────────────────────
+# ── Iterative tree walker ───────────────────────────────────────────────────────────────────
 
-def _walk(text, meshes):
+def _walk(text, meshes, brace_idx, bracket_idx):
     import trimesh
     stack = [(0, len(text), np.eye(4))]
 
@@ -268,11 +289,11 @@ def _walk(text, meshes):
         pos = start
 
         while pos < end:
-            m = _NODE_RE.search(text, pos, end)   # compiled: pos/endpos OK
+            m = _NODE_RE.search(text, pos, end)
             if not m: break
 
             node = m.group(1)
-            bp = _brace_pos(text, m.start())
+            bp = _brace_pos(text, m.start(), brace_idx)
             if not bp: break
             cs, ce = bp
 
@@ -287,15 +308,15 @@ def _walk(text, meshes):
             elif node in ('Shape', 'IndexedFaceSet'):
                 ifs_cs, ifs_ce = cs, ce
                 if node == 'Shape':
-                    ifs_m = _IFS_RE.search(text, cs, ce)   # compiled: pos/endpos OK
+                    ifs_m = _IFS_RE.search(text, cs, ce)
                     if ifs_m:
-                        bp2 = _brace_pos(text, ifs_m.start())
+                        bp2 = _brace_pos(text, ifs_m.start(), brace_idx)
                         if bp2: ifs_cs, ifs_ce = bp2
                     else:
                         pos = ce + 1
                         continue
 
-                result = _extract_ifs(text, ifs_cs, ifs_ce)
+                result = _extract_ifs(text, ifs_cs, ifs_ce, brace_idx, bracket_idx)
                 if result:
                     verts, faces = result
                     mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
@@ -304,10 +325,10 @@ def _walk(text, meshes):
 
                     color = [200, 200, 200, 255]
                     back_s = max(0, m.start() - 10000)
-                    dc = _DC_RE.search(text, back_s, m.start())   # compiled: OK
+                    dc = _DC_RE.search(text, back_s, m.start())
                     if dc:
                         color = [int(float(dc.group(i))*255) for i in (1,2,3)] + [255]
-                        tr2 = _TP_RE.search(text, back_s, m.start())  # compiled: OK
+                        tr2 = _TP_RE.search(text, back_s, m.start())
                         if tr2:
                             color[3] = max(0, min(255, int((1-float(tr2.group(1)))*255)))
 
@@ -327,9 +348,11 @@ def _parse_vrml(src: Path):
     import trimesh
     logger.info('Reading %s (%.1f MB) …', src.name, src.stat().st_size/1e6)
     text = src.read_text(encoding='utf-8', errors='replace')
+    brace_idx   = _build_brace_index(text)
+    bracket_idx = _build_bracket_index(text)
     logger.info('Walking VRML tree (iterative) …')
     meshes = []
-    _walk(text, meshes)
+    _walk(text, meshes, brace_idx, bracket_idx)
     if not meshes:
         raise ValueError('No IndexedFaceSet geometry found in the WRL file.')
     combined = trimesh.util.concatenate(meshes)
@@ -357,7 +380,7 @@ def _to_bytes(out):
     return out.encode('utf-8') if isinstance(out, str) else bytes(out)
 
 
-# ── Routes ─────────────────────────────────────────────────────────────────────
+# ── Routes ─────────────────────────────────────────────────────────────────────────────
 
 @app.route('/')
 def index():
