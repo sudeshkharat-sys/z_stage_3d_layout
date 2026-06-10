@@ -148,8 +148,6 @@ _NUM_RE      = re.compile(r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?')
 _BRACE_RE    = re.compile(r'[{}]')
 _BRACKET_RE  = re.compile(r'[\[\]]')
 
-# Direct-child node scanner: matches any VRML 1.0 node keyword followed by {
-# We use this to walk ONLY direct children by jumping brace_close+1 each time
 _DIRECT_RE = re.compile(
     r'\b(MatrixTransform|Transform|Separator|Group|LOD|Switch'
     r'|TransformSeparator|Coordinate3|IndexedFaceSet|IndexedLineSet'
@@ -162,7 +160,6 @@ _DIRECT_RE = re.compile(
     r')\s*\{'
 )
 
-# Field patterns
 _PT_RE       = re.compile(r'\bpoint\s*\[')
 _CI_RE       = re.compile(r'\bcoordIndex\s*\[')
 _DC_RE       = re.compile(rf'diffuseColor\s+({_FLT})\s+({_FLT})\s+({_FLT})')
@@ -215,8 +212,7 @@ def _direct_children(text, cs, ce, brace_idx):
     """
     Yield (node_name, keyword_pos, content_cs, content_ce) for EVERY
     direct child node in range [cs, ce).  Nested content is skipped by
-    jumping to brace_close+1 after each node — so we never accidentally
-    pick up a grandchild MatrixTransform / Coordinate3 / etc.
+    jumping to brace_close+1 after each node.
     """
     pos = cs
     while pos < ce:
@@ -224,7 +220,6 @@ def _direct_children(text, cs, ce, brace_idx):
         if m is None:
             break
         node = m.group(1)
-        # find the opening {
         brace_open = text.find('{', m.start())
         if brace_open == -1 or brace_open >= ce:
             pos = m.end()
@@ -234,7 +229,7 @@ def _direct_children(text, cs, ce, brace_idx):
             pos = m.end()
             continue
         yield node, m.start(), brace_open + 1, brace_close
-        pos = brace_close + 1   # skip ENTIRE node including its content
+        pos = brace_close + 1
 
 
 # ── Math helpers ───────────────────────────────────────────────────────────────────────
@@ -256,7 +251,7 @@ def _parse_floats(text, pos_tuple):
     return np.array(nums, dtype=np.float64) if nums else None
 
 
-# ── Face builder ───────────────────────────────────────────────────────────────────────────
+# ── Face builder ──────────────────────────────────────────────────────────────
 
 def _build_faces(indices):
     faces, fan = [], []
@@ -282,22 +277,18 @@ _CONTAINERS = frozenset({'Separator', 'Group', 'Switch', 'TransformSeparator'})
 def _walk(text, meshes, brace_idx, bracket_idx):
     import trimesh
 
-    # stack: (content_cs, content_ce, parent_matrix)
     stack = [(0, len(text), np.eye(4))]
     total_tried = 0
 
     while stack:
         cs, ce, parent_matrix = stack.pop()
 
-        # Per-scope state (VRML 1.0 state machine)
         current_matrix = np.copy(parent_matrix)
-        current_coord  = None    # numpy (N,3) vertex array
-        current_color  = [200, 200, 200, 255]
-        lod_first_done = False   # only take first LOD child
+        current_coord  = None
+        current_color  = [230, 230, 230, 255]  # light gray default
 
         for node, node_pos, ncs, nce in _direct_children(text, cs, ce, brace_idx):
 
-            # ——— Transform state nodes ———
             if node == 'MatrixTransform':
                 vm = _MTX_VALS_RE.search(text, ncs, nce)
                 if vm:
@@ -323,7 +314,6 @@ def _walk(text, meshes, brace_idx, bracket_idx):
                     M = M @ np.diag([sx, sy, sz, 1.0])
                 current_matrix = parent_matrix @ M
 
-            # ——— Geometry state nodes ———
             elif node == 'Coordinate3':
                 pt_m = _PT_RE.search(text, ncs, nce)
                 if pt_m:
@@ -333,25 +323,21 @@ def _walk(text, meshes, brace_idx, bracket_idx):
                         if floats is not None and len(floats) >= 9 and len(floats) % 3 == 0:
                             current_coord = floats.reshape(-1, 3)
 
-            # ——— Appearance state nodes ———
             elif node == 'Material':
                 hdr = text[ncs: min(ncs + 400, nce)]
                 dc = _DC_RE.search(hdr)
                 if dc:
                     current_color = [int(float(dc.group(i)) * 255) for i in (1, 2, 3)] + [255]
 
-            # ——— Container nodes ———
             elif node in _CONTAINERS:
                 stack.append((ncs, nce, current_matrix))
 
             elif node == 'LOD':
-                # Only push the FIRST child Separator (highest detail)
                 for child_node, _, ccs, cce in _direct_children(text, ncs, nce, brace_idx):
-                    if child_node in _CONTAINERS or child_node in ('LOD',):
+                    if child_node in _CONTAINERS or child_node == 'LOD':
                         stack.append((ccs, cce, current_matrix))
-                        break  # first child only
+                        break
 
-            # ——— Geometry nodes ———
             elif node == 'IndexedFaceSet':
                 total_tried += 1
                 if current_coord is None:
