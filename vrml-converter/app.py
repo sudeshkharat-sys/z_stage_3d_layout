@@ -1,5 +1,5 @@
 """
-VRML / WRL → GLB / OBJ / STL Converter  (streaming parser, handles large files)
+VRML / WRL → GLB / OBJ / STL Converter  (streaming parser v2)
 Usage:
     pip install flask trimesh[easy] numpy
     python app.py
@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024 * 1024
 
-# ── HTML (unchanged UI) ────────────────────────────────────────────────────────
+# ── HTML ───────────────────────────────────────────────────────────────────
 
 HTML = """
 <!DOCTYPE html>
@@ -101,49 +101,36 @@ HTML = """
   <div class="result" id="resultBox"></div>
 </div>
 <script>
-let chosenFile = null;
-const dz = document.getElementById('dropZone');
-dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('dragover'); });
-dz.addEventListener('dragleave', () => dz.classList.remove('dragover'));
-dz.addEventListener('drop', e => { e.preventDefault(); dz.classList.remove('dragover'); const f=e.dataTransfer.files[0]; if(f) setFile(f); });
-function onFileChosen(input) { if(input.files[0]) setFile(input.files[0]); }
-function setFile(f) {
-  chosenFile=f;
-  document.getElementById('chosenName').textContent=f.name+'  ('+formatBytes(f.size)+')';
-  document.getElementById('convertBtn').disabled=false;
-}
-function formatBytes(b) {
-  if(b>1e9) return (b/1e9).toFixed(1)+' GB';
-  if(b>1e6) return (b/1e6).toFixed(1)+' MB';
-  return (b/1e3).toFixed(0)+' KB';
-}
-async function convert() {
-  if(!chosenFile) return;
+let chosenFile=null;
+const dz=document.getElementById('dropZone');
+dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('dragover');});
+dz.addEventListener('dragleave',()=>dz.classList.remove('dragover'));
+dz.addEventListener('drop',e=>{e.preventDefault();dz.classList.remove('dragover');const f=e.dataTransfer.files[0];if(f)setFile(f);});
+function onFileChosen(i){if(i.files[0])setFile(i.files[0]);}
+function setFile(f){chosenFile=f;document.getElementById('chosenName').textContent=f.name+'  ('+formatBytes(f.size)+')';document.getElementById('convertBtn').disabled=false;}
+function formatBytes(b){if(b>1e9)return(b/1e9).toFixed(1)+' GB';if(b>1e6)return(b/1e6).toFixed(1)+' MB';return(b/1e3).toFixed(0)+' KB';}
+async function convert(){
+  if(!chosenFile)return;
   const btn=document.getElementById('convertBtn'),pw=document.getElementById('progressWrap'),
         pf=document.getElementById('progressFill'),pl=document.getElementById('progressLabel'),
         rb=document.getElementById('resultBox');
-  btn.disabled=true; rb.style.display='none'; pw.style.display='block'; pf.style.width='5%';
-  pl.textContent='Uploading file…';
-  const fmt=document.getElementById('outFmt').value,
-        maxFaces=parseInt(document.getElementById('maxFaces').value)||200000,
-        form=new FormData();
-  form.append('file',chosenFile); form.append('out_format',fmt); form.append('max_faces',maxFaces);
-  const xhr=new XMLHttpRequest(); xhr.open('POST','/convert'); xhr.responseType='blob';
-  xhr.upload.onprogress=e=>{ if(e.lengthComputable){const p=Math.round(e.loaded/e.total*50); pf.style.width=p+'%'; pl.textContent='Uploading… '+p+'%';} };
+  btn.disabled=true;rb.style.display='none';pw.style.display='block';pf.style.width='5%';pl.textContent='Uploading file…';
+  const fmt=document.getElementById('outFmt').value,maxFaces=parseInt(document.getElementById('maxFaces').value)||200000,form=new FormData();
+  form.append('file',chosenFile);form.append('out_format',fmt);form.append('max_faces',maxFaces);
+  const xhr=new XMLHttpRequest();xhr.open('POST','/convert');xhr.responseType='blob';
+  xhr.upload.onprogress=e=>{if(e.lengthComputable){const p=Math.round(e.loaded/e.total*50);pf.style.width=p+'%';pl.textContent='Uploading… '+p+'%';}};
   let fakeP=50;
-  const ticker=setInterval(()=>{ fakeP=Math.min(fakeP+(fakeP<70?2:fakeP<88?.8:.2),94); pf.style.width=fakeP+'%'; pl.textContent='Converting… '+Math.round(fakeP)+'%'; },600);
+  const ticker=setInterval(()=>{fakeP=Math.min(fakeP+(fakeP<70?2:fakeP<88?.8:.2),94);pf.style.width=fakeP+'%';pl.textContent='Converting… '+Math.round(fakeP)+'%';},600);
   xhr.onload=()=>{
-    clearInterval(ticker); pf.style.width='100%'; pl.textContent='Done!'; btn.disabled=false;
+    clearInterval(ticker);pf.style.width='100%';pl.textContent='Done!';btn.disabled=false;
     if(xhr.status===200){
       const url=URL.createObjectURL(xhr.response),base=chosenFile.name.replace(/\\.[^.]+$/,''),a=document.createElement('a');
-      a.href=url; a.download=base+'.'+fmt; a.click(); URL.revokeObjectURL(url);
-      rb.className='result ok'; rb.style.display='block';
-      rb.innerHTML='&#9989; Conversion complete! Download started.<br/><span class="stats">Output size: '+formatBytes(xhr.response.size)+'</span>';
-    } else {
-      xhr.response.text().then(txt=>{ let msg='Conversion failed.'; try{msg=JSON.parse(txt).detail||msg;}catch(_){} rb.className='result err'; rb.style.display='block'; rb.textContent='✗ '+msg; });
-    }
+      a.href=url;a.download=base+'.'+fmt;a.click();URL.revokeObjectURL(url);
+      rb.className='result ok';rb.style.display='block';
+      rb.innerHTML='&#9989; Conversion complete! Download started.<br/><span class="stats">Output: '+formatBytes(xhr.response.size)+'</span>';
+    }else{xhr.response.text().then(txt=>{let msg='Conversion failed.';try{msg=JSON.parse(txt).detail||msg;}catch(_){}rb.className='result err';rb.style.display='block';rb.textContent='✗ '+msg;});}
   };
-  xhr.onerror=()=>{ clearInterval(ticker); btn.disabled=false; rb.className='result err'; rb.style.display='block'; rb.textContent='✗ Network error.'; };
+  xhr.onerror=()=>{clearInterval(ticker);btn.disabled=false;rb.className='result err';rb.style.display='block';rb.textContent='✗ Network error.';};
   xhr.send(form);
 }
 </script>
@@ -151,22 +138,22 @@ async function convert() {
 """
 
 
-# ── Streaming VRML parser ──────────────────────────────────────────────────────────
+# ── Streaming VRML parser v2 ──────────────────────────────────────────────────────────
 #
-# Reads the file line-by-line so even a 2 GB WRL never fully lives in RAM
-# as a single regex target.  Tracks brace/bracket depth to know which
-# section we are inside and collects tokens accordingly.
+# Key fix: when we hit '{', look BACKWARDS on the current line for the
+# last identifier.  If the line is just '{', fall back to _last_word
+# carried from the previous line.  This avoids the off-by-one bug in v1
+# where _pending_keyword was set at end-of-line, after the '{' was
+# already processed.
 
-_NUM = re.compile(r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?')
-_INT = re.compile(r'-?\d+')
-
-
-def _tokens_float(s):
-    return [float(x) for x in _NUM.findall(s)]
+_NUM_RE  = re.compile(r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?')
+_WORD_RE = re.compile(r'[A-Za-z_]\w*')
 
 
-def _tokens_int(s):
-    return [int(x) for x in _INT.findall(s)]
+def _last_word_before(line: str, pos: int) -> str:
+    """Last identifier on `line` strictly before index `pos`."""
+    m = re.search(r'([A-Za-z_]\w*)\s*$', line[:pos])
+    return m.group(1) if m else ''
 
 
 def _faces_from_coord_index(indices):
@@ -185,192 +172,193 @@ def _faces_from_coord_index(indices):
     return faces
 
 
-class _VRMLStreamParser:
-    """
-    One-pass line-by-line state machine.
-    Tracks nested braces so it knows exactly which block it is inside.
-    """
+class _VRMLParser:
 
     def __init__(self):
-        # brace stack: list of context labels
-        self._stack = []          # e.g. ['Shape', 'appearance', 'Appearance', 'material', 'Material']
-        self._bracket_ctx = None  # which field is being collected inside [ ]
-        self._bracket_buf = []    # token accumulator for current [ ] block
-        self._bracket_depth = 0
+        self._stack     = []       # keyword pushed for each '{'
+        self._last_word = ''       # last identifier seen (for next-line '{')
 
-        # per-Shape accumulators
-        self._reset_shape()
+        # bracket accumulator
+        self._bdepth = 0
+        self._bctx   = None        # 'point' | 'coordIndex' | None
+        self._bbuf   = []
+
+        # current Shape state
+        self._points      = None
+        self._coord_index = None
+        self._color       = [200, 200, 200, 255]
+
+        # context flags (derived from stack)
+        self._in_shape      = False
+        self._in_ifs        = False   # IndexedFaceSet
+        self._in_appearance = False
+        self._in_material   = False
+        self._in_coordinate = False
 
         self.meshes = []
 
-    def _reset_shape(self):
-        self._points = []
-        self._coord_index = []
-        self._color = [200, 200, 200, 255]
-        self._in_shape = False
-        self._in_ifs = False
-        self._in_appearance = False
-        self._in_material = False
-        self._in_coordinate = False
+    # ------------------------------------------------------------------ #
 
-    def _context(self):
+    def _stack_top(self):
         return self._stack[-1] if self._stack else ''
 
-    def _emit_shape(self):
-        """Build a Trimesh from accumulated data and reset."""
+    def _emit(self):
+        """Build mesh from accumulated Shape data."""
         import trimesh
-        if self._points and self._coord_index:
-            verts = np.array(self._points, dtype=np.float64).reshape(-1, 3)
-            faces_list = _faces_from_coord_index(self._coord_index)
-            if faces_list:
-                faces = np.array(faces_list, dtype=np.int64)
+        pts = self._points
+        idx = self._coord_index
+        if pts and idx:
+            verts = np.array(pts, dtype=np.float64).reshape(-1, 3)
+            face_list = _faces_from_coord_index(idx)
+            if face_list:
+                faces = np.array(face_list, dtype=np.int64)
                 valid = np.all((faces >= 0) & (faces < len(verts)), axis=1)
                 faces = faces[valid]
-                if len(faces) > 0:
-                    mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
-                    mesh.visual.face_colors = self._color
-                    self.meshes.append(mesh)
-                    logger.info("  Shape: %d verts %d faces  rgba=%s",
+                if len(faces):
+                    m = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+                    m.visual.face_colors = list(self._color)
+                    self.meshes.append(m)
+                    logger.info("  Shape: %d verts  %d faces  rgba=%s",
                                 len(verts), len(faces), self._color)
-        self._reset_shape()
+        # reset per-shape data
+        self._points      = None
+        self._coord_index = None
+        self._color       = [200, 200, 200, 255]
+        self._in_shape      = False
+        self._in_ifs        = False
+        self._in_appearance = False
+        self._in_material   = False
+        self._in_coordinate = False
 
-    def feed_line(self, line: str):
-        # Strip inline comments
-        comment = line.find('#')
-        if comment != -1:
-            line = line[:comment]
+    # ------------------------------------------------------------------ #
+
+    def feed_line(self, raw: str):
+        # strip comment
+        c = raw.find('#')
+        line = raw[:c] if c != -1 else raw
 
         i = 0
-        while i < len(line):
+        n = len(line)
+
+        while i < n:
             ch = line[i]
 
-            # ─ inside a bracket block: accumulate until depth==0 ─
-            if self._bracket_depth > 0 or (self._bracket_ctx and ch == '['):
+            # ---- inside bracket accumulator ----
+            if self._bdepth > 0:
                 if ch == '[':
-                    self._bracket_depth += 1
-                    i += 1
-                    continue
-                if ch == ']':
-                    self._bracket_depth -= 1
-                    if self._bracket_depth == 0:
-                        # bracket closed: store collected tokens
-                        raw = ''.join(self._bracket_buf)
-                        if self._bracket_ctx == 'point':
-                            self._points = _tokens_float(raw)
-                        elif self._bracket_ctx == 'coordIndex':
-                            self._coord_index = _tokens_int(raw)
-                        self._bracket_buf = []
-                        self._bracket_ctx = None
-                    i += 1
-                    continue
-                self._bracket_buf.append(ch)
+                    self._bdepth += 1
+                elif ch == ']':
+                    self._bdepth -= 1
+                    if self._bdepth == 0:
+                        raw_buf = ''.join(self._bbuf)
+                        if self._bctx == 'point':
+                            self._points = [float(x) for x in _NUM_RE.findall(raw_buf)]
+                        elif self._bctx == 'coordIndex':
+                            self._coord_index = [int(x) for x in re.findall(r'-?\d+', raw_buf)]
+                        self._bbuf  = []
+                        self._bctx  = None
+                else:
+                    self._bbuf.append(ch)
                 i += 1
                 continue
 
-            # ─ brace open ─
+            # ---- brace open ----
             if ch == '{':
-                # peek at the word just before '{' on the stack
-                self._stack.append(self._pending_keyword or '?')
-                self._pending_keyword = None
+                kw = _last_word_before(line, i) or self._last_word
+                self._stack.append(kw)
 
-                ctx = self._context()
-                if ctx == 'Shape':
+                if kw == 'Shape':
                     self._in_shape = True
-                elif ctx == 'IndexedFaceSet' and self._in_shape:
+                elif kw == 'IndexedFaceSet' and self._in_shape:
                     self._in_ifs = True
-                elif ctx == 'Appearance' and self._in_shape:
+                elif kw == 'Appearance' and self._in_shape:
                     self._in_appearance = True
-                elif ctx == 'Material' and self._in_appearance:
+                elif kw == 'Material' and self._in_appearance:
                     self._in_material = True
-                elif ctx == 'Coordinate' and self._in_ifs:
+                elif kw == 'Coordinate' and self._in_ifs:
                     self._in_coordinate = True
+
                 i += 1
                 continue
 
-            # ─ brace close ─
+            # ---- brace close ----
             if ch == '}':
-                ctx = self._context()
-                if ctx == 'Shape' and self._in_shape:
-                    self._emit_shape()
-                elif ctx == 'IndexedFaceSet':
+                top = self._stack_top()
+                if top == 'Shape':
+                    self._emit()
+                elif top == 'IndexedFaceSet':
                     self._in_ifs = False
-                elif ctx == 'Appearance':
+                elif top == 'Appearance':
                     self._in_appearance = False
-                elif ctx == 'Material':
+                elif top == 'Material':
                     self._in_material = False
-                elif ctx == 'Coordinate':
+                elif top == 'Coordinate':
                     self._in_coordinate = False
                 if self._stack:
                     self._stack.pop()
                 i += 1
                 continue
 
-            # ─ bracket open (field value) ─
+            # ---- bracket open ----
             if ch == '[':
-                self._bracket_depth = 1
-                self._bracket_buf = []
-                # determine which field this bracket belongs to
-                # read word backward from current position on the line
-                before = line[:i].rstrip()
-                word_m = re.search(r'(\w+)\s*$', before)
-                field = word_m.group(1) if word_m else ''
-                if self._in_coordinate and field == 'point':
-                    self._bracket_ctx = 'point'
-                elif self._in_ifs and field == 'coordIndex':
-                    self._bracket_ctx = 'coordIndex'
+                self._bdepth = 1
+                self._bbuf   = []
+                field = _last_word_before(line, i)
+                if field == 'point' and (self._in_coordinate or self._in_ifs):
+                    self._bctx = 'point'
+                elif field == 'coordIndex' and self._in_ifs:
+                    self._bctx = 'coordIndex'
                 else:
-                    self._bracket_ctx = '__skip__'
+                    self._bctx = None   # skip
                 i += 1
                 continue
 
             i += 1
 
-        # ─ scan for keywords on this line (outside brackets) ─
-        # We need to track the last keyword seen before a '{'
-        # Do a lightweight scan for known node names
-        if self._bracket_depth == 0:
-            # collect last identifier token as pending keyword
-            tokens = re.findall(r'[A-Za-z_]\w*', line)
-            for tok in tokens:
-                self._pending_keyword = tok
-            # inline field values (no bracket): diffuseColor, transparency
-            if self._in_material:
-                m = re.search(r'diffuseColor\s+(' + _NUM.pattern + r')\s+(' + _NUM.pattern + r')\s+(' + _NUM.pattern + r')', line)
-                if m:
-                    r_, g_, b_ = float(m.group(1)), float(m.group(2)), float(m.group(3))
-                    self._color = [int(r_*255), int(g_*255), int(b_*255), self._color[3]]
-                t = re.search(r'transparency\s+(' + _NUM.pattern + r')', line)
-                if t:
-                    alpha = max(0, min(255, int((1.0 - float(t.group(1))) * 255)))
-                    self._color[3] = alpha
+        # track last word on this line (used when next line is just '{')
+        words = _WORD_RE.findall(line)
+        if words:
+            self._last_word = words[-1]
+
+        # material properties (only meaningful inside Material {})
+        if self._in_material:
+            m = re.search(
+                r'diffuseColor\s+([\d.eE+\-]+)\s+([\d.eE+\-]+)\s+([\d.eE+\-]+)', line)
+            if m:
+                self._color = [
+                    int(float(m.group(1)) * 255),
+                    int(float(m.group(2)) * 255),
+                    int(float(m.group(3)) * 255),
+                    self._color[3],
+                ]
+            t = re.search(r'transparency\s+([\d.eE+\-]+)', line)
+            if t:
+                self._color[3] = max(0, min(255, int((1.0 - float(t.group(1))) * 255)))
+
+    # ------------------------------------------------------------------ #
 
     def parse_file(self, src: Path):
-        self._pending_keyword = None
-        logger.info("Streaming parse of %s (%.1f MB) …", src.name, src.stat().st_size / 1e6)
+        logger.info("Streaming %s  (%.1f MB) …", src.name, src.stat().st_size / 1e6)
         with src.open(encoding='utf-8', errors='replace') as fh:
             for lineno, line in enumerate(fh, 1):
                 self.feed_line(line)
                 if lineno % 500_000 == 0:
-                    logger.info("  … %d lines read, %d shapes so far", lineno, len(self.meshes))
-        # flush any unclosed Shape
-        if self._in_shape:
-            self._emit_shape()
-        logger.info("Parse complete: %d shapes found", len(self.meshes))
+                    logger.info("  … %d lines  %d shapes so far", lineno, len(self.meshes))
+        if self._in_shape:      # flush unclosed Shape at EOF
+            self._emit()
+        logger.info("Parse done: %d shapes", len(self.meshes))
 
 
-# ── Top-level load ───────────────────────────────────────────────────────────────────
+# ── Load + simplify ─────────────────────────────────────────────────────────────────
 
 def _parse_vrml(src: Path):
     import trimesh
-
-    parser = _VRMLStreamParser()
-    parser.parse_file(src)
-
-    if not parser.meshes:
+    p = _VRMLParser()
+    p.parse_file(src)
+    if not p.meshes:
         raise ValueError("No IndexedFaceSet geometry found in the WRL file.")
-
-    combined = trimesh.util.concatenate(parser.meshes)
-    logger.info("Combined: %d faces, %d vertices", len(combined.faces), len(combined.vertices))
+    combined = trimesh.util.concatenate(p.meshes)
+    logger.info("Combined: %d faces  %d verts", len(combined.faces), len(combined.vertices))
     return combined
 
 
@@ -381,18 +369,17 @@ def _simplify(mesh, max_faces: int):
     for method in ('simplify_quadric_decimation', 'simplify_quadratic_decimation'):
         if hasattr(mesh, method):
             try:
-                result = getattr(mesh, method)(max_faces)
-                logger.info("After simplification: %d faces", len(result.faces))
-                return result
+                r = getattr(mesh, method)(max_faces)
+                logger.info("After simplification: %d faces", len(r.faces))
+                return r
             except Exception as exc:
-                logger.warning("Simplification failed (%s) — skipping", exc)
+                logger.warning("Simplification skipped: %s", exc)
                 return mesh
     return mesh
 
 
 def _load_and_simplify(src: Path, max_faces: int):
-    mesh = _parse_vrml(src)
-    return _simplify(mesh, max_faces)
+    return _simplify(_parse_vrml(src), max_faces)
 
 
 def _to_bytes(out) -> bytes:
@@ -411,48 +398,37 @@ def convert():
     f = request.files.get("file")
     if not f or not f.filename:
         return jsonify(detail="No file received."), 400
-
     ext = f.filename.rsplit(".", 1)[-1].lower()
     if ext not in ("wrl", "vrml"):
-        return jsonify(detail=f"Only .wrl / .vrml files are supported (got .{ext})."), 400
-
+        return jsonify(detail=f"Only .wrl/.vrml supported (got .{ext})."), 400
     out_format = request.form.get("out_format", "glb").lower()
     if out_format not in ("glb", "obj", "stl"):
         out_format = "glb"
-
-    max_faces = int(request.form.get("max_faces", 200000))
-    max_faces = max(5000, min(max_faces, 5_000_000))
+    max_faces = max(5000, min(int(request.form.get("max_faces", 200000)), 5_000_000))
 
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as tmp:
             tmp_path = Path(tmp.name)
             f.save(tmp)
-
         mesh = _load_and_simplify(tmp_path, max_faces)
-
-        raw = mesh.export(file_type=out_format)
+        raw  = mesh.export(file_type=out_format)
         out_bytes = _to_bytes(raw)
-        logger.info("Output: %.2f MB  format=%s", len(out_bytes) / 1e6, out_format)
-
+        logger.info("Output: %.2f MB  %s", len(out_bytes) / 1e6, out_format)
         mime = {"glb": "model/gltf-binary", "obj": "text/plain", "stl": "application/octet-stream"}[out_format]
-        stem = Path(f.filename).stem
         return send_file(io.BytesIO(out_bytes), mimetype=mime,
-                         as_attachment=True, download_name=f"{stem}.{out_format}")
-
+                         as_attachment=True, download_name=f"{Path(f.filename).stem}.{out_format}")
     except ValueError as ve:
         return jsonify(detail=str(ve)), 422
     except Exception:
         logger.error(traceback.format_exc())
-        return jsonify(detail="Conversion failed — check terminal for details."), 500
+        return jsonify(detail="Conversion failed — check terminal."), 500
     finally:
         if tmp_path and tmp_path.exists():
-            try:
-                tmp_path.unlink()
-            except Exception:
-                pass
+            try: tmp_path.unlink()
+            except Exception: pass
 
 
 if __name__ == "__main__":
-    print("\n  VRML / WRL Converter running at  http://localhost:5555\n")
+    print("\n  VRML / WRL Converter  →  http://localhost:5555\n")
     app.run(host="0.0.0.0", port=5555, debug=False)
