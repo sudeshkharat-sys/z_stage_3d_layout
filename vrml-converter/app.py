@@ -136,14 +136,22 @@ async function convert(){
 """
 
 
-# ── Transform math ───────────────────────────────────────────────────────────────────
+# ── Compiled patterns (required for .search(text, pos, endpos)) ──────────────────
 
-_FLT = r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?'
-_NODE_RE = re.compile(
-    r'\b(Transform|Group|Separator|Switch|Shape|IndexedFaceSet)\s*\{')
+_FLT     = r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?'
+_NODE_RE = re.compile(r'\b(Transform|Group|Separator|Switch|Shape|IndexedFaceSet)\s*\{')
 _IFS_RE  = re.compile(r'\bIndexedFaceSet\s*\{')
+_CI_RE   = re.compile(r'\bcoordIndex\s*\[')
+_PT_RE   = re.compile(r'\bpoint\s*\[')
 _NUM_RE  = re.compile(r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?')
+_TR_RE   = re.compile(rf'\btranslation\s+({_FLT})\s+({_FLT})\s+({_FLT})')
+_SC_RE   = re.compile(rf'\bscale\s+({_FLT})\s+({_FLT})\s+({_FLT})')
+_RO_RE   = re.compile(rf'\brotation\s+({_FLT})\s+({_FLT})\s+({_FLT})\s+({_FLT})')
+_DC_RE   = re.compile(rf'diffuseColor\s+({_FLT})\s+({_FLT})\s+({_FLT})')
+_TP_RE   = re.compile(rf'transparency\s+({_FLT})')
 
+
+# ── Transform math ───────────────────────────────────────────────────────────────────
 
 def _axis_angle_matrix(x, y, z, angle):
     L = np.sqrt(x*x + y*y + z*z)
@@ -158,28 +166,23 @@ def _axis_angle_matrix(x, y, z, angle):
 
 
 def _transform_matrix(text, cs, ce):
-    """Parse translation/rotation/scale from text[cs:cs+2000] (no copy for large blocks)."""
-    hdr = text[cs: min(cs+2000, ce)]   # only small header slice
+    hdr = text[cs: min(cs+2000, ce)]
     M = np.eye(4)
-    tr = re.search(rf'\btranslation\s+({_FLT})\s+({_FLT})\s+({_FLT})', hdr)
-    if tr:
-        M[0,3]=float(tr.group(1)); M[1,3]=float(tr.group(2)); M[2,3]=float(tr.group(3))
-    sc = re.search(rf'\bscale\s+({_FLT})\s+({_FLT})\s+({_FLT})', hdr)
+    tr = _TR_RE.search(hdr)
+    if tr: M[0,3]=float(tr.group(1)); M[1,3]=float(tr.group(2)); M[2,3]=float(tr.group(3))
     S = np.eye(4)
-    if sc:
-        S[0,0]=float(sc.group(1)); S[1,1]=float(sc.group(2)); S[2,2]=float(sc.group(3))
-    ro = re.search(rf'\brotation\s+({_FLT})\s+({_FLT})\s+({_FLT})\s+({_FLT})', hdr)
+    sc = _SC_RE.search(hdr)
+    if sc: S[0,0]=float(sc.group(1)); S[1,1]=float(sc.group(2)); S[2,2]=float(sc.group(3))
     R = np.eye(4)
-    if ro:
-        R = _axis_angle_matrix(float(ro.group(1)),float(ro.group(2)),
-                                float(ro.group(3)),float(ro.group(4)))
+    ro = _RO_RE.search(hdr)
+    if ro: R = _axis_angle_matrix(float(ro.group(1)),float(ro.group(2)),
+                                   float(ro.group(3)),float(ro.group(4)))
     return M @ R @ S
 
 
-# ── Position-based brace/bracket finders (zero string copies) ───────────────────
+# ── Position-based brace/bracket helpers ───────────────────────────────────────────
 
 def _brace_pos(text, start):
-    """Return (content_start, content_end) of next { } block, or None."""
     p = text.find('{', start)
     if p == -1: return None
     depth = 0
@@ -192,7 +195,6 @@ def _brace_pos(text, start):
 
 
 def _bracket_pos(text, start, end):
-    """Return (content_start, content_end) of next [ ] block within text[start:end], or None."""
     p = text.find('[', start)
     if p == -1 or p >= end: return None
     depth = 0
@@ -221,32 +223,26 @@ def _build_faces(indices):
 
 
 def _extract_ifs(text, cs, ce):
-    """
-    Extract geometry from IndexedFaceSet block text[cs:ce].
-    Returns (verts, faces) or None.
-    All operations use positions; only small numeric slices are copied.
-    """
     # coordIndex
-    ci_m = re.search(r'\bcoordIndex\s*\[', text, cs, ce)
+    ci_m = _CI_RE.search(text, cs, ce)          # compiled pattern: pos/endpos OK
     if not ci_m: return None
     ci_pos = _bracket_pos(text, ci_m.start(), ce)
     if not ci_pos: return None
     indices = [int(x) for x in re.findall(r'-?\d+', text[ci_pos[0]:ci_pos[1]])]
     if not indices: return None
 
-    # point — inside block
-    pt_m = re.search(r'\bpoint\s*\[', text, cs, ce)
+    # point — inside block first
+    pt_m = _PT_RE.search(text, cs, ce)           # compiled pattern: pos/endpos OK
     if pt_m:
         pt_pos = _bracket_pos(text, pt_m.start(), ce)
     else:
         # search backwards up to 60 000 chars
         ws = max(0, cs - 60000)
         last = None
-        for lm in re.finditer(r'\bpoint\s*\[', text[ws:cs]):
+        for lm in _PT_RE.finditer(text, ws, cs):  # compiled pattern: pos/endpos OK
             last = lm
         if not last: return None
-        abs_pt = ws + last.start()
-        pt_pos = _bracket_pos(text, abs_pt, cs + 500)  # allow slight overlap
+        pt_pos = _bracket_pos(text, last.start(), cs + 500)
 
     if not pt_pos: return None
     floats = [float(x) for x in _NUM_RE.findall(text[pt_pos[0]:pt_pos[1]])]
@@ -261,44 +257,37 @@ def _extract_ifs(text, cs, ce):
     return verts, faces
 
 
-# ── Iterative tree walker (no recursion = no stack overflow or string copies) ──────
+# ── Iterative tree walker ─────────────────────────────────────────────────────────────────
 
 def _walk(text, meshes):
-    """
-    Iterative VRML tree walk using an explicit stack of (search_start, search_end, matrix).
-    Never copies the text string — all operations use start/end indices.
-    """
     import trimesh
-
-    # stack entries: (search_start, search_end, transform_matrix)
     stack = [(0, len(text), np.eye(4))]
 
     while stack:
         start, end, matrix = stack.pop()
-
         pos = start
+
         while pos < end:
-            m = _NODE_RE.search(text, pos, end)
+            m = _NODE_RE.search(text, pos, end)   # compiled: pos/endpos OK
             if not m: break
 
             node = m.group(1)
             bp = _brace_pos(text, m.start())
             if not bp: break
-            cs, ce = bp          # content start / end
+            cs, ce = bp
 
             if node in ('Transform', 'Group', 'Separator', 'Switch'):
                 child_matrix = matrix
                 if node == 'Transform':
                     child_matrix = matrix @ _transform_matrix(text, cs, ce)
-                # push children onto stack instead of recursing
                 stack.append((cs, ce, child_matrix))
-                pos = ce + 1     # skip past this block at this level
+                pos = ce + 1
                 continue
 
             elif node in ('Shape', 'IndexedFaceSet'):
                 ifs_cs, ifs_ce = cs, ce
                 if node == 'Shape':
-                    ifs_m = _IFS_RE.search(text, cs, ce)
+                    ifs_m = _IFS_RE.search(text, cs, ce)   # compiled: pos/endpos OK
                     if ifs_m:
                         bp2 = _brace_pos(text, ifs_m.start())
                         if bp2: ifs_cs, ifs_ce = bp2
@@ -313,16 +302,12 @@ def _walk(text, meshes):
                     if not np.allclose(matrix, np.eye(4)):
                         mesh.apply_transform(matrix)
 
-                    # colour — search backwards 10 000 chars
                     color = [200, 200, 200, 255]
-                    back_start = max(0, m.start() - 10000)
-                    dc = re.search(
-                        rf'diffuseColor\s+({_FLT})\s+({_FLT})\s+({_FLT})',
-                        text, back_start, m.start())
+                    back_s = max(0, m.start() - 10000)
+                    dc = _DC_RE.search(text, back_s, m.start())   # compiled: OK
                     if dc:
                         color = [int(float(dc.group(i))*255) for i in (1,2,3)] + [255]
-                        tr2 = re.search(rf'transparency\s+({_FLT})',
-                                        text, back_start, m.start())
+                        tr2 = _TP_RE.search(text, back_s, m.start())  # compiled: OK
                         if tr2:
                             color[3] = max(0, min(255, int((1-float(tr2.group(1)))*255)))
 
