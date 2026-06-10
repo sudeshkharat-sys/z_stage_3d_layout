@@ -1,5 +1,5 @@
 """
-VRML / WRL → GLB / OBJ / STL Converter
+VRML / WRL → GLB / OBJ / STL Converter  (with material colours)
 Standalone local web app — runs on CPU, no GPU needed.
 Usage:
     pip install flask trimesh[easy] numpy
@@ -206,9 +206,10 @@ async function convert() {
 """
 
 
-# ── VRML text parser ──────────────────────────────────────────────────────────────
+# ── VRML parser helpers ──────────────────────────────────────────────────────────
 
 def _extract_bracket_content(text: str, start: int) -> str:
+    """Return text inside the [ ] block at or after `start`."""
     open_pos = text.find('[', start)
     if open_pos == -1:
         return ""
@@ -217,6 +218,22 @@ def _extract_bracket_content(text: str, start: int) -> str:
         if text[i] == '[':
             depth += 1
         elif text[i] == ']':
+            depth -= 1
+            if depth == 0:
+                return text[open_pos + 1:i]
+    return ""
+
+
+def _extract_brace_block(text: str, start: int) -> str:
+    """Return text inside the { } block at or after `start`."""
+    open_pos = text.find('{', start)
+    if open_pos == -1:
+        return ""
+    depth = 0
+    for i in range(open_pos, len(text)):
+        if text[i] == '{':
+            depth += 1
+        elif text[i] == '}':
             depth -= 1
             if depth == 0:
                 return text[open_pos + 1:i]
@@ -248,32 +265,77 @@ def _faces_from_index(indices: list) -> np.ndarray:
     return np.array(faces, dtype=np.int64) if faces else np.empty((0, 3), dtype=np.int64)
 
 
+def _parse_diffuse_color(block: str):
+    """Return (r, g, b) 0-1 floats from a Material block, or None."""
+    m = re.search(
+        r'diffuseColor\s+(\S+)\s+(\S+)\s+(\S+)', block
+    )
+    if m:
+        try:
+            return (float(m.group(1)), float(m.group(2)), float(m.group(3)))
+        except ValueError:
+            pass
+    return None
+
+
+def _parse_transparency(block: str) -> float:
+    m = re.search(r'transparency\s+(\S+)', block)
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            pass
+    return 0.0
+
+
+# ── Main VRML parser ───────────────────────────────────────────────────────────────
+
 def _parse_vrml(src: Path):
     import trimesh
 
     logger.info("Reading %s (%.1f MB) …", src.name, src.stat().st_size / 1e6)
     text = src.read_text(encoding='utf-8', errors='replace')
-    logger.info("File loaded into memory, parsing geometry …")
+    logger.info("Parsing geometry and materials …")
 
     meshes = []
-    for m in re.finditer(r'IndexedFaceSet\s*\{', text):
-        block_start = m.end()
 
-        ci_match = re.search(r'coordIndex\s*\[', text[block_start:block_start + 200000])
-        if not ci_match:
+    # Iterate over every Shape { } block
+    for shape_m in re.finditer(r'\bShape\s*\{', text):
+        shape_block = _extract_brace_block(text, shape_m.start())
+        if not shape_block:
             continue
-        ci_abs = block_start + ci_match.start()
-        ci_content = _extract_bracket_content(text, ci_abs)
+
+        # ─ geometry: IndexedFaceSet only ─
+        ifs_m = re.search(r'\bIndexedFaceSet\s*\{', shape_block)
+        if not ifs_m:
+            continue
+        ifs_block = _extract_brace_block(shape_block, ifs_m.start())
+        if not ifs_block:
+            continue
+
+        # coordIndex
+        ci_m = re.search(r'coordIndex\s*\[', ifs_block)
+        if not ci_m:
+            continue
+        ci_content = _extract_bracket_content(ifs_block, ci_m.start())
         indices = _parse_ints(ci_content)
         if not indices:
             continue
 
-        search_zone = text[max(0, block_start - 5000): block_start + 500000]
-        pt_match = re.search(r'point\s*\[', search_zone)
-        if not pt_match:
-            continue
-        pt_abs = max(0, block_start - 5000) + pt_match.start()
-        pt_content = _extract_bracket_content(text, pt_abs)
+        # Coordinate point
+        pt_m = re.search(r'\bpoint\s*\[', ifs_block)
+        if not pt_m:
+            # sometimes Coordinate { point [...] } is referenced outside ifs_block
+            # fall back: search a window before this Shape in the full text
+            shape_abs = shape_m.start()
+            window = text[max(0, shape_abs - 20000): shape_abs + len(shape_block) + 1000]
+            pt_m2 = re.search(r'\bpoint\s*\[', window)
+            if not pt_m2:
+                continue
+            pt_content = _extract_bracket_content(window, pt_m2.start())
+        else:
+            pt_content = _extract_bracket_content(ifs_block, pt_m.start())
+
         floats = _parse_floats(pt_content)
         if floats.size < 9 or floats.size % 3 != 0:
             continue
@@ -288,17 +350,40 @@ def _parse_vrml(src: Path):
         if len(faces) == 0:
             continue
 
-        meshes.append(trimesh.Trimesh(vertices=verts, faces=faces, process=False))
-        logger.info("  Mesh: %d verts, %d faces", len(verts), len(faces))
+        mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+
+        # ─ material / colour ─
+        color_rgba = [200, 200, 200, 255]  # default grey
+        app_m = re.search(r'\bAppearance\s*\{', shape_block)
+        if app_m:
+            app_block = _extract_brace_block(shape_block, app_m.start())
+            mat_m = re.search(r'\bMaterial\s*\{', app_block)
+            if mat_m:
+                mat_block = _extract_brace_block(app_block, mat_m.start())
+                rgb = _parse_diffuse_color(mat_block)
+                if rgb:
+                    transp = _parse_transparency(mat_block)
+                    alpha = max(0, min(255, int((1.0 - transp) * 255)))
+                    color_rgba = [
+                        int(rgb[0] * 255),
+                        int(rgb[1] * 255),
+                        int(rgb[2] * 255),
+                        alpha,
+                    ]
+
+        mesh.visual.face_colors = color_rgba
+        meshes.append(mesh)
+        logger.info("  Shape: %d verts, %d faces  color=(%d,%d,%d,%d)",
+                    len(verts), len(faces), *color_rgba)
 
     if not meshes:
         raise ValueError(
-            "No IndexedFaceSet geometry found in the WRL file. "
-            "The file may use a different VRML geometry type."
+            "No IndexedFaceSet geometry found in the WRL file."
         )
 
     combined = trimesh.util.concatenate(meshes)
-    logger.info("Total: %d faces, %d vertices", len(combined.faces), len(combined.vertices))
+    logger.info("Total: %d faces, %d vertices, %d shapes",
+                len(combined.faces), len(combined.vertices), len(meshes))
     return combined
 
 
@@ -306,7 +391,6 @@ def _simplify(mesh, max_faces: int):
     if len(mesh.faces) <= max_faces:
         return mesh
     logger.info("Simplifying to ~%d faces …", max_faces)
-    # try both method names across trimesh versions
     for method in ('simplify_quadric_decimation', 'simplify_quadratic_decimation'):
         if hasattr(mesh, method):
             try:
@@ -326,7 +410,6 @@ def _load_and_simplify(src: Path, max_faces: int):
 
 
 def _to_bytes(out, fmt: str) -> bytes:
-    """Export trimesh to bytes, handling formats that return str."""
     if isinstance(out, str):
         return out.encode('utf-8')
     return bytes(out)
