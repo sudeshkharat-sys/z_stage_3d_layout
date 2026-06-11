@@ -330,8 +330,16 @@ def _parse_floats(text, pos_tuple):
     return np.array(nums, dtype=np.float64) if nums else None
 
 
+def _parse_face_indices(text, start, end):
+    """Fast face index parser using numpy — much faster than list comprehension on large IFS."""
+    raw = text[start:end]
+    arr = np.fromstring(raw.replace(',', ' '), dtype=np.int32, sep=' ')
+    return arr if len(arr) > 0 else np.array([], dtype=np.int32)
+
+
 # ── Face builder ───────────────────────────────────────────────────────────────
 def _build_faces(indices):
+    """Fan-triangulate polygons delimited by -1 sentinels."""
     faces, fan = [], []
     for idx in indices:
         if idx < 0:
@@ -340,11 +348,11 @@ def _build_faces(indices):
                     faces.append((fan[0], fan[j], fan[j + 1]))
             fan = []
         else:
-            fan.append(idx)
+            fan.append(int(idx))
     if len(fan) >= 3:
         for j in range(1, len(fan) - 1):
             faces.append((fan[0], fan[j], fan[j + 1]))
-    return np.array(faces, dtype=np.int64) if faces else np.empty((0, 3), dtype=np.int64)
+    return np.array(faces, dtype=np.int32) if faces else np.empty((0, 3), dtype=np.int32)
 
 
 # ── Direct-child scanner ───────────────────────────────────────────────────────
@@ -585,8 +593,8 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_map, field_use_positions,
                         ci_pp = _bracket_pos(text, ci_m.start(), cce, bracket_idx)
                         if ci_pp is None:
                             continue
-                        indices = [int(x) for x in re.findall(r'-?\d+', text[ci_pp[0]:ci_pp[1]])]
-                        if not indices:
+                        indices = _parse_face_indices(text, ci_pp[0], ci_pp[1])
+                        if len(indices) == 0:
                             continue
                         faces = _build_faces(indices)
                         if len(faces) == 0:
@@ -596,7 +604,7 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_map, field_use_positions,
                         if len(faces) == 0:
                             continue
                         color = list(_DEFAULT_COLOR) if color_mode == 'gray' else list(shape_color)
-                        mesh = trimesh.Trimesh(vertices=ifs_coord.copy(), faces=faces, process=False)
+                        mesh = trimesh.Trimesh(vertices=ifs_coord.copy(), faces=faces, process=True)
                         if not np.allclose(current_matrix, np.eye(4)):
                             mesh.apply_transform(current_matrix)
                         mesh.visual.face_colors = color
@@ -627,8 +635,8 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_map, field_use_positions,
                 if ci_pp is None:
                     continue
 
-                indices = [int(x) for x in re.findall(r'-?\d+', text[ci_pp[0]:ci_pp[1]])]
-                if not indices:
+                indices = _parse_face_indices(text, ci_pp[0], ci_pp[1])
+                if len(indices) == 0:
                     continue
                 faces = _build_faces(indices)
                 if len(faces) == 0:
@@ -639,7 +647,7 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_map, field_use_positions,
                     continue
 
                 color = list(_DEFAULT_COLOR) if color_mode == 'gray' else list(current_color)
-                mesh = trimesh.Trimesh(vertices=ifs_coord.copy(), faces=faces, process=False)
+                mesh = trimesh.Trimesh(vertices=ifs_coord.copy(), faces=faces, process=True)
                 if not np.allclose(current_matrix, np.eye(4)):
                     mesh.apply_transform(current_matrix)
                 mesh.visual.face_colors = color
@@ -669,7 +677,7 @@ def _simplify(mesh, max_faces):
 
 # ── Same-color mesh merging ────────────────────────────────────────────────────
 def _merge_by_color(meshes):
-    """Merge meshes with the same color into single meshes to reduce GLB primitive count."""
+    """Merge meshes with the same color, then deduplicate shared vertices per group."""
     import trimesh
     groups = {}
     for m in meshes:
@@ -682,41 +690,24 @@ def _merge_by_color(meshes):
         groups.setdefault(key, []).append(m)
     result = []
     for key, group in groups.items():
-        if len(group) == 1:
-            result.append(group[0])
-        else:
-            merged = trimesh.util.concatenate(group)
-            merged.visual.face_colors = list(key)
-            result.append(merged)
-    logger.info('Color groups: %d → %d merged meshes', len(meshes), len(result))
+        merged = trimesh.util.concatenate(group) if len(group) > 1 else group[0]
+        # Deduplicate vertices across the merged mesh — big size reduction
+        try:
+            merged = trimesh.Trimesh(
+                vertices=merged.vertices,
+                faces=merged.faces,
+                process=True,          # merges duplicate verts, removes degenerate faces
+            )
+        except Exception:
+            pass
+        merged.visual.face_colors = list(key)
+        result.append(merged)
+    total_v = sum(len(m.vertices) for m in result)
+    total_f = sum(len(m.faces) for m in result)
+    logger.info('Color groups: %d → %d meshes  verts=%d  faces=%d',
+                len(meshes), len(result), total_v, total_f)
     return result
 
-
-# ── PBR material assignment ────────────────────────────────────────────────────
-def _assign_pbr_materials(meshes):
-    """Assign PBR materials (metallic=0, roughness=0.7) for correct Three.js rendering."""
-    try:
-        from trimesh.visual.material import PBRMaterial
-        result = []
-        for m in meshes:
-            fc = m.visual.face_colors
-            if hasattr(fc, '__len__') and len(fc) > 0:
-                c = list(fc[0])
-            else:
-                c = list(_DEFAULT_COLOR)
-            r, g, b, a = (c + [255])[:4]
-            mat = PBRMaterial(
-                baseColorFactor=[r/255, g/255, b/255, a/255],
-                metallicFactor=0.0,
-                roughnessFactor=0.7,
-            )
-            m2 = m.copy()
-            m2.visual = m2.visual.to_texture()
-            m2.visual.material = mat
-            result.append(m2)
-        return result
-    except Exception:
-        return meshes
 
 
 # ── Draco GLB export ───────────────────────────────────────────────────────────
@@ -744,14 +735,24 @@ def _export_glb_draco(meshes):
             faces = np.array(m.faces, dtype=np.uint32)
 
             try:
-                draco_bytes = DracoPy.encode(verts, faces)
-            except Exception:
+                # quantization_bits=14 gives good precision with ~40% smaller output vs default 16
+                draco_bytes = DracoPy.encode(verts, faces,
+                                             quantization_bits=14,
+                                             compression_level=7)
+            except TypeError:
+                # older DracoPy API without kwargs
                 try:
-                    draco_bytes = DracoPy.encode_mesh_to_buffer(
-                        verts.flatten().tolist(), faces.flatten().tolist())
-                except Exception as e:
-                    logger.warning('Draco encode failed for mesh %d: %s', idx, e)
-                    return None
+                    draco_bytes = DracoPy.encode(verts, faces)
+                except Exception:
+                    try:
+                        draco_bytes = DracoPy.encode_mesh_to_buffer(
+                            verts.flatten().tolist(), faces.flatten().tolist())
+                    except Exception as e:
+                        logger.warning('Draco encode failed for mesh %d: %s', idx, e)
+                        return None
+            except Exception as e:
+                logger.warning('Draco encode failed for mesh %d: %s', idx, e)
+                return None
 
             # Buffer view for Draco blob
             bv_idx = len(buffer_views)
@@ -852,20 +853,94 @@ def _export_glb_draco(meshes):
 
 
 # ── GLB export (Draco → standard fallback) ────────────────────────────────────
+def _export_glb_standard(meshes):
+    """
+    Build a compact GLB manually: float32 positions + uint32 indices only.
+    No normals (Three.js computes them), no UVs — minimises file size.
+    """
+    bin_chunks = []
+    bin_offset = 0
+    accessors = []
+    buffer_views = []
+    mesh_primitives = []
+    materials = []
+
+    for m in meshes:
+        verts = np.asarray(m.vertices, dtype=np.float32)
+        faces = np.asarray(m.faces, dtype=np.uint32)
+
+        # ── vertex buffer view ──
+        vb = verts.tobytes()
+        bv_verts = len(buffer_views)
+        buffer_views.append({"buffer": 0, "byteOffset": bin_offset, "byteLength": len(vb),
+                              "byteStride": 12, "target": 34962})
+        bin_chunks.append(vb)
+        bin_offset += len(vb)
+        pad = (4 - len(vb) % 4) % 4
+        if pad:
+            bin_chunks.append(b'\x00' * pad); bin_offset += pad
+
+        # ── index buffer view ──
+        ib = faces.tobytes()
+        bv_idx = len(buffer_views)
+        buffer_views.append({"buffer": 0, "byteOffset": bin_offset, "byteLength": len(ib),
+                              "target": 34963})
+        bin_chunks.append(ib)
+        bin_offset += len(ib)
+        pad = (4 - len(ib) % 4) % 4
+        if pad:
+            bin_chunks.append(b'\x00' * pad); bin_offset += pad
+
+        vmin = verts.min(axis=0).tolist()
+        vmax = verts.max(axis=0).tolist()
+        pos_acc = len(accessors)
+        accessors.append({"bufferView": bv_verts, "byteOffset": 0, "componentType": 5126,
+                           "count": len(verts), "type": "VEC3", "min": vmin, "max": vmax})
+        idx_acc = len(accessors)
+        accessors.append({"bufferView": bv_idx, "byteOffset": 0, "componentType": 5125,
+                           "count": int(faces.size), "type": "SCALAR"})
+
+        fc = m.visual.face_colors if hasattr(m.visual, 'face_colors') else None
+        c = list(fc[0]) if (fc is not None and hasattr(fc, '__len__') and len(fc) > 0) else list(_DEFAULT_COLOR)
+        r, g, b, a = (c + [255])[:4]
+        mat_idx = len(materials)
+        materials.append({
+            "pbrMetallicRoughness": {
+                "baseColorFactor": [r/255, g/255, b/255, a/255],
+                "metallicFactor": 0.0, "roughnessFactor": 0.7,
+            },
+            "doubleSided": True,
+        })
+        mesh_primitives.append({"attributes": {"POSITION": pos_acc}, "indices": idx_acc,
+                                 "material": mat_idx})
+
+    bin_data = b''.join(bin_chunks)
+    gltf = {
+        "asset": {"version": "2.0", "generator": "vrml-converter"},
+        "scene": 0,
+        "scenes": [{"nodes": [0]}],
+        "nodes": [{"mesh": 0}],
+        "meshes": [{"primitives": mesh_primitives}],
+        "materials": materials,
+        "accessors": accessors,
+        "bufferViews": buffer_views,
+        "buffers": [{"byteLength": len(bin_data)}],
+    }
+    json_bytes = json.dumps(gltf, separators=(',', ':')).encode('utf-8')
+    json_pad = (4 - len(json_bytes) % 4) % 4
+    json_bytes += b' ' * json_pad
+    glb_len = 12 + 8 + len(json_bytes) + 8 + len(bin_data)
+    return (struct.pack('<III', 0x46546C67, 2, glb_len)
+            + struct.pack('<II', len(json_bytes), 0x4E4F534A) + json_bytes
+            + struct.pack('<II', len(bin_data), 0x004E4942) + bin_data)
+
+
 def _export_glb(meshes):
-    """Export list of meshes as GLB. Tries Draco first, falls back to trimesh Scene."""
+    """Export list of meshes as GLB. Tries Draco first, falls back to compact standard GLB."""
     draco_bytes = _export_glb_draco(meshes)
     if draco_bytes:
         return draco_bytes, True
-
-    # Standard trimesh GLB with PBR materials
-    import trimesh
-    pbr_meshes = _assign_pbr_materials(meshes)
-    scene = trimesh.scene.Scene()
-    for i, m in enumerate(pbr_meshes):
-        scene.add_geometry(m, node_name=f'part_{i}')
-    raw = scene.export(file_type='glb')
-    return bytes(raw) if not isinstance(raw, bytes) else raw, False
+    return _export_glb_standard(meshes), False
 
 
 # ── VRML parse entry point ─────────────────────────────────────────────────────
