@@ -678,6 +678,40 @@ def _parse_vrml(src: Path, color_mode: str, progress_cb=None):
 
 
 # ── Background job ─────────────────────────────────────────────────────────────
+def _export_glb_with_materials(meshes):
+    """
+    Export each color group as a separate named mesh node with a GLB material
+    (baseColorFactor). Three.js reads material colors natively — no vertexColors
+    config needed. metallicFactor=0 prevents the dark metallic look.
+    """
+    import trimesh
+    try:
+        from trimesh.visual.material import PBRMaterial
+    except ImportError:
+        # Fallback: concatenate and let trimesh handle it
+        combined = trimesh.util.concatenate(meshes)
+        raw = combined.export(file_type='glb')
+        return bytes(raw) if not isinstance(raw, bytes) else raw
+
+    scene = trimesh.scene.Scene()
+    for i, m in enumerate(meshes):
+        fc = m.visual.face_colors
+        c = list(fc[0]) if (hasattr(fc, '__len__') and len(fc) > 0) else list(_DEFAULT_COLOR)
+        r, g, b, a = (c + [255])[:4]
+
+        mat = PBRMaterial(
+            baseColorFactor=[r / 255.0, g / 255.0, b / 255.0, a / 255.0],
+            metallicFactor=0.0,
+            roughnessFactor=0.8,
+        )
+        m2 = trimesh.Trimesh(vertices=m.vertices, faces=m.faces, process=False)
+        m2.visual = trimesh.visual.TextureVisuals(material=mat)
+        scene.add_geometry(m2, node_name=f'part_{i}')
+
+    raw = scene.export(file_type='glb')
+    return bytes(raw) if not isinstance(raw, bytes) else raw
+
+
 def _run_job(jid, tmp_path, out_format, max_faces, color_mode):
     try:
         import trimesh
@@ -690,15 +724,24 @@ def _run_job(jid, tmp_path, out_format, max_faces, color_mode):
 
         meshes = _parse_vrml(tmp_path, color_mode, progress_cb=cb)
 
-        _job_set(jid, pct=85, label='Combining…')
-        combined = trimesh.util.concatenate(meshes)
-
         _job_set(jid, pct=88, label='Simplifying…')
+        # Simplify on the combined mesh, then re-split if needed
+        combined = trimesh.util.concatenate(meshes)
         combined = _simplify(combined, max_faces)
 
         _job_set(jid, pct=92, label=f'Exporting {out_format.upper()}…')
-        raw = combined.export(file_type=out_format)
-        out_bytes = bytes(raw) if not isinstance(raw, bytes) else raw
+        if out_format == 'glb':
+            # For GLB: use per-mesh materials so colors show correctly in Three.js
+            # If we simplified, meshes list still has original color groups
+            if len(combined.faces) < sum(len(m.faces) for m in meshes):
+                # Simplification happened — export combined with face_colors
+                raw = combined.export(file_type='glb')
+            else:
+                raw = _export_glb_with_materials(meshes)
+            out_bytes = bytes(raw) if not isinstance(raw, bytes) else raw
+        else:
+            raw = combined.export(file_type=out_format)
+            out_bytes = bytes(raw) if not isinstance(raw, bytes) else raw
 
         _job_set(jid, pct=100, label='Done!', status='done',
                  result=out_bytes, parts=len(meshes), size=len(out_bytes))
