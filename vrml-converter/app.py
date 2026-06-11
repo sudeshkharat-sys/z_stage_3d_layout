@@ -4,13 +4,12 @@ Handles:
   - VRML 1.0 (Open Inventor) state machine: Coordinate3 + Material + IndexedFaceSet siblings
   - VRML 2.0 (VRML97): Transform/Shape/Appearance/Material/Coordinate hierarchy
   - DEF/USE references (named node reuse)
-  - Same-color mesh merging for compact GLB output
-  - Draco geometry compression (KHR_draco_mesh_compression) via DracoPy
+  - Same-color mesh merging + vertex deduplication for smaller output
   - Server-Sent Events (SSE) real progress stream
   - Color mode: actual VRML colors or uniform light-gray
 
 Usage:
-    pip install flask trimesh[easy] numpy DracoPy
+    pip install flask trimesh[easy] numpy
     python app.py
 Open http://localhost:5555
 """
@@ -19,7 +18,6 @@ import io
 import json
 import logging
 import re
-import struct
 import tempfile
 import threading
 import time
@@ -37,8 +35,7 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024 * 1024
 
 # ── Job store ──────────────────────────────────────────────────────────────────
-_jobs = {}   # job_id -> {"status": "running"|"done"|"error", "pct": int, "label": str,
-             #             "result": bytes|None, "format": str, "error": str}
+_jobs = {}
 _jobs_lock = threading.Lock()
 
 
@@ -99,8 +96,6 @@ HTML = r"""
   .result.ok  { background: #052e16; border: 1px solid #16a34a; color: #86efac; }
   .result.err { background: #2d0a0a; border: 1px solid #dc2626; color: #fca5a5; }
   .stats { margin-top: .5rem; font-size: .82rem; color: #64748b; line-height: 1.6; }
-  .badge { display: inline-block; font-size: .72rem; padding: .1rem .45rem; border-radius: 4px;
-    background: #164e63; color: #67e8f9; margin-left: .4rem; vertical-align: middle; }
 </style>
 </head>
 <body>
@@ -184,13 +179,7 @@ async function convert(){
       a.download=chosenFile.name.replace(/\.[^.]+$/,'')+'.'+document.getElementById('outFmt').value;
       a.click();
       rb.className='result ok';rb.style.display='block';
-      let badge=d.draco?'<span class="badge">Draco</span>':'';
-      rb.innerHTML='&#9989; Converted!'+badge+'<div class="stats">'+
-        'Output size: '+fmt(d.size)+'<br/>'+
-        'Parts: '+d.parts+'<br/>'+
-        (d.draco?'Compression: Draco (KHR_draco_mesh_compression)<br/>':'')+
-        'Color mode: '+(colorMode==='actual'?'Actual VRML colors':'Uniform light gray')+
-        '</div>';
+      rb.innerHTML='✅ Converted!<div class="stats">Output size: '+fmt(d.size)+'<br/>Parts merged: '+d.parts+'<br/>Color mode: '+(colorMode==='actual'?'Actual VRML colors':'Uniform light gray')+'</div>';
       btn.disabled=false;
     }else if(d.status==='error'){
       evtSrc.close();evtSrc=null;
@@ -215,7 +204,6 @@ _NUM_RE     = re.compile(r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?')
 _BRACE_RE   = re.compile(r'[{}]')
 _BRACKET_RE = re.compile(r'[\[\]]')
 
-# VRML 1.0 + 2.0 node types we scan for
 _DIRECT_RE = re.compile(
     r'\b(MatrixTransform|Transform|Separator|Group|Switch'
     r'|TransformSeparator|Coordinate3|IndexedFaceSet|IndexedLineSet'
@@ -225,29 +213,24 @@ _DIRECT_RE = re.compile(
     r'|Cube|Sphere|Cone|Cylinder|AsciiText'
     r'|FontStyle|DrawStyle|LightModel|BaseColor|PackedColor'
     r'|EnvironmentMap|ShapeKit|WWWAnchor|WWWInline'
-    # VRML 2.0
     r'|Shape|Appearance|Coordinate|Anchor|Billboard|Collision'
     r')\s*\{'
 )
 
-# DEF name NodeType {
-_DEF_RE = re.compile(r'\bDEF\s+(\S+)\s+(\w+)\s*\{')
-# standalone USE name (not after coord/appearance/geometry/material field names)
+_DEF_RE            = re.compile(r'\bDEF\s+(\S+)\s+(\w+)\s*\{')
 _USE_STANDALONE_RE = re.compile(r'(?<!\w)USE\s+(\S+)')
-# field-value USE patterns: coord USE x, appearance USE x, geometry USE x, etc.
-_FIELD_USE_RE = re.compile(
+_FIELD_USE_RE      = re.compile(
     r'\b(?:coord|appearance|geometry|material|color|normal|texCoord|children)\s+USE\s+(\S+)'
 )
 
-_PT_RE       = re.compile(r'\bpoint\s*\[')
-_CI_RE       = re.compile(r'\bcoordIndex\s*\[')
-_DC_RE       = re.compile(rf'\bdiffuseColor\s+({_FLT})\s+({_FLT})\s+({_FLT})')
-_FLT16       = r'\s+'.join([rf'({_FLT})'] * 16)
-_MTX_VALS_RE = re.compile(r'\bmatrix\s+' + _FLT16)
-_TR1_RE      = re.compile(rf'\btranslation\s+({_FLT})\s+({_FLT})\s+({_FLT})')
-_SC1_RE      = re.compile(rf'\bscaleFactor\s+({_FLT})(?:\s+({_FLT})\s+({_FLT}))?')
-_RO1_RE      = re.compile(rf'\brotation\s+({_FLT})\s+({_FLT})\s+({_FLT})\s+({_FLT})')
-# Inline coord: coord [DEF name] Coordinate { point [...] }
+_PT_RE          = re.compile(r'\bpoint\s*\[')
+_CI_RE          = re.compile(r'\bcoordIndex\s*\[')
+_DC_RE          = re.compile(rf'\bdiffuseColor\s+({_FLT})\s+({_FLT})\s+({_FLT})')
+_FLT16          = r'\s+'.join([rf'({_FLT})'] * 16)
+_MTX_VALS_RE    = re.compile(r'\bmatrix\s+' + _FLT16)
+_TR1_RE         = re.compile(rf'\btranslation\s+({_FLT})\s+({_FLT})\s+({_FLT})')
+_SC1_RE         = re.compile(rf'\bscaleFactor\s+({_FLT})(?:\s+({_FLT})\s+({_FLT}))?')
+_RO1_RE         = re.compile(rf'\brotation\s+({_FLT})\s+({_FLT})\s+({_FLT})\s+({_FLT})')
 _COORD_FIELD_RE = re.compile(r'\bcoord\s+(?:DEF\s+\S+\s+)?Coordinate\s*\{')
 _COORD_USE_RE   = re.compile(r'\bcoord\s+USE\s+(\S+)')
 
@@ -278,7 +261,6 @@ def _build_bracket_index(text):
 
 
 def _build_def_map(text, brace_idx):
-    """Pre-scan all DEF name NodeType { ... } entries."""
     def_map = {}
     for m in _DEF_RE.finditer(text):
         name, node_type = m.group(1), m.group(2)
@@ -293,16 +275,14 @@ def _build_def_map(text, brace_idx):
 
 
 def _build_field_use_positions(text):
-    """Pre-compute byte offsets of all field-value USE tokens (coord USE x, etc.)."""
     positions = set()
     for m in _FIELD_USE_RE.finditer(text):
-        # find the "USE" within this match
         use_pos = text.index('USE', m.start())
         positions.add(use_pos)
     return positions
 
 
-# ── Position helpers ───────────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────────
 def _bracket_pos(text, start, end, bracket_idx):
     p = text.find('[', start)
     if p == -1 or p >= end:
@@ -311,7 +291,6 @@ def _bracket_pos(text, start, end, bracket_idx):
     return (p + 1, cl) if (cl is not None and cl <= end) else None
 
 
-# ── Math helpers ───────────────────────────────────────────────────────────────
 def _axis_angle_to_mat4(x, y, z, angle):
     L = np.sqrt(x*x + y*y + z*z)
     if L < 1e-10:
@@ -331,15 +310,12 @@ def _parse_floats(text, pos_tuple):
 
 
 def _parse_face_indices(text, start, end):
-    """Fast face index parser using numpy — much faster than list comprehension on large IFS."""
-    raw = text[start:end]
-    arr = np.fromstring(raw.replace(',', ' '), dtype=np.int32, sep=' ')
+    raw = text[start:end].replace(',', ' ')
+    arr = np.fromstring(raw, dtype=np.int32, sep=' ')
     return arr if len(arr) > 0 else np.array([], dtype=np.int32)
 
 
-# ── Face builder ───────────────────────────────────────────────────────────────
 def _build_faces(indices):
-    """Fan-triangulate polygons delimited by -1 sentinels."""
     faces, fan = [], []
     for idx in indices:
         if idx < 0:
@@ -355,32 +331,29 @@ def _build_faces(indices):
     return np.array(faces, dtype=np.int32) if faces else np.empty((0, 3), dtype=np.int32)
 
 
+def _extract_diffuse(text, cs, ce):
+    hdr = text[cs: min(cs + 400, ce)]
+    dc = _DC_RE.search(hdr)
+    if dc:
+        return [int(float(dc.group(i)) * 255) for i in (1, 2, 3)] + [255]
+    return None
+
+
 # ── Direct-child scanner ───────────────────────────────────────────────────────
 def _direct_children(text, cs, ce, brace_idx, def_map, field_use_positions):
-    """
-    Yield (node_name, keyword_pos, content_cs, content_ce) for every direct
-    child in [cs, ce).  Also yields bare USE references that are NOT field-
-    value USEs (i.e. standalone child nodes referenced by name).
-    """
     pos = cs
     while pos < ce:
-        # find next explicit node OR USE reference
         nm = _DIRECT_RE.search(text, pos, ce)
         um = _USE_STANDALONE_RE.search(text, pos, ce)
-
-        # pick whichever comes first
         if nm is None and um is None:
             break
         use_first = (nm is None) or (um is not None and um.start() < nm.start())
 
         if use_first:
-            # Check it's not a field-value USE
-            use_token_pos = um.start()
-            if use_token_pos in field_use_positions:
+            if um.start() in field_use_positions:
                 pos = um.end()
                 continue
-            name = um.group(1)
-            entry = def_map.get(name)
+            entry = def_map.get(um.group(1))
             if entry is None:
                 pos = um.end()
                 continue
@@ -397,25 +370,17 @@ def _direct_children(text, cs, ce, brace_idx, def_map, field_use_positions):
             if brace_close is None or brace_close > ce:
                 pos = nm.end()
                 continue
-            # Check for DEF prefix before this node
+            # register inline DEF
             prefix = text[max(cs, nm.start() - 40): nm.start()]
-            def_prefix = re.search(r'\bDEF\s+(\S+)\s*$', prefix)
-            if def_prefix:
-                def_name = def_prefix.group(1)
-                if def_name not in def_map:
-                    def_map[def_name] = (node, brace_open + 1, brace_close)
+            dm = re.search(r'\bDEF\s+(\S+)\s*$', prefix)
+            if dm and dm.group(1) not in def_map:
+                def_map[dm.group(1)] = (node, brace_open + 1, brace_close)
             yield node, nm.start(), brace_open + 1, brace_close
             pos = brace_close + 1
 
 
 # ── Inline coord resolver ──────────────────────────────────────────────────────
 def _inline_coord(text, ncs, nce, brace_idx, bracket_idx, def_map):
-    """
-    For VRML 2.0 IFS: resolve `coord Coordinate { point [...] }` or
-    `coord USE name` inline within an IFS block.
-    Returns numpy (N,3) or None.
-    """
-    # inline Coordinate node
     cm = _COORD_FIELD_RE.search(text, ncs, nce)
     if cm:
         bo = text.find('{', cm.start())
@@ -429,7 +394,6 @@ def _inline_coord(text, ncs, nce, brace_idx, bracket_idx, def_map):
                         floats = _parse_floats(text, pp)
                         if floats is not None and len(floats) >= 9 and len(floats) % 3 == 0:
                             return floats.reshape(-1, 3)
-    # USE reference
     um = _COORD_USE_RE.search(text, ncs, nce)
     if um:
         entry = def_map.get(um.group(1))
@@ -445,29 +409,14 @@ def _inline_coord(text, ncs, nce, brace_idx, bracket_idx, def_map):
     return None
 
 
-# ── Color extractor ────────────────────────────────────────────────────────────
-def _extract_diffuse(text, cs, ce):
-    hdr = text[cs: min(cs + 400, ce)]
-    dc = _DC_RE.search(hdr)
-    if dc:
-        return [int(float(dc.group(i)) * 255) for i in (1, 2, 3)] + [255]
-    return None
-
-
-# ── VRML 1.0 + 2.0 state-machine walker ───────────────────────────────────────
-_CONTAINERS_V1 = frozenset({
-    'Separator', 'Group', 'Switch', 'TransformSeparator',
-})
-_CONTAINERS_V2 = frozenset({
-    'Shape', 'Anchor', 'Billboard', 'Collision',
-})
+# ── VRML walker ────────────────────────────────────────────────────────────────
+_CONTAINERS_V1 = frozenset({'Separator', 'Group', 'Switch', 'TransformSeparator'})
 
 
 def _walk(text, meshes, brace_idx, bracket_idx, def_map, field_use_positions,
           color_mode, progress_cb=None):
     import trimesh
 
-    # stack items: (cs, ce, matrix, coord, color)
     stack = [(0, len(text), np.eye(4), None, list(_DEFAULT_COLOR))]
     total_tried = 0
     text_len = len(text)
@@ -485,14 +434,12 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_map, field_use_positions,
         for node, node_pos, ncs, nce in _direct_children(
                 text, cs, ce, brace_idx, def_map, field_use_positions):
 
-            # ── Transform matrix nodes ──
             if node == 'MatrixTransform':
                 vm = _MTX_VALS_RE.search(text, ncs, nce)
                 if vm:
                     mat = np.array([float(vm.group(i)) for i in range(1, 17)],
                                    dtype=np.float64).reshape(4, 4)
                     current_matrix = parent_matrix @ mat
-                # push children for VRML 2.0
                 stack.append((ncs, nce, current_matrix, current_coord, list(current_color)))
 
             elif node == 'Transform':
@@ -512,12 +459,9 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_map, field_use_positions,
                     sz = float(sc.group(3)) if sc.group(3) else sx
                     M = M @ np.diag([sx, sy, sz, 1.0])
                 new_matrix = parent_matrix @ M
-                # VRML 1.0: update current matrix for siblings
                 current_matrix = new_matrix
-                # VRML 2.0: push children scope
                 stack.append((ncs, nce, new_matrix, current_coord, list(current_color)))
 
-            # ── VRML 1.0 coord ──
             elif node == 'Coordinate3':
                 pt_m = _PT_RE.search(text, ncs, nce)
                 if pt_m:
@@ -527,7 +471,6 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_map, field_use_positions,
                         if floats is not None and len(floats) >= 9 and len(floats) % 3 == 0:
                             current_coord = floats.reshape(-1, 3)
 
-            # ── VRML 2.0 coord (also in Coordinate node used by IFS) ──
             elif node == 'Coordinate':
                 pt_m = _PT_RE.search(text, ncs, nce)
                 if pt_m:
@@ -537,13 +480,11 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_map, field_use_positions,
                         if floats is not None and len(floats) >= 9 and len(floats) % 3 == 0:
                             current_coord = floats.reshape(-1, 3)
 
-            # ── VRML 1.0 material ──
             elif node == 'Material':
                 col = _extract_diffuse(text, ncs, nce)
                 if col:
                     current_color = col
 
-            # ── VRML 2.0 Appearance ──
             elif node == 'Appearance':
                 for child_node, _, ccs, cce in _direct_children(
                         text, ncs, nce, brace_idx, def_map, field_use_positions):
@@ -553,11 +494,9 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_map, field_use_positions,
                             current_color = col
                         break
 
-            # ── VRML 1.0 containers (scope-isolated) ──
             elif node in _CONTAINERS_V1:
                 stack.append((ncs, nce, current_matrix, current_coord, list(current_color)))
 
-            # ── VRML 2.0 Shape (pulls Appearance + geometry) ──
             elif node == 'Shape':
                 shape_color = list(current_color)
                 shape_coord = current_coord
@@ -581,7 +520,6 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_map, field_use_positions,
                                     shape_coord = floats.reshape(-1, 3)
                     elif child_node == 'IndexedFaceSet':
                         total_tried += 1
-                        # Try inline coord first
                         ifs_coord = _inline_coord(text, ccs, cce, brace_idx, bracket_idx, def_map)
                         if ifs_coord is None:
                             ifs_coord = shape_coord
@@ -604,37 +542,32 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_map, field_use_positions,
                         if len(faces) == 0:
                             continue
                         color = list(_DEFAULT_COLOR) if color_mode == 'gray' else list(shape_color)
-                        mesh = trimesh.Trimesh(vertices=ifs_coord.copy(), faces=faces, process=True)
+                        mesh = trimesh.Trimesh(vertices=ifs_coord.copy(), faces=faces, process=False)
                         if not np.allclose(current_matrix, np.eye(4)):
                             mesh.apply_transform(current_matrix)
                         mesh.visual.face_colors = color
                         meshes.append(mesh)
 
-            # ── LOD — use first child only ──
             elif node == 'LOD':
                 for child_node, _, ccs, cce in _direct_children(
                         text, ncs, nce, brace_idx, def_map, field_use_positions):
-                    if child_node in _CONTAINERS_V1 or child_node == 'LOD' or child_node == 'Transform':
+                    if child_node in _CONTAINERS_V1 or child_node in ('LOD', 'Transform'):
                         stack.append((ccs, cce, current_matrix, current_coord, list(current_color)))
                         break
 
-            # ── VRML 1.0 IndexedFaceSet ──
             elif node == 'IndexedFaceSet':
                 total_tried += 1
-                # try inline coord (VRML 2.0 style embedded in IFS)
                 ifs_coord = _inline_coord(text, ncs, nce, brace_idx, bracket_idx, def_map)
                 if ifs_coord is None:
                     ifs_coord = current_coord
                 if ifs_coord is None:
                     continue
-
                 ci_m = _CI_RE.search(text, ncs, nce)
                 if ci_m is None:
                     continue
                 ci_pp = _bracket_pos(text, ci_m.start(), nce, bracket_idx)
                 if ci_pp is None:
                     continue
-
                 indices = _parse_face_indices(text, ci_pp[0], ci_pp[1])
                 if len(indices) == 0:
                     continue
@@ -645,20 +578,46 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_map, field_use_positions,
                 faces = faces[valid]
                 if len(faces) == 0:
                     continue
-
                 color = list(_DEFAULT_COLOR) if color_mode == 'gray' else list(current_color)
-                mesh = trimesh.Trimesh(vertices=ifs_coord.copy(), faces=faces, process=True)
+                mesh = trimesh.Trimesh(vertices=ifs_coord.copy(), faces=faces, process=False)
                 if not np.allclose(current_matrix, np.eye(4)):
                     mesh.apply_transform(current_matrix)
                 mesh.visual.face_colors = color
                 meshes.append(mesh)
-                logger.info('  part %d: %d verts  %d faces  color=%s',
+                logger.info('  part %d: %d verts %d faces color=%s',
                             len(meshes), len(ifs_coord), len(faces), color[:3])
 
-    logger.info('IFS tried: %d  succeeded: %d', total_tried, len(meshes))
+    logger.info('IFS tried=%d succeeded=%d', total_tried, len(meshes))
 
 
-# ── Simplification ─────────────────────────────────────────────────────────────
+# ── Post-processing ────────────────────────────────────────────────────────────
+def _merge_by_color(meshes):
+    """Group by color, concatenate, deduplicate vertices (big size reduction for VRML)."""
+    import trimesh
+    groups = {}
+    for m in meshes:
+        fc = m.visual.face_colors
+        c = fc[0] if (hasattr(fc, '__len__') and len(fc) > 0) else _DEFAULT_COLOR
+        key = tuple(int(x) for x in c[:4])
+        groups.setdefault(key, []).append(m)
+
+    result = []
+    for key, group in groups.items():
+        merged = trimesh.util.concatenate(group) if len(group) > 1 else group[0].copy()
+        # Deduplicate shared vertices — VRML duplicates every vert per face
+        try:
+            merged = trimesh.Trimesh(vertices=merged.vertices, faces=merged.faces, process=True)
+        except Exception:
+            pass
+        merged.visual.face_colors = list(key)
+        result.append(merged)
+
+    total_f = sum(len(m.faces) for m in result)
+    total_v = sum(len(m.vertices) for m in result)
+    logger.info('Merged: %d color groups, %d faces, %d verts', len(result), total_f, total_v)
+    return result
+
+
 def _simplify(mesh, max_faces):
     if len(mesh.faces) <= max_faces:
         return mesh
@@ -675,298 +634,79 @@ def _simplify(mesh, max_faces):
     return mesh
 
 
-# ── Same-color mesh merging ────────────────────────────────────────────────────
-def _merge_by_color(meshes):
-    """Merge meshes with the same color, then deduplicate shared vertices per group."""
-    import trimesh
-    groups = {}
-    for m in meshes:
-        fc = m.visual.face_colors
-        if hasattr(fc, '__len__') and len(fc) > 0:
-            c = fc[0]
-        else:
-            c = list(_DEFAULT_COLOR)
-        key = tuple(int(x) for x in c[:4])
-        groups.setdefault(key, []).append(m)
-    result = []
-    for key, group in groups.items():
-        merged = trimesh.util.concatenate(group) if len(group) > 1 else group[0]
-        # Deduplicate vertices across the merged mesh — big size reduction
-        try:
-            merged = trimesh.Trimesh(
-                vertices=merged.vertices,
-                faces=merged.faces,
-                process=True,          # merges duplicate verts, removes degenerate faces
-            )
-        except Exception:
-            pass
-        merged.visual.face_colors = list(key)
-        result.append(merged)
-    total_v = sum(len(m.vertices) for m in result)
-    total_f = sum(len(m.faces) for m in result)
-    logger.info('Color groups: %d → %d meshes  verts=%d  faces=%d',
-                len(meshes), len(result), total_v, total_f)
-    return result
-
-
-
-# ── Draco GLB export ───────────────────────────────────────────────────────────
-def _export_glb_draco(meshes):
-    """Build a GLB with KHR_draco_mesh_compression. Returns bytes or None on failure."""
-    try:
-        import DracoPy
-    except ImportError:
-        logger.warning('DracoPy not installed — falling back to standard GLB')
-        return None
-
-    try:
-        import base64
-
-        bin_chunks = []
-        bin_offset = 0
-
-        accessors = []
-        buffer_views = []
-        mesh_primitives = []
-        materials = []
-
-        for idx, m in enumerate(meshes):
-            verts = np.array(m.vertices, dtype=np.float32)
-            faces = np.array(m.faces, dtype=np.uint32)
-
-            try:
-                # quantization_bits=14 gives good precision with ~40% smaller output vs default 16
-                draco_bytes = DracoPy.encode(verts, faces,
-                                             quantization_bits=14,
-                                             compression_level=7)
-            except TypeError:
-                # older DracoPy API without kwargs
-                try:
-                    draco_bytes = DracoPy.encode(verts, faces)
-                except Exception:
-                    try:
-                        draco_bytes = DracoPy.encode_mesh_to_buffer(
-                            verts.flatten().tolist(), faces.flatten().tolist())
-                    except Exception as e:
-                        logger.warning('Draco encode failed for mesh %d: %s', idx, e)
-                        return None
-            except Exception as e:
-                logger.warning('Draco encode failed for mesh %d: %s', idx, e)
-                return None
-
-            # Buffer view for Draco blob
-            bv_idx = len(buffer_views)
-            buffer_views.append({
-                "buffer": 0,
-                "byteOffset": bin_offset,
-                "byteLength": len(draco_bytes),
-            })
-            bin_chunks.append(draco_bytes)
-            bin_offset += len(draco_bytes)
-            # Pad to 4-byte alignment
-            pad = (4 - len(draco_bytes) % 4) % 4
-            if pad:
-                bin_chunks.append(b'\x00' * pad)
-                bin_offset += pad
-
-            # Position accessor (placeholder — Draco loader fills actual values)
-            vmin = verts.min(axis=0).tolist()
-            vmax = verts.max(axis=0).tolist()
-            pos_acc = len(accessors)
-            accessors.append({
-                "bufferView": bv_idx,
-                "componentType": 5126,  # FLOAT
-                "count": len(verts),
-                "type": "VEC3",
-                "min": vmin,
-                "max": vmax,
-            })
-            idx_acc = len(accessors)
-            accessors.append({
-                "bufferView": bv_idx,
-                "componentType": 5125,  # UNSIGNED_INT
-                "count": int(faces.size),
-                "type": "SCALAR",
-            })
-
-            # Material
-            fc = m.visual.face_colors if hasattr(m.visual, 'face_colors') else None
-            if fc is not None and hasattr(fc, '__len__') and len(fc) > 0:
-                c = list(fc[0])
-            else:
-                c = list(_DEFAULT_COLOR)
-            r, g, b, a = (c + [255])[:4]
-            mat_idx = len(materials)
-            materials.append({
-                "pbrMetallicRoughness": {
-                    "baseColorFactor": [r/255, g/255, b/255, a/255],
-                    "metallicFactor": 0.0,
-                    "roughnessFactor": 0.7,
-                },
-                "doubleSided": True,
-            })
-
-            mesh_primitives.append({
-                "attributes": {"POSITION": pos_acc},
-                "indices": idx_acc,
-                "material": mat_idx,
-                "extensions": {
-                    "KHR_draco_mesh_compression": {
-                        "bufferView": bv_idx,
-                        "attributes": {"POSITION": 0},
-                    }
-                },
-            })
-
-        bin_data = b''.join(bin_chunks)
-
-        gltf = {
-            "asset": {"version": "2.0", "generator": "vrml-converter-draco"},
-            "extensionsUsed": ["KHR_draco_mesh_compression"],
-            "extensionsRequired": ["KHR_draco_mesh_compression"],
-            "scene": 0,
-            "scenes": [{"nodes": [0]}],
-            "nodes": [{"mesh": 0}],
-            "meshes": [{"primitives": mesh_primitives}],
-            "materials": materials,
-            "accessors": accessors,
-            "bufferViews": buffer_views,
-            "buffers": [{"byteLength": len(bin_data)}],
-        }
-
-        json_bytes = json.dumps(gltf, separators=(',', ':')).encode('utf-8')
-        # pad JSON to 4-byte boundary
-        json_pad = (4 - len(json_bytes) % 4) % 4
-        json_bytes += b' ' * json_pad
-
-        # GLB structure: header(12) + JSON chunk(8+N) + BIN chunk(8+M)
-        glb_len = 12 + 8 + len(json_bytes) + 8 + len(bin_data)
-        header  = struct.pack('<III', 0x46546C67, 2, glb_len)
-        json_chunk = struct.pack('<II', len(json_bytes), 0x4E4F534A) + json_bytes
-        bin_chunk  = struct.pack('<II', len(bin_data), 0x004E4942) + bin_data
-
-        return header + json_chunk + bin_chunk
-
-    except Exception as exc:
-        logger.error('Draco GLB export failed: %s', exc)
-        return None
-
-
-# ── GLB export (Draco → standard fallback) ────────────────────────────────────
-def _export_glb_standard(meshes):
-    """
-    Export using trimesh Scene with PBR materials — compatible with all GLB viewers.
-    Each color group becomes a named node (part_0, part_1, …) so the sidebar works.
-    """
-    import trimesh
-    from trimesh.visual.material import PBRMaterial
-
-    scene = trimesh.scene.Scene()
-    for i, m in enumerate(meshes):
-        # read stored face color
-        fc = m.visual.face_colors if hasattr(m.visual, 'face_colors') else None
-        c = list(fc[0]) if (fc is not None and hasattr(fc, '__len__') and len(fc) > 0) else list(_DEFAULT_COLOR)
-        r, g, b, a = (c + [255])[:4]
-        try:
-            mat = PBRMaterial(
-                baseColorFactor=[r/255, g/255, b/255, a/255],
-                metallicFactor=0.0,
-                roughnessFactor=0.7,
-            )
-            m2 = trimesh.Trimesh(vertices=m.vertices, faces=m.faces, process=False)
-            m2.visual = trimesh.visual.TextureVisuals(material=mat)
-        except Exception:
-            m2 = m
-        scene.add_geometry(m2, node_name=f'part_{i}')
-
-    raw = scene.export(file_type='glb')
-    return bytes(raw) if not isinstance(raw, bytes) else raw
-
-
-def _export_glb(meshes):
-    """Export list of meshes as GLB. Tries Draco first, falls back to trimesh Scene."""
-    draco_bytes = _export_glb_draco(meshes)
-    if draco_bytes:
-        return draco_bytes, True
-    return _export_glb_standard(meshes), False
-
-
 # ── VRML parse entry point ─────────────────────────────────────────────────────
 def _parse_vrml(src: Path, color_mode: str, progress_cb=None):
     import trimesh
     logger.info('Reading %s (%.1f MB) …', src.name, src.stat().st_size / 1e6)
     text = src.read_text(encoding='utf-8', errors='replace')
-    if progress_cb:
-        progress_cb(0, 10, 'Building index…')
-    brace_idx   = _build_brace_index(text)
-    bracket_idx = _build_bracket_index(text)
-    def_map     = _build_def_map(text, brace_idx)
-    field_use_positions = _build_field_use_positions(text)
-    if progress_cb:
-        progress_cb(1, 10, 'Parsing geometry…')
-    meshes = []
-    text_len = len(text)
 
-    last_pct = [0]
-    max_pos  = [0]  # only advance — stack is LIFO so pos can go backwards
+    if progress_cb:
+        progress_cb(5, 100, 'Building index…')
+    brace_idx           = _build_brace_index(text)
+    bracket_idx         = _build_bracket_index(text)
+    def_map             = _build_def_map(text, brace_idx)
+    field_use_positions = _build_field_use_positions(text)
+
+    if progress_cb:
+        progress_cb(10, 100, 'Parsing geometry…')
+
+    meshes   = []
+    text_len = len(text)
+    last_pct = [10]
+    max_pos  = [0]
+
     def _walker_cb(pos, total):
         if pos > max_pos[0]:
             max_pos[0] = pos
         pct = int(10 + 70 * max_pos[0] / max(total, 1))
-        if pct > last_pct[0]:   # strictly greater: bar never goes backwards
+        if pct > last_pct[0]:
             last_pct[0] = pct
             if progress_cb:
                 progress_cb(pct, 100, f'Parsing… {pct}%')
 
     _walk(text, meshes, brace_idx, bracket_idx, def_map, field_use_positions,
           color_mode, progress_cb=_walker_cb)
+
     if not meshes:
-        raise ValueError('No geometry found — check terminal for details.')
+        raise ValueError('No geometry found in file.')
+
     if progress_cb:
-        progress_cb(80, 100, 'Merging meshes…')
+        progress_cb(82, 100, 'Merging color groups…')
     meshes = _merge_by_color(meshes)
-    logger.info('After merge: %d mesh groups', len(meshes))
+    logger.info('After merge: %d groups', len(meshes))
     return meshes
 
 
-# ── Background conversion job ──────────────────────────────────────────────────
+# ── Background job ─────────────────────────────────────────────────────────────
 def _run_job(jid, tmp_path, out_format, max_faces, color_mode):
     try:
-        last_job_pct = [0]
+        import trimesh
+
+        last_pct = [0]
         def cb(cur, total, label='Converting…'):
-            pct = cur if total == 100 else int(cur / max(total, 1) * 100)
-            pct = max(pct, last_job_pct[0])   # never go backwards
-            last_job_pct[0] = pct
+            pct = max(cur if total == 100 else int(cur / max(total, 1) * 100), last_pct[0])
+            last_pct[0] = pct
             _job_set(jid, pct=pct, label=label)
 
         meshes = _parse_vrml(tmp_path, color_mode, progress_cb=cb)
-        _job_set(jid, pct=85, label='Simplifying…')
 
-        import trimesh
-        if out_format == 'glb':
-            _job_set(jid, pct=88, label='Exporting GLB…')
-            combined_for_simplify = trimesh.util.concatenate(meshes)
-            if len(combined_for_simplify.faces) > max_faces:
-                combined_for_simplify = _simplify(combined_for_simplify, max_faces)
-                # rebuild single-mesh list after simplification
-                meshes = [combined_for_simplify]
-            out_bytes, used_draco = _export_glb(meshes)
-        else:
-            combined = trimesh.util.concatenate(meshes)
-            combined = _simplify(combined, max_faces)
-            _job_set(jid, pct=90, label=f'Exporting {out_format.upper()}…')
-            raw = combined.export(file_type=out_format)
-            out_bytes = bytes(raw) if not isinstance(raw, bytes) else raw
-            used_draco = False
+        _job_set(jid, pct=85, label='Combining…')
+        combined = trimesh.util.concatenate(meshes)
+
+        _job_set(jid, pct=88, label='Simplifying…')
+        combined = _simplify(combined, max_faces)
+
+        _job_set(jid, pct=92, label=f'Exporting {out_format.upper()}…')
+        raw = combined.export(file_type=out_format)
+        out_bytes = bytes(raw) if not isinstance(raw, bytes) else raw
 
         _job_set(jid, pct=100, label='Done!', status='done',
-                 result=out_bytes, draco=used_draco,
-                 parts=len(meshes), size=len(out_bytes))
-        logger.info('Job %s done: %.2f MB  draco=%s', jid, len(out_bytes)/1e6, used_draco)
+                 result=out_bytes, parts=len(meshes), size=len(out_bytes))
+        logger.info('Job %s done: %.2f MB', jid, len(out_bytes) / 1e6)
+
     except Exception:
-        err = traceback.format_exc()
-        logger.error('Job %s failed:\n%s', jid, err)
-        _job_set(jid, status='error', error='Conversion failed — see server log.')
+        logger.error('Job %s failed:\n%s', jid, traceback.format_exc())
+        _job_set(jid, status='error', error='Conversion failed — check server log.')
     finally:
         try:
             tmp_path.unlink()
@@ -988,11 +728,11 @@ def start():
     ext = f.filename.rsplit('.', 1)[-1].lower()
     if ext not in ('wrl', 'vrml'):
         return jsonify(detail=f'Only .wrl/.vrml supported (got .{ext}).'), 400
-    out_format  = request.form.get('out_format', 'glb').lower()
+    out_format = request.form.get('out_format', 'glb').lower()
     if out_format not in ('glb', 'obj', 'stl'):
         out_format = 'glb'
-    max_faces   = max(5000, min(int(request.form.get('max_faces', 500000)), 10_000_000))
-    color_mode  = request.form.get('color_mode', 'actual')
+    max_faces  = max(5000, min(int(request.form.get('max_faces', 500000)), 10_000_000))
+    color_mode = request.form.get('color_mode', 'actual')
     if color_mode not in ('actual', 'gray'):
         color_mode = 'actual'
 
@@ -1002,15 +742,12 @@ def start():
 
     jid = str(uuid.uuid4())
     with _jobs_lock:
-        _jobs[jid] = {
-            'status': 'running', 'pct': 2, 'label': 'Queued…',
-            'result': None, 'format': out_format,
-            'draco': False, 'parts': 0, 'size': 0, 'error': '',
-        }
-    t = threading.Thread(target=_run_job,
-                         args=(jid, tmp_path, out_format, max_faces, color_mode),
-                         daemon=True)
-    t.start()
+        _jobs[jid] = {'status': 'running', 'pct': 2, 'label': 'Queued…',
+                      'result': None, 'format': out_format,
+                      'parts': 0, 'size': 0, 'error': ''}
+    threading.Thread(target=_run_job,
+                     args=(jid, tmp_path, out_format, max_faces, color_mode),
+                     daemon=True).start()
     return jsonify(job_id=jid)
 
 
@@ -1026,7 +763,6 @@ def progress(jid):
                 'pct':    job.get('pct', 0),
                 'label':  job.get('label', '…'),
                 'status': job.get('status', 'running'),
-                'draco':  job.get('draco', False),
                 'parts':  job.get('parts', 0),
                 'size':   job.get('size', 0),
                 'error':  job.get('error', ''),
@@ -1044,11 +780,10 @@ def download(jid):
     job = _job_get(jid)
     if not job or job.get('status') != 'done':
         return jsonify(detail='Not ready.'), 404
-    fmt = job.get('format', 'glb')
+    fmt  = job.get('format', 'glb')
     mime = {'glb': 'model/gltf-binary', 'obj': 'text/plain',
             'stl': 'application/octet-stream'}.get(fmt, 'application/octet-stream')
     data = job['result']
-    # Free memory after serving
     with _jobs_lock:
         if jid in _jobs:
             _jobs[jid]['result'] = None
