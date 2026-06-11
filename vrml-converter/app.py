@@ -960,9 +960,12 @@ def _parse_vrml(src: Path, color_mode: str, progress_cb=None):
     text_len = len(text)
 
     last_pct = [0]
+    max_pos  = [0]  # only advance — stack is LIFO so pos can go backwards
     def _walker_cb(pos, total):
-        pct = int(10 + 70 * pos / max(total, 1))
-        if pct != last_pct[0]:
+        if pos > max_pos[0]:
+            max_pos[0] = pos
+        pct = int(10 + 70 * max_pos[0] / max(total, 1))
+        if pct > last_pct[0]:   # strictly greater: bar never goes backwards
             last_pct[0] = pct
             if progress_cb:
                 progress_cb(pct, 100, f'Parsing… {pct}%')
@@ -981,8 +984,11 @@ def _parse_vrml(src: Path, color_mode: str, progress_cb=None):
 # ── Background conversion job ──────────────────────────────────────────────────
 def _run_job(jid, tmp_path, out_format, max_faces, color_mode):
     try:
+        last_job_pct = [0]
         def cb(cur, total, label='Converting…'):
-            pct = int(cur / max(total, 1) * 100) if total != 100 else cur
+            pct = cur if total == 100 else int(cur / max(total, 1) * 100)
+            pct = max(pct, last_job_pct[0])   # never go backwards
+            last_job_pct[0] = pct
             _job_set(jid, pct=pct, label=label)
 
         meshes = _parse_vrml(tmp_path, color_mode, progress_cb=cb)
