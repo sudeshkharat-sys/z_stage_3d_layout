@@ -1,12 +1,10 @@
 """VRML 1.0 + 2.0 / WRL -> GLB / OBJ / STL Converter
 
-Handles VRML 1.0 (Open Inventor) and VRML 2.0 (VRML97) including DEF/USE:
-  VRML 1.0: Coordinate3 + Material siblings -> IndexedFaceSet
-  VRML 2.0: Shape -> Appearance -> Material; IFS with inline coord
-  DEF/USE: pre-scans all DEF declarations; standalone USE nodes resolved
-  - coord + color inherited into nested Separators/Groups/Shapes
-  - GLB uses per-part PBRMaterial (metalness=0) for correct color in Three.js
-  - Color mode: actual VRML colors or uniform light gray
+Speed / size improvements vs previous version:
+  - Field-USE positions pre-computed once globally (was per-scope)
+  - Same-color meshes merged before export (fewer GLB primitives, smaller file)
+  - Background thread + SSE progress stream (real server-side %)
+  - Proper two-step flow: POST /start -> SSE /progress/<id> -> GET /download/<id>
 
 Usage:
     pip install flask trimesh[easy] numpy
@@ -15,20 +13,28 @@ Open http://localhost:5555
 """
 
 import io
+import json
 import logging
 import re
 import tempfile
+import threading
+import time
 import traceback
+import uuid
 from pathlib import Path
 
 import numpy as np
-from flask import Flask, jsonify, render_template_string, request, send_file
+from flask import Flask, Response, jsonify, render_template_string, request, send_file
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024 * 1024
+
+# in-memory job store: job_id -> dict
+_jobs: dict = {}
+_jobs_lock = threading.Lock()
 
 HTML = """
 <!DOCTYPE html>
@@ -70,27 +76,27 @@ HTML = """
   button:hover { background: #0369a1; }
   button:disabled { background: #334155; color: #64748b; cursor: not-allowed; }
   .progress-wrap { margin-top: 1.5rem; display: none; }
-  .progress-bar { background: #1e3a5f; border-radius: 8px; height: 10px; overflow: hidden; margin-bottom: .5rem; }
+  .progress-bar { background: #1e3a5f; border-radius: 8px; height: 12px; overflow: hidden; margin-bottom: .5rem; }
   .progress-fill { height: 100%; background: linear-gradient(90deg,#0284c7,#7dd3fc);
-    border-radius: 8px; width: 0%; transition: width .3s ease; }
-  .progress-label { font-size: .85rem; color: #94a3b8; text-align: center; }
+    border-radius: 8px; width: 0%; transition: width .4s ease; }
+  .progress-label { font-size: .85rem; color: #94a3b8; text-align: center; min-height: 1.2em; }
   .result { margin-top: 1.5rem; padding: 1rem 1.25rem; border-radius: 10px; font-size: .9rem; display: none; }
   .result.ok  { background: #052e16; border: 1px solid #16a34a; color: #86efac; }
   .result.err { background: #2d0a0a; border: 1px solid #dc2626; color: #fca5a5; }
-  .stats { margin-top: .6rem; font-size: .82rem; color: #64748b; }
+  .stats { margin-top: .4rem; font-size: .82rem; color: #64748b; }
 </style>
 </head>
 <body>
 <div class="card">
   <h1>&#127922; VRML / WRL Converter</h1>
-  <p class="sub">Supports VRML 1.0 &amp; 2.0 + DEF/USE &mdash; runs locally on CPU</p>
+  <p class="sub">VRML 1.0 &amp; 2.0 + DEF/USE &mdash; runs locally on CPU</p>
 
   <label>1. Choose your WRL / VRML file</label>
   <div class="drop-zone" id="dropZone" onclick="document.getElementById('fileInput').click()">
     <input type="file" id="fileInput" accept=".wrl,.vrml" onchange="onFileChosen(this)"/>
     <div class="icon">&#128196;</div>
     <div>Click to browse or drag &amp; drop</div>
-    <div class="hint">Supports .wrl &amp; .vrml &mdash; VRML 1.0 &amp; 2.0</div>
+    <div class="hint">.wrl / .vrml &mdash; up to 4 GB</div>
     <div class="chosen" id="chosenName"></div>
   </div>
 
@@ -117,62 +123,136 @@ HTML = """
     <label class="opt" for="cmGray">&#9643; Light Gray</label>
   </div>
 
-  <button id="convertBtn" onclick="convert()" disabled>Convert</button>
+  <button id="convertBtn" onclick="startConvert()" disabled>Convert</button>
+
   <div class="progress-wrap" id="progressWrap">
     <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
-    <div class="progress-label" id="progressLabel">Uploading...</div>
+    <div class="progress-label" id="progressLabel">Starting...</div>
   </div>
   <div class="result" id="resultBox"></div>
 </div>
+
 <script>
-let chosenFile=null;
-const dz=document.getElementById('dropZone');
-dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('dragover');});
-dz.addEventListener('dragleave',()=>dz.classList.remove('dragover'));
-dz.addEventListener('drop',e=>{e.preventDefault();dz.classList.remove('dragover');const f=e.dataTransfer.files[0];if(f)setFile(f);});
-function onFileChosen(i){if(i.files[0])setFile(i.files[0]);}
-function setFile(f){chosenFile=f;document.getElementById('chosenName').textContent=f.name+'  ('+fmt(f.size)+')';document.getElementById('convertBtn').disabled=false;}
-function fmt(b){if(b>1e9)return(b/1e9).toFixed(1)+' GB';if(b>1e6)return(b/1e6).toFixed(1)+' MB';return(b/1e3).toFixed(0)+' KB';}
-async function convert(){
-  if(!chosenFile)return;
-  const btn=document.getElementById('convertBtn'),pw=document.getElementById('progressWrap'),
-    pf=document.getElementById('progressFill'),pl=document.getElementById('progressLabel'),rb=document.getElementById('resultBox');
-  btn.disabled=true;rb.style.display='none';pw.style.display='block';pf.style.width='5%';pl.textContent='Uploading...';
-  const form=new FormData();
-  form.append('file',chosenFile);
-  form.append('out_format',document.getElementById('outFmt').value);
-  form.append('max_faces',document.getElementById('maxFaces').value);
-  const cm=document.querySelector('input[name=colorMode]:checked');
+let chosenFile = null;
+const dz = document.getElementById('dropZone');
+dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('dragover'); });
+dz.addEventListener('dragleave', () => dz.classList.remove('dragover'));
+dz.addEventListener('drop', e => { e.preventDefault(); dz.classList.remove('dragover'); const f = e.dataTransfer.files[0]; if (f) setFile(f); });
+function onFileChosen(i) { if (i.files[0]) setFile(i.files[0]); }
+function setFile(f) {
+  chosenFile = f;
+  document.getElementById('chosenName').textContent = f.name + '  (' + fmt(f.size) + ')';
+  document.getElementById('convertBtn').disabled = false;
+}
+function fmt(b) {
+  if (b > 1e9) return (b / 1e9).toFixed(1) + ' GB';
+  if (b > 1e6) return (b / 1e6).toFixed(1) + ' MB';
+  return (b / 1e3).toFixed(0) + ' KB';
+}
+
+async function startConvert() {
+  if (!chosenFile) return;
+  const btn = document.getElementById('convertBtn');
+  const pw  = document.getElementById('progressWrap');
+  const pf  = document.getElementById('progressFill');
+  const pl  = document.getElementById('progressLabel');
+  const rb  = document.getElementById('resultBox');
+
+  btn.disabled = true;
+  rb.style.display = 'none';
+  pw.style.display = 'block';
+  pf.style.width = '2%';
+  pl.textContent = 'Uploading...';
+
+  // ---- Phase 1: upload file and get job_id ----
+  const form = new FormData();
+  form.append('file', chosenFile);
+  form.append('out_format', document.getElementById('outFmt').value);
+  form.append('max_faces', document.getElementById('maxFaces').value);
+  const cm = document.querySelector('input[name=colorMode]:checked');
   form.append('color_mode', cm ? cm.value : 'actual');
-  const xhr=new XMLHttpRequest();xhr.open('POST','/convert');xhr.responseType='blob';
-  xhr.upload.onprogress=e=>{if(e.lengthComputable){const p=Math.round(e.loaded/e.total*50);pf.style.width=p+'%';pl.textContent='Uploading... '+p+'%';}};
-  let fp=50;const tk=setInterval(()=>{fp=Math.min(fp+(fp<70?2:fp<88?.8:.2),94);pf.style.width=fp+'%';pl.textContent='Converting... '+Math.round(fp)+'%';},600);
-  xhr.onload=()=>{
-    clearInterval(tk);pf.style.width='100%';pl.textContent='Done!';btn.disabled=false;
-    if(xhr.status===200){
-      const url=URL.createObjectURL(xhr.response),base=chosenFile.name.replace(/\\.[^.]+$/,''),a=document.createElement('a');
-      a.href=url;a.download=base+'.'+document.getElementById('outFmt').value;a.click();URL.revokeObjectURL(url);
-      rb.className='result ok';rb.style.display='block';
-      rb.innerHTML='&#9989; Done! <span class="stats">'+fmt(xhr.response.size)+'</span>';
-    }else{xhr.response.text().then(t=>{let m='Conversion failed.';try{m=JSON.parse(t).detail||m;}catch(_){}rb.className='result err';rb.style.display='block';rb.textContent='x '+m;});}
+
+  let jobId;
+  try {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/start');
+    const uploadDone = new Promise((resolve, reject) => {
+      xhr.upload.onprogress = e => {
+        if (e.lengthComputable) {
+          const p = Math.round(e.loaded / e.total * 30);
+          pf.style.width = p + '%';
+          pl.textContent = 'Uploading... ' + p + '%';
+        }
+      };
+      xhr.onload = () => {
+        if (xhr.status === 200) resolve(JSON.parse(xhr.responseText));
+        else reject(new Error(JSON.parse(xhr.responseText).detail || 'Upload failed'));
+      };
+      xhr.onerror = () => reject(new Error('Network error'));
+    });
+    xhr.send(form);
+    const resp = await uploadDone;
+    jobId = resp.job_id;
+  } catch (err) {
+    showError(err.message); btn.disabled = false; return;
+  }
+
+  pf.style.width = '32%';
+  pl.textContent = 'Processing...';
+
+  // ---- Phase 2: stream real progress via SSE ----
+  const evtSrc = new EventSource('/progress/' + jobId);
+  evtSrc.onmessage = async (e) => {
+    const data = JSON.parse(e.data);
+    // Map server 0-100 into 30-100 range on the bar
+    const barPct = 30 + Math.round(data.pct * 0.70);
+    pf.style.width = barPct + '%';
+    pl.textContent = data.label || 'Processing...';
+
+    if (data.status === 'done') {
+      evtSrc.close();
+      pf.style.width = '100%';
+      pl.textContent = 'Done!';
+      // trigger download
+      const a = document.createElement('a');
+      const base = chosenFile.name.replace(/\\.[^.]+$/, '');
+      a.href = '/download/' + jobId;
+      a.download = base + '.' + document.getElementById('outFmt').value;
+      a.click();
+      rb.className = 'result ok';
+      rb.style.display = 'block';
+      rb.innerHTML = '&#9989; Done! <div class="stats">' + fmt(data.size) + ' &mdash; ' + (data.parts || '') + ' parts merged into ' + (data.merged || '') + ' color groups</div>';
+      btn.disabled = false;
+    } else if (data.status === 'error') {
+      evtSrc.close();
+      showError(data.error || 'Conversion failed');
+      btn.disabled = false;
+    }
   };
-  xhr.onerror=()=>{clearInterval(tk);btn.disabled=false;rb.className='result err';rb.style.display='block';rb.textContent='x Network error.'};
-  xhr.send(form);
+  evtSrc.onerror = () => { evtSrc.close(); showError('Lost connection to server.'); btn.disabled = false; };
+}
+
+function showError(msg) {
+  const rb = document.getElementById('resultBox');
+  rb.className = 'result err';
+  rb.style.display = 'block';
+  rb.textContent = 'Error: ' + msg;
+  document.getElementById('progressWrap').style.display = 'none';
 }
 </script>
 </body></html>
 """
 
 
-# -- Compiled patterns --------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Compiled patterns
+# ---------------------------------------------------------------------------
 
 _FLT         = r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?'
 _NUM_RE      = re.compile(r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?')
 _BRACE_RE    = re.compile(r'[{}]')
 _BRACKET_RE  = re.compile(r'[\[\]]')
 
-# VRML 1.0 + 2.0 node keywords
-# Coordinate3 must come before Coordinate so the longer match wins
 _DIRECT_RE = re.compile(
     r'\b(MatrixTransform|Transform|Separator|Group|LOD|Switch'
     r'|TransformSeparator|Coordinate3|Coordinate|IndexedFaceSet|IndexedLineSet'
@@ -186,12 +266,8 @@ _DIRECT_RE = re.compile(
     r')\s*\{'
 )
 
-# DEF / USE
-_DEF_RE           = re.compile(r'\bDEF\s+(\w+)\s+(\w+)\s*\{')
-# standalone USE: not preceded by a field-name word on the same line
-# We detect field-value USEs (coord USE x, appearance USE x) separately
+_DEF_RE            = re.compile(r'\bDEF\s+(\w+)\s+(\w+)\s*\{')
 _STANDALONE_USE_RE = re.compile(r'(?<![\w.])USE\s+(\w+)')
-# field-name prefixes that indicate a field-value USE (not standalone)
 _FIELD_USE_RE      = re.compile(
     r'\b(?:coord|appearance|geometry|material|normal|color|texCoord|children'
     r'|proxy|level|range|choice|whichChoice)\s+USE\s+(\w+)')
@@ -208,15 +284,15 @@ _COORD_FIELD_RE = re.compile(r'\bcoord\s+(?:DEF\s+\w+\s+)?Coordinate\s*\{')
 _COORD_USE_RE   = re.compile(r'\bcoord\s+USE\s+(\w+)')
 
 
-# -- Index builders -----------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Index builders
+# ---------------------------------------------------------------------------
 
 def _build_brace_index(text):
-    logger.info('Building brace index ...')
     idx, stack = {}, []
     for m in _BRACE_RE.finditer(text):
         if m.group() == '{': stack.append(m.start())
         elif stack: idx[stack.pop()] = m.start()
-    logger.info('Brace index: %d pairs', len(idx))
     return idx
 
 
@@ -229,40 +305,31 @@ def _build_bracket_index(text):
 
 
 def _build_def_map(text, brace_idx):
-    """Pre-scan entire file for DEF name NodeType { ... } declarations.
-    Returns dict: name -> (node_type, content_start, content_end)
-    """
     def_map = {}
     for m in _DEF_RE.finditer(text):
-        name      = m.group(1)
-        node_type = m.group(2)
+        name, node_type = m.group(1), m.group(2)
         bo = text.find('{', m.start())
-        if bo == -1:
-            continue
+        if bo == -1: continue
         bc = brace_idx.get(bo)
-        if bc is None:
-            continue
+        if bc is None: continue
         def_map[name] = (node_type, bo + 1, bc)
-    logger.info('DEF map: %d entries', len(def_map))
     return def_map
 
 
-# -- Build a set of positions that are field-value USEs -----------------------
-
-def _field_use_positions(text, cs, ce):
-    """Return set of start positions of USE tokens that are field values
-    (e.g. coord USE name, appearance USE name).  These should NOT be
-    treated as standalone USE node references.
+def _build_global_field_uses(text):
+    """Pre-compute positions of all field-value USE tokens in the file.
+    Much faster than scanning per-scope.
     """
     positions = set()
-    for m in _FIELD_USE_RE.finditer(text, cs, ce):
-        # find where 'USE' starts inside this match
-        use_pos = text.index('USE', m.start())
-        positions.add(use_pos)
+    for m in _FIELD_USE_RE.finditer(text):
+        pos = text.index('USE', m.start())
+        positions.add(pos)
     return positions
 
 
-# -- Position helpers ---------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Position helpers
+# ---------------------------------------------------------------------------
 
 def _bracket_pos(text, start, end, bracket_idx):
     p = text.find('[', start)
@@ -271,22 +338,22 @@ def _bracket_pos(text, start, end, bracket_idx):
     return (p + 1, cl) if (cl is not None and cl <= end) else None
 
 
-# -- Direct-child scanner (with USE resolution) -------------------------------
+# ---------------------------------------------------------------------------
+# Direct-child scanner
+# ---------------------------------------------------------------------------
 
-def _direct_children(text, cs, ce, brace_idx, def_map):
+def _direct_children(text, cs, ce, brace_idx, def_map, field_uses):
     """
-    Yield (node_name, keyword_pos, content_cs, content_ce) for every
-    direct child node in [cs, ce), including standalone USE nodes resolved
-    via def_map.  Field-value USEs (coord USE x, appearance USE x) are
-    skipped here because they are handled by their specific parsers.
+    Yield (node_name, kw_pos, content_cs, content_ce) for every direct child
+    node in [cs, ce), including standalone USE nodes resolved via def_map.
+    Field-value USEs (coord USE x, ...) are excluded via the global field_uses set.
     """
-    field_uses = _field_use_positions(text, cs, ce)
     pos = cs
     while pos < ce:
         dm = _DIRECT_RE.search(text, pos, ce)
         um = _STANDALONE_USE_RE.search(text, pos, ce)
 
-        # skip USE matches that are actually field values
+        # skip USE matches that are field values
         while um is not None and um.start() in field_uses:
             um = _STANDALONE_USE_RE.search(text, um.end(), ce)
 
@@ -306,17 +373,17 @@ def _direct_children(text, cs, ce, brace_idx, def_map):
             node = dm.group(1)
             brace_open = text.find('{', dm.start())
             if brace_open == -1 or brace_open >= ce:
-                pos = dm.end()
-                continue
+                pos = dm.end(); continue
             brace_close = brace_idx.get(brace_open)
             if brace_close is None or brace_close > ce:
-                pos = dm.end()
-                continue
+                pos = dm.end(); continue
             yield node, dm.start(), brace_open + 1, brace_close
             pos = brace_close + 1
 
 
-# -- Math helpers -------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Math helpers
+# ---------------------------------------------------------------------------
 
 def _axis_angle_to_mat4(x, y, z, angle):
     L = np.sqrt(x*x + y*y + z*z)
@@ -335,7 +402,9 @@ def _parse_floats(text, pos_tuple):
     return np.array(nums, dtype=np.float64) if nums else None
 
 
-# -- Face builder -------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Face builder
+# ---------------------------------------------------------------------------
 
 def _build_faces(indices):
     faces, fan = [], []
@@ -353,81 +422,71 @@ def _build_faces(indices):
     return np.array(faces, dtype=np.int64) if faces else np.empty((0, 3), dtype=np.int64)
 
 
-# -- Coord / color extraction helpers -----------------------------------------
+# ---------------------------------------------------------------------------
+# Coord / color extraction helpers
+# ---------------------------------------------------------------------------
 
 def _extract_points(text, ncs, nce, bracket_idx):
     pt_m = _PT_RE.search(text, ncs, nce)
-    if not pt_m:
-        return None
+    if not pt_m: return None
     pp = _bracket_pos(text, pt_m.start(), nce, bracket_idx)
-    if not pp:
-        return None
+    if not pp: return None
     floats = _parse_floats(text, pp)
-    if floats is None or len(floats) < 9 or len(floats) % 3 != 0:
-        return None
+    if floats is None or len(floats) < 9 or len(floats) % 3 != 0: return None
     return floats.reshape(-1, 3)
 
 
 def _extract_diffuse(text, ncs, nce):
     hdr = text[ncs: min(ncs + 512, nce)]
     dc = _DC_RE.search(hdr)
-    if not dc:
-        return None
+    if not dc: return None
     return [int(float(dc.group(i)) * 255) for i in (1, 2, 3)] + [255]
 
 
 def _inline_coord(text, ncs, nce, brace_idx, bracket_idx, def_map):
-    """VRML 2.0: resolve coord field inside an IndexedFaceSet block.
-    Handles inline Coordinate{} and coord USE name references.
-    """
-    # Inline: coord [DEF name] Coordinate { point [...] }
     cm = _COORD_FIELD_RE.search(text, ncs, nce)
     if cm:
         bo = text.find('{', cm.start())
         if bo != -1 and bo < nce:
             bc = brace_idx.get(bo)
             if bc is not None and bc <= nce:
-                result = _extract_points(text, bo + 1, bc, bracket_idx)
-                if result is not None:
-                    return result
-
-    # USE reference: coord USE SomeName
+                r = _extract_points(text, bo + 1, bc, bracket_idx)
+                if r is not None: return r
     um = _COORD_USE_RE.search(text, ncs, nce)
     if um:
         entry = def_map.get(um.group(1))
         if entry:
             _, dcs, dce = entry
-            result = _extract_points(text, dcs, dce, bracket_idx)
-            if result is not None:
-                return result
-
+            r = _extract_points(text, dcs, dce, bracket_idx)
+            if r is not None: return r
     return None
 
 
-# -- VRML state-machine walker (1.0 + 2.0 + DEF/USE) -------------------------
+# ---------------------------------------------------------------------------
+# VRML walker
+# ---------------------------------------------------------------------------
 
 _CONTAINERS = frozenset({'Separator', 'Group', 'Switch', 'TransformSeparator', 'Shape'})
 
 
-def _walk(text, meshes, brace_idx, bracket_idx, def_map):
+def _walk(text, meshes, brace_idx, bracket_idx, def_map, field_uses, progress_cb=None):
     import trimesh
     from trimesh.visual.material import PBRMaterial
 
     _DEFAULT_COLOR = [210, 210, 210, 255]
-    # Stack: (cs, ce, matrix, coord, color)
     stack = [(0, len(text), np.eye(4), None, list(_DEFAULT_COLOR))]
     total_tried = 0
+    file_len = len(text)
 
     while stack:
         cs, ce, parent_matrix, parent_coord, parent_color = stack.pop()
-
         current_matrix = np.copy(parent_matrix)
         current_coord  = parent_coord
         current_color  = list(parent_color)
 
-        for node, node_pos, ncs, nce in _direct_children(text, cs, ce, brace_idx, def_map):
+        for node, node_pos, ncs, nce in _direct_children(
+                text, cs, ce, brace_idx, def_map, field_uses):
 
-            # -- Transforms ---------------------------------------------------
             if node == 'MatrixTransform':
                 vm = _MTX_VALS_RE.search(text, ncs, nce)
                 if vm:
@@ -453,7 +512,6 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_map):
                     M = M @ np.diag([sx, sy, sz, 1.0])
                 current_matrix = parent_matrix @ M
 
-            # -- Geometry state (VRML 1.0 siblings) ---------------------------
             elif node in ('Coordinate3', 'Coordinate'):
                 coords = _extract_points(text, ncs, nce, bracket_idx)
                 if coords is not None:
@@ -461,59 +519,48 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_map):
 
             elif node == 'Material':
                 col = _extract_diffuse(text, ncs, nce)
-                if col:
-                    current_color = col
+                if col: current_color = col
 
-            # -- VRML 2.0 Appearance ------------------------------------------
             elif node == 'Appearance':
-                for child, _, ccs, cce in _direct_children(text, ncs, nce, brace_idx, def_map):
+                for child, _, ccs, cce in _direct_children(
+                        text, ncs, nce, brace_idx, def_map, field_uses):
                     if child == 'Material':
                         col = _extract_diffuse(text, ccs, cce)
-                        if col:
-                            current_color = col
+                        if col: current_color = col
                         break
 
-            # -- Containers: push scope inheriting current state ---------------
             elif node in _CONTAINERS:
                 stack.append((ncs, nce, current_matrix,
                               current_coord, list(current_color)))
 
             elif node == 'LOD':
-                for child_node, _, ccs, cce in _direct_children(text, ncs, nce, brace_idx, def_map):
+                for child_node, _, ccs, cce in _direct_children(
+                        text, ncs, nce, brace_idx, def_map, field_uses):
                     if child_node in _CONTAINERS or child_node == 'LOD':
                         stack.append((ccs, cce, current_matrix,
                                       current_coord, list(current_color)))
                         break
 
-            # -- Geometry -----------------------------------------------------
             elif node == 'IndexedFaceSet':
                 total_tried += 1
-
-                # VRML 2.0: coord may be inline or a USE ref inside the IFS
                 coord_to_use = (_inline_coord(text, ncs, nce, brace_idx,
                                               bracket_idx, def_map)
                                 or current_coord)
-                if coord_to_use is None:
-                    continue
+                if coord_to_use is None: continue
 
                 ci_m = _CI_RE.search(text, ncs, nce)
-                if ci_m is None:
-                    continue
+                if ci_m is None: continue
                 ci_pp = _bracket_pos(text, ci_m.start(), nce, bracket_idx)
-                if ci_pp is None:
-                    continue
+                if ci_pp is None: continue
 
                 indices = [int(x) for x in re.findall(r'-?\d+', text[ci_pp[0]:ci_pp[1]])]
-                if not indices:
-                    continue
+                if not indices: continue
 
                 faces = _build_faces(indices)
-                if len(faces) == 0:
-                    continue
+                if len(faces) == 0: continue
                 valid = np.all((faces >= 0) & (faces < len(coord_to_use)), axis=1)
                 faces = faces[valid]
-                if len(faces) == 0:
-                    continue
+                if len(faces) == 0: continue
 
                 mesh = trimesh.Trimesh(vertices=coord_to_use.copy(),
                                        faces=faces, process=False)
@@ -521,6 +568,7 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_map):
                     mesh.apply_transform(current_matrix)
 
                 r, g, b, a = current_color
+                from trimesh.visual.material import PBRMaterial
                 pbr = PBRMaterial(
                     baseColorFactor=np.array([r/255.0, g/255.0, b/255.0, a/255.0]),
                     metallicFactor=0.0,
@@ -528,32 +576,22 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_map):
                 )
                 mesh.visual = trimesh.visual.TextureVisuals(material=pbr)
                 meshes.append(mesh)
-                logger.info('  part %d: %d verts  %d faces  color=%s',
-                            len(meshes), len(coord_to_use), len(faces), current_color[:3])
+
+                # emit progress every 50 parts based on file position
+                if progress_cb and len(meshes) % 50 == 0:
+                    pct = int(20 + min(ncs / file_len, 1.0) * 55)
+                    progress_cb(pct, f'Parsing... {len(meshes)} parts found')
 
     logger.info('IFS tried: %d  succeeded: %d', total_tried, len(meshes))
 
 
-# -- Parse + post-process -----------------------------------------------------
-
-def _parse_vrml(src: Path):
-    logger.info('Reading %s (%.1f MB) ...', src.name, src.stat().st_size / 1e6)
-    text = src.read_text(encoding='utf-8', errors='replace')
-    brace_idx   = _build_brace_index(text)
-    bracket_idx = _build_bracket_index(text)
-    def_map     = _build_def_map(text, brace_idx)
-    logger.info('Walking VRML tree ...')
-    meshes = []
-    _walk(text, meshes, brace_idx, bracket_idx, def_map)
-    if not meshes:
-        raise ValueError('No geometry found - check terminal for details.')
-    logger.info('Parsed %d mesh parts', len(meshes))
-    return meshes
-
+# ---------------------------------------------------------------------------
+# Post-process helpers
+# ---------------------------------------------------------------------------
 
 def _apply_gray(meshes):
-    from trimesh.visual.material import PBRMaterial
     import trimesh
+    from trimesh.visual.material import PBRMaterial
     gray = np.array([0.82, 0.82, 0.82, 1.0])
     for m in meshes:
         pbr = PBRMaterial(baseColorFactor=gray, metallicFactor=0.0, roughnessFactor=0.6)
@@ -561,13 +599,38 @@ def _apply_gray(meshes):
     return meshes
 
 
+def _merge_by_color(meshes):
+    """Merge meshes that share the same base color into one mesh per color group.
+    Dramatically reduces GLB primitive count and file size.
+    """
+    import trimesh
+    groups: dict = {}
+    for m in meshes:
+        try:
+            key = tuple(round(float(x), 2) for x in m.visual.material.baseColorFactor)
+        except Exception:
+            key = ('default',)
+        if key not in groups:
+            groups[key] = []
+        groups[key].append(m)
+
+    result = []
+    for key, group in groups.items():
+        if len(group) == 1:
+            result.append(group[0])
+        else:
+            merged = trimesh.util.concatenate(group)
+            merged.visual = group[0].visual
+            result.append(merged)
+    logger.info('Merged %d parts -> %d color groups', len(meshes), len(result))
+    return result
+
+
 def _simplify_list(meshes, max_faces):
     total = sum(len(m.faces) for m in meshes)
     if total <= max_faces:
         return meshes
     ratio = max_faces / total
-    logger.info('Simplifying %d total faces -> target %d (ratio %.2f) ...',
-                total, max_faces, ratio)
     out = []
     for m in meshes:
         target = max(4, int(len(m.faces) * ratio))
@@ -581,8 +644,7 @@ def _simplify_list(meshes, max_faces):
                     pass
                 break
         out.append(simplified)
-    logger.info('After simplification: %d faces across %d parts',
-                sum(len(m.faces) for m in out), len(out))
+    logger.info('Simplify: %d -> %d faces', total, sum(len(m.faces) for m in out))
     return out
 
 
@@ -597,7 +659,6 @@ def _export_glb(meshes):
 def _export_flat(meshes, file_type):
     import trimesh
     combined = trimesh.util.concatenate(meshes)
-    logger.info('Combined: %d faces  %d verts', len(combined.faces), len(combined.vertices))
     return combined.export(file_type=file_type)
 
 
@@ -605,58 +666,191 @@ def _to_bytes(out):
     return out.encode('utf-8') if isinstance(out, str) else bytes(out)
 
 
-# -- Flask routes -------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Background conversion job
+# ---------------------------------------------------------------------------
+
+def _set_progress(job_id, pct, label=''):
+    with _jobs_lock:
+        if job_id in _jobs:
+            _jobs[job_id]['pct'] = pct
+            _jobs[job_id]['label'] = label
+
+
+def _run_job(job_id, src_path, out_format, max_faces, color_mode, stem):
+    def prog(pct, label):
+        _set_progress(job_id, pct, label)
+
+    try:
+        prog(5,  'Reading file...')
+        text = src_path.read_text(encoding='utf-8', errors='replace')
+
+        prog(8,  'Building brace index...')
+        brace_idx = _build_brace_index(text)
+
+        prog(11, 'Building bracket index...')
+        bracket_idx = _build_bracket_index(text)
+
+        prog(13, 'Scanning DEF map...')
+        def_map = _build_def_map(text, brace_idx)
+        logger.info('DEF map: %d entries', len(def_map))
+
+        prog(15, 'Pre-computing field references...')
+        field_uses = _build_global_field_uses(text)
+
+        prog(18, 'Parsing geometry...')
+        meshes = []
+        _walk(text, meshes, brace_idx, bracket_idx, def_map, field_uses,
+              progress_cb=prog)
+        del text  # free 2 GB string ASAP
+
+        if not meshes:
+            raise ValueError('No geometry found - check terminal for details.')
+
+        n_parts = len(meshes)
+        prog(76, f'Found {n_parts} parts, applying color...')
+        if color_mode == 'gray':
+            meshes = _apply_gray(meshes)
+
+        prog(80, 'Simplifying geometry...')
+        meshes = _simplify_list(meshes, max_faces)
+
+        prog(86, 'Merging same-color groups...')
+        meshes = _merge_by_color(meshes)
+        n_merged = len(meshes)
+
+        prog(91, f'Exporting {n_merged} mesh groups...')
+        if out_format == 'glb':
+            raw = _export_glb(meshes)
+        else:
+            raw = _export_flat(meshes, out_format)
+        out_bytes = _to_bytes(raw)
+        del meshes
+
+        # save result to a temp file for download
+        result_path = src_path.with_suffix(f'.out.{out_format}')
+        result_path.write_bytes(out_bytes)
+        size = len(out_bytes)
+        del out_bytes
+
+        logger.info('Job %s done: %.2f MB', job_id, size / 1e6)
+        with _jobs_lock:
+            _jobs[job_id].update({
+                'status':      'done',
+                'pct':         100,
+                'label':       'Done!',
+                'result_path': result_path,
+                'result_size': size,
+                'stem':        stem,
+                'out_format':  out_format,
+                'n_parts':     n_parts,
+                'n_merged':    n_merged,
+            })
+
+    except Exception:
+        err = traceback.format_exc()
+        logger.error(err)
+        short = err.strip().splitlines()[-1]
+        with _jobs_lock:
+            _jobs[job_id].update({'status': 'error', 'error': short,
+                                  'pct': 0, 'label': 'Error'})
+    finally:
+        if src_path.exists():
+            try: src_path.unlink()
+            except Exception: pass
+
+
+# ---------------------------------------------------------------------------
+# Flask routes
+# ---------------------------------------------------------------------------
 
 @app.route('/')
 def index():
     return render_template_string(HTML)
 
 
-@app.route('/convert', methods=['POST'])
-def convert():
+@app.route('/start', methods=['POST'])
+def start():
+    """Receive the file, start background conversion, return job_id immediately."""
     f = request.files.get('file')
     if not f or not f.filename:
         return jsonify(detail='No file received.'), 400
     ext = f.filename.rsplit('.', 1)[-1].lower()
     if ext not in ('wrl', 'vrml'):
         return jsonify(detail=f'Only .wrl/.vrml supported (got .{ext}).'), 400
+
     out_format = request.form.get('out_format', 'glb').lower()
     if out_format not in ('glb', 'obj', 'stl'):
         out_format = 'glb'
     max_faces  = max(5000, min(int(request.form.get('max_faces', 500000)), 10_000_000))
-    color_mode = request.form.get('color_mode', 'actual')  # 'actual' | 'gray'
+    color_mode = request.form.get('color_mode', 'actual')
+    stem       = Path(f.filename).stem
 
-    tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=f'.{ext}', delete=False) as tmp:
-            tmp_path = Path(tmp.name)
-            f.save(tmp)
+    # save upload to temp file
+    tmp = tempfile.NamedTemporaryFile(suffix=f'.{ext}', delete=False)
+    f.save(tmp)
+    tmp.close()
+    src_path = Path(tmp.name)
 
-        meshes = _parse_vrml(tmp_path)
-        if color_mode == 'gray':
-            meshes = _apply_gray(meshes)
-        meshes = _simplify_list(meshes, max_faces)
+    job_id = str(uuid.uuid4())
+    with _jobs_lock:
+        _jobs[job_id] = {'status': 'running', 'pct': 0, 'label': 'Starting...'}
 
-        raw = _export_glb(meshes) if out_format == 'glb' else _export_flat(meshes, out_format)
-        out_bytes = _to_bytes(raw)
-        logger.info('Output: %.2f MB  format=%s  color=%s',
-                    len(out_bytes)/1e6, out_format, color_mode)
+    t = threading.Thread(target=_run_job,
+                         args=(job_id, src_path, out_format, max_faces, color_mode, stem),
+                         daemon=True)
+    t.start()
+    return jsonify(job_id=job_id)
 
-        mime = {'glb': 'model/gltf-binary', 'obj': 'text/plain',
-                'stl': 'application/octet-stream'}[out_format]
-        return send_file(io.BytesIO(out_bytes), mimetype=mime, as_attachment=True,
-                         download_name=f'{Path(f.filename).stem}.{out_format}')
-    except ValueError as ve:
-        return jsonify(detail=str(ve)), 422
-    except Exception:
-        logger.error(traceback.format_exc())
-        return jsonify(detail='Conversion failed - check terminal.'), 500
-    finally:
-        if tmp_path and tmp_path.exists():
-            try: tmp_path.unlink()
-            except Exception: pass
+
+@app.route('/progress/<job_id>')
+def progress(job_id):
+    """SSE stream of real server-side progress for a conversion job."""
+    def generate():
+        while True:
+            with _jobs_lock:
+                job = _jobs.get(job_id)
+            if job is None:
+                yield f'data: {json.dumps({"status": "error", "error": "Job not found"})}\n\n'
+                return
+            payload = {
+                'pct':    job.get('pct', 0),
+                'label':  job.get('label', ''),
+                'status': job.get('status', 'running'),
+            }
+            if job.get('status') == 'done':
+                payload['size']   = job.get('result_size', 0)
+                payload['parts']  = job.get('n_parts', '')
+                payload['merged'] = job.get('n_merged', '')
+            elif job.get('status') == 'error':
+                payload['error'] = job.get('error', 'Unknown error')
+            yield f'data: {json.dumps(payload)}\n\n'
+            if job.get('status') in ('done', 'error'):
+                return
+            time.sleep(0.5)
+
+    return Response(generate(), mimetype='text/event-stream',
+                    headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+
+
+@app.route('/download/<job_id>')
+def download(job_id):
+    """Send the converted file once the job is complete."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job or job.get('status') != 'done':
+        return jsonify(detail='Not ready or job not found.'), 404
+
+    result_path = job['result_path']
+    out_format  = job['out_format']
+    stem        = job['stem']
+    mime = {'glb': 'model/gltf-binary', 'obj': 'text/plain',
+            'stl': 'application/octet-stream'}[out_format]
+
+    return send_file(result_path, mimetype=mime, as_attachment=True,
+                     download_name=f'{stem}.{out_format}')
 
 
 if __name__ == '__main__':
     print('\n  VRML / WRL Converter  ->  http://localhost:5555\n')
-    app.run(host='0.0.0.0', port=5555, debug=False)
+    app.run(host='0.0.0.0', port=5555, debug=False, threaded=True)
