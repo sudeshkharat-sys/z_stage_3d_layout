@@ -676,6 +676,38 @@ def _parse_vrml(src: Path, color_mode: str, progress_cb=None):
     logger.info('After merge: %d groups', len(meshes))
     return meshes
 
+def _build_glb_scene(meshes):
+    """
+    Export each color-group mesh as a named node with a PBR material.
+    baseColorFactor carries the color — Three.js reads this natively.
+    metallicFactor=0 avoids the dark metallic default.
+    Falls back to plain concatenated export if PBRMaterial unavailable.
+    """
+    import trimesh
+    try:
+        from trimesh.visual.material import PBRMaterial
+    except ImportError:
+        combined = trimesh.util.concatenate(meshes)
+        raw = combined.export(file_type='glb')
+        return bytes(raw) if not isinstance(raw, bytes) else raw
+
+    scene = trimesh.scene.Scene()
+    for i, m in enumerate(meshes):
+        fc = m.visual.face_colors
+        c = list(fc[0]) if (hasattr(fc, '__len__') and len(fc) > 0) else list(_DEFAULT_COLOR)
+        r, g, b, a = (c + [255])[:4]
+        mat = PBRMaterial(
+            baseColorFactor=[r/255.0, g/255.0, b/255.0, a/255.0],
+            metallicFactor=0.0,
+            roughnessFactor=0.8,
+        )
+        m2 = trimesh.Trimesh(vertices=m.vertices, faces=m.faces, process=False)
+        m2.visual = trimesh.visual.TextureVisuals(material=mat)
+        scene.add_geometry(m2, node_name=f'part_{i}')
+
+    raw = scene.export(file_type='glb')
+    return bytes(raw) if not isinstance(raw, bytes) else raw
+
 
 # ── Background job ─────────────────────────────────────────────────────────────
 def _run_job(jid, tmp_path, out_format, max_faces, color_mode):
@@ -690,14 +722,24 @@ def _run_job(jid, tmp_path, out_format, max_faces, color_mode):
 
         meshes = _parse_vrml(tmp_path, color_mode, progress_cb=cb)
 
-        _job_set(jid, pct=88, label='Combining…')
-        combined = trimesh.util.concatenate(meshes)
-
         _job_set(jid, pct=91, label='Simplifying…')
+        combined = trimesh.util.concatenate(meshes)
         combined = _simplify(combined, max_faces)
 
         _job_set(jid, pct=95, label=f'Exporting {out_format.upper()}…')
-        raw = combined.export(file_type=out_format)
+
+        if out_format == 'glb':
+            # Use scene with PBR materials so colors appear correctly in Three.js.
+            # If simplification ran, meshes list may not match simplified geometry,
+            # so fall back to plain export in that case.
+            simplified = len(combined.faces) < sum(len(m.faces) for m in meshes)
+            if simplified:
+                raw = combined.export(file_type='glb')
+            else:
+                raw = _build_glb_scene(meshes)
+        else:
+            raw = combined.export(file_type=out_format)
+
         out_bytes = bytes(raw) if not isinstance(raw, bytes) else raw
 
         _job_set(jid, pct=100, label='Done!', status='done',
