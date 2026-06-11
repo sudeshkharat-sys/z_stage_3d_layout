@@ -3,7 +3,7 @@
 Handles VRML 1.0 (Open Inventor) and VRML 2.0 (VRML97) including DEF/USE:
   VRML 1.0: Coordinate3 + Material siblings -> IndexedFaceSet
   VRML 2.0: Shape -> Appearance -> Material; IFS with inline coord
-  DEF/USE: pre-scans all DEF declarations; USE references are resolved
+  DEF/USE: pre-scans all DEF declarations; standalone USE nodes resolved
   - coord + color inherited into nested Separators/Groups/Shapes
   - GLB uses per-part PBRMaterial (metalness=0) for correct color in Three.js
   - Color mode: actual VRML colors or uniform light gray
@@ -171,8 +171,8 @@ _NUM_RE      = re.compile(r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?')
 _BRACE_RE    = re.compile(r'[{}]')
 _BRACKET_RE  = re.compile(r'[\[\]]')
 
-# VRML 1.0 + 2.0 node keywords (Coordinate before Coordinate3 would be wrong;
-# keep Coordinate3 first so it matches before the shorter Coordinate)
+# VRML 1.0 + 2.0 node keywords
+# Coordinate3 must come before Coordinate so the longer match wins
 _DIRECT_RE = re.compile(
     r'\b(MatrixTransform|Transform|Separator|Group|LOD|Switch'
     r'|TransformSeparator|Coordinate3|Coordinate|IndexedFaceSet|IndexedLineSet'
@@ -186,9 +186,15 @@ _DIRECT_RE = re.compile(
     r')\s*\{'
 )
 
-# DEF / USE patterns
-_DEF_RE      = re.compile(r'\bDEF\s+(\w+)\s+(\w+)\s*\{')
-_USE_RE      = re.compile(r'\bUSE\s+(\w+)')
+# DEF / USE
+_DEF_RE           = re.compile(r'\bDEF\s+(\w+)\s+(\w+)\s*\{')
+# standalone USE: not preceded by a field-name word on the same line
+# We detect field-value USEs (coord USE x, appearance USE x) separately
+_STANDALONE_USE_RE = re.compile(r'(?<![\w.])USE\s+(\w+)')
+# field-name prefixes that indicate a field-value USE (not standalone)
+_FIELD_USE_RE      = re.compile(
+    r'\b(?:coord|appearance|geometry|material|normal|color|texCoord|children'
+    r'|proxy|level|range|choice|whichChoice)\s+USE\s+(\w+)')
 
 _PT_RE          = re.compile(r'\bpoint\s*\[')
 _CI_RE          = re.compile(r'\bcoordIndex\s*\[')
@@ -241,6 +247,21 @@ def _build_def_map(text, brace_idx):
     return def_map
 
 
+# -- Build a set of positions that are field-value USEs -----------------------
+
+def _field_use_positions(text, cs, ce):
+    """Return set of start positions of USE tokens that are field values
+    (e.g. coord USE name, appearance USE name).  These should NOT be
+    treated as standalone USE node references.
+    """
+    positions = set()
+    for m in _FIELD_USE_RE.finditer(text, cs, ce):
+        # find where 'USE' starts inside this match
+        use_pos = text.index('USE', m.start())
+        positions.add(use_pos)
+    return positions
+
+
 # -- Position helpers ---------------------------------------------------------
 
 def _bracket_pos(text, start, end, bracket_idx):
@@ -255,19 +276,23 @@ def _bracket_pos(text, start, end, bracket_idx):
 def _direct_children(text, cs, ce, brace_idx, def_map):
     """
     Yield (node_name, keyword_pos, content_cs, content_ce) for every
-    direct child node in [cs, ce), including USE'd nodes resolved via def_map.
+    direct child node in [cs, ce), including standalone USE nodes resolved
+    via def_map.  Field-value USEs (coord USE x, appearance USE x) are
+    skipped here because they are handled by their specific parsers.
     """
+    field_uses = _field_use_positions(text, cs, ce)
     pos = cs
     while pos < ce:
-        # Find next explicit node keyword
         dm = _DIRECT_RE.search(text, pos, ce)
-        # Find next USE reference
-        um = _USE_RE.search(text, pos, ce)
+        um = _STANDALONE_USE_RE.search(text, pos, ce)
+
+        # skip USE matches that are actually field values
+        while um is not None and um.start() in field_uses:
+            um = _STANDALONE_USE_RE.search(text, um.end(), ce)
 
         if dm is None and um is None:
             break
 
-        # Pick whichever comes first
         use_first = (um is not None) and (dm is None or um.start() < dm.start())
 
         if use_first:
@@ -287,12 +312,6 @@ def _direct_children(text, cs, ce, brace_idx, def_map):
             if brace_close is None or brace_close > ce:
                 pos = dm.end()
                 continue
-            # Also register inline DEF if present (DEF name NodeType {)
-            # so later USE references in sibling nodes can resolve it
-            def_pre = text[max(pos, dm.start()-64):dm.start()]
-            def_m = re.search(r'\bDEF\s+(\w+)\s*$', def_pre)
-            if def_m and def_m.group(1) not in def_map:
-                def_map[def_m.group(1)] = (node, brace_open + 1, brace_close)
             yield node, dm.start(), brace_open + 1, brace_close
             pos = brace_close + 1
 
@@ -358,8 +377,8 @@ def _extract_diffuse(text, ncs, nce):
 
 
 def _inline_coord(text, ncs, nce, brace_idx, bracket_idx, def_map):
-    """VRML 2.0: resolve coord field inside an IndexedFaceSet.
-    Handles both inline Coordinate{} and coord USE name references.
+    """VRML 2.0: resolve coord field inside an IndexedFaceSet block.
+    Handles inline Coordinate{} and coord USE name references.
     """
     # Inline: coord [DEF name] Coordinate { point [...] }
     cm = _COORD_FIELD_RE.search(text, ncs, nce)
@@ -398,7 +417,6 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_map):
     # Stack: (cs, ce, matrix, coord, color)
     stack = [(0, len(text), np.eye(4), None, list(_DEFAULT_COLOR))]
     total_tried = 0
-    seen_ifs = set()  # avoid processing the same IFS content range twice (DEF reuse)
 
     while stack:
         cs, ce, parent_matrix, parent_coord, parent_color = stack.pop()
@@ -470,12 +488,6 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_map):
             # -- Geometry -----------------------------------------------------
             elif node == 'IndexedFaceSet':
                 total_tried += 1
-
-                # Skip duplicate IFS content ranges (same DEF reused at same
-                # position would double-add geometry)
-                if (ncs, nce) in seen_ifs:
-                    continue
-                seen_ifs.add((ncs, nce))
 
                 # VRML 2.0: coord may be inline or a USE ref inside the IFS
                 coord_to_use = (_inline_coord(text, ncs, nce, brace_idx,
