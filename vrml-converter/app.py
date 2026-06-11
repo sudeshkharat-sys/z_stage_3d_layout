@@ -1,15 +1,7 @@
 """VRML 1.0 + 2.0 / WRL -> GLB / OBJ / STL Converter
 
-Speed / size improvements vs previous version:
-  - Field-USE positions pre-computed once globally (was per-scope)
-  - Same-color meshes merged before export (fewer GLB primitives, smaller file)
-  - Background thread + SSE progress stream (real server-side %)
-  - Proper two-step flow: POST /start -> SSE /progress/<id> -> GET /download/<id>
-  - Transform/MatrixTransform now push children to stack (VRML 2.0 grouping fix)
-  - Anchor, Billboard, Collision added as containers
-
 Usage:
-    pip install flask trimesh[easy] numpy
+    pip install flask trimesh[easy] numpy DracoPy
     python app.py
 Open http://localhost:5555
 """
@@ -18,6 +10,7 @@ import io
 import json
 import logging
 import re
+import struct
 import tempfile
 import threading
 import time
@@ -36,6 +29,15 @@ app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024 * 1024
 
 _jobs: dict = {}
 _jobs_lock = threading.Lock()
+
+# Check Draco availability once at startup
+try:
+    import DracoPy
+    _DRACO_OK = True
+    logger.info('DracoPy available — GLB will use Draco compression')
+except ImportError:
+    _DRACO_OK = False
+    logger.warning('DracoPy not installed — GLB will be uncompressed (pip install DracoPy)')
 
 HTML = """
 <!DOCTYPE html>
@@ -85,12 +87,19 @@ HTML = """
   .result.ok  { background: #052e16; border: 1px solid #16a34a; color: #86efac; }
   .result.err { background: #2d0a0a; border: 1px solid #dc2626; color: #fca5a5; }
   .stats { margin-top: .4rem; font-size: .82rem; color: #64748b; }
+  .badge { display:inline-block; padding:.15rem .5rem; border-radius:6px;
+    font-size:.75rem; font-weight:600; margin-left:.5rem;
+    background:#0f2744; color:#7dd3fc; border:1px solid #0284c7; }
 </style>
 </head>
 <body>
 <div class="card">
-  <h1>&#127922; VRML / WRL Converter</h1>
-  <p class="sub">VRML 1.0 &amp; 2.0 + DEF/USE &mdash; runs locally on CPU</p>
+  <h1>&#127922; VRML / WRL Converter
+    {% if draco %}<span class="badge">Draco</span>{% endif %}
+  </h1>
+  <p class="sub">VRML 1.0 &amp; 2.0 + DEF/USE
+    {% if draco %}&mdash; Draco GLB compression active{% else %}&mdash; install DracoPy for smaller GLB{% endif %}
+  </p>
 
   <label>1. Choose your WRL / VRML file</label>
   <div class="drop-zone" id="dropZone" onclick="document.getElementById('fileInput').click()">
@@ -105,7 +114,7 @@ HTML = """
     <div class="field">
       <label>2. Output format</label>
       <select id="outFmt">
-        <option value="glb">GLB</option>
+        <option value="glb">GLB{% if draco %} (Draco){% endif %}</option>
         <option value="obj">OBJ</option>
         <option value="stl">STL</option>
       </select>
@@ -146,97 +155,63 @@ function setFile(f) {
   document.getElementById('convertBtn').disabled = false;
 }
 function fmt(b) {
-  if (b > 1e9) return (b / 1e9).toFixed(1) + ' GB';
-  if (b > 1e6) return (b / 1e6).toFixed(1) + ' MB';
-  return (b / 1e3).toFixed(0) + ' KB';
+  if (b > 1e9) return (b/1e9).toFixed(1)+' GB';
+  if (b > 1e6) return (b/1e6).toFixed(1)+' MB';
+  return (b/1e3).toFixed(0)+' KB';
 }
-
 async function startConvert() {
   if (!chosenFile) return;
-  const btn = document.getElementById('convertBtn');
-  const pw  = document.getElementById('progressWrap');
-  const pf  = document.getElementById('progressFill');
-  const pl  = document.getElementById('progressLabel');
-  const rb  = document.getElementById('resultBox');
+  const btn=document.getElementById('convertBtn'),pw=document.getElementById('progressWrap'),
+        pf=document.getElementById('progressFill'),pl=document.getElementById('progressLabel'),
+        rb=document.getElementById('resultBox');
+  btn.disabled=true; rb.style.display='none'; pw.style.display='block';
+  pf.style.width='2%'; pl.textContent='Uploading...';
 
-  btn.disabled = true;
-  rb.style.display = 'none';
-  pw.style.display = 'block';
-  pf.style.width = '2%';
-  pl.textContent = 'Uploading...';
-
-  const form = new FormData();
-  form.append('file', chosenFile);
-  form.append('out_format', document.getElementById('outFmt').value);
-  form.append('max_faces', document.getElementById('maxFaces').value);
-  const cm = document.querySelector('input[name=colorMode]:checked');
+  const form=new FormData();
+  form.append('file',chosenFile);
+  form.append('out_format',document.getElementById('outFmt').value);
+  form.append('max_faces',document.getElementById('maxFaces').value);
+  const cm=document.querySelector('input[name=colorMode]:checked');
   form.append('color_mode', cm ? cm.value : 'actual');
 
   let jobId;
   try {
-    const xhr = new XMLHttpRequest();
-    xhr.open('POST', '/start');
-    const uploadDone = new Promise((resolve, reject) => {
-      xhr.upload.onprogress = e => {
-        if (e.lengthComputable) {
-          const p = Math.round(e.loaded / e.total * 30);
-          pf.style.width = p + '%';
-          pl.textContent = 'Uploading... ' + p + '%';
-        }
-      };
-      xhr.onload = () => {
-        if (xhr.status === 200) resolve(JSON.parse(xhr.responseText));
-        else reject(new Error(JSON.parse(xhr.responseText).detail || 'Upload failed'));
-      };
-      xhr.onerror = () => reject(new Error('Network error'));
+    const xhr=new XMLHttpRequest(); xhr.open('POST','/start');
+    const done=new Promise((res,rej)=>{
+      xhr.upload.onprogress=e=>{ if(e.lengthComputable){const p=Math.round(e.loaded/e.total*30); pf.style.width=p+'%'; pl.textContent='Uploading... '+p+'%';} };
+      xhr.onload=()=>xhr.status===200?res(JSON.parse(xhr.responseText)):rej(new Error(JSON.parse(xhr.responseText).detail||'Upload failed'));
+      xhr.onerror=()=>rej(new Error('Network error'));
     });
     xhr.send(form);
-    const resp = await uploadDone;
-    jobId = resp.job_id;
-  } catch (err) {
-    showError(err.message); btn.disabled = false; return;
-  }
+    jobId=(await done).job_id;
+  } catch(err){ showError(err.message); btn.disabled=false; return; }
 
-  pf.style.width = '32%';
-  pl.textContent = 'Processing...';
+  pf.style.width='32%'; pl.textContent='Processing...';
 
-  const evtSrc = new EventSource('/progress/' + jobId);
-  evtSrc.onmessage = async (e) => {
-    const data = JSON.parse(e.data);
-    const barPct = 30 + Math.round(data.pct * 0.70);
-    pf.style.width = barPct + '%';
-    pl.textContent = data.label || 'Processing...';
-
-    if (data.status === 'done') {
-      evtSrc.close();
-      pf.style.width = '100%';
-      pl.textContent = 'Done!';
-      const a = document.createElement('a');
-      const base = chosenFile.name.replace(/\\.[^.]+$/, '');
-      a.href = '/download/' + jobId;
-      a.download = base + '.' + document.getElementById('outFmt').value;
+  const es=new EventSource('/progress/'+jobId);
+  es.onmessage=e=>{
+    const d=JSON.parse(e.data);
+    pf.style.width=(30+Math.round(d.pct*0.70))+'%';
+    pl.textContent=d.label||'Processing...';
+    if(d.status==='done'){
+      es.close(); pf.style.width='100%'; pl.textContent='Done!';
+      const a=document.createElement('a'),base=chosenFile.name.replace(/\\.[^.]+$/,'');
+      a.href='/download/'+jobId;
+      a.download=base+'.'+document.getElementById('outFmt').value;
       a.click();
-      rb.className = 'result ok';
-      rb.style.display = 'block';
-      rb.innerHTML = '&#9989; Done! <div class="stats">' + fmt(data.size)
-        + ' &mdash; ' + (data.parts || 0) + ' parts &rarr; '
-        + (data.merged || 0) + ' color groups</div>';
-      btn.disabled = false;
-    } else if (data.status === 'error') {
-      evtSrc.close();
-      showError(data.error || 'Conversion failed');
-      btn.disabled = false;
-    }
+      rb.className='result ok'; rb.style.display='block';
+      rb.innerHTML='&#9989; Done! <div class="stats">'
+        +fmt(d.size)+' &mdash; '+d.parts+' parts &rarr; '+d.merged+' color groups'
+        +(d.draco?' &mdash; <strong>Draco compressed</strong>':'')+'</div>';
+      btn.disabled=false;
+    } else if(d.status==='error'){ es.close(); showError(d.error||'Conversion failed'); btn.disabled=false; }
   };
-  evtSrc.onerror = () => { evtSrc.close(); showError('Lost connection to server.'); btn.disabled = false; };
+  es.onerror=()=>{ es.close(); showError('Lost connection.'); btn.disabled=false; };
 }
-
-function showError(msg) {
-  const rb = document.getElementById('resultBox');
-  rb.className = 'result err';
-  rb.style.display = 'block';
-  rb.textContent = 'Error: ' + msg;
-  document.getElementById('progressWrap').style.display = 'none';
+function showError(msg){
+  const rb=document.getElementById('resultBox');
+  rb.className='result err'; rb.style.display='block'; rb.textContent='Error: '+msg;
+  document.getElementById('progressWrap').style.display='none';
 }
 </script>
 </body></html>
@@ -252,9 +227,6 @@ _NUM_RE      = re.compile(r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?')
 _BRACE_RE    = re.compile(r'[{}]')
 _BRACKET_RE  = re.compile(r'[\[\]]')
 
-# All node keywords that start a { } block.
-# Transform and MatrixTransform included here so _direct_children finds them;
-# they are handled specially in _walk (matrix computed AND children pushed).
 _DIRECT_RE = re.compile(
     r'\b(MatrixTransform|Transform|Separator|Group|LOD|Switch'
     r'|TransformSeparator|Coordinate3|Coordinate|IndexedFaceSet|IndexedLineSet'
@@ -297,14 +269,12 @@ def _build_brace_index(text):
         elif stack: idx[stack.pop()] = m.start()
     return idx
 
-
 def _build_bracket_index(text):
     idx, stack = {}, []
     for m in _BRACKET_RE.finditer(text):
         if m.group() == '[': stack.append(m.start())
         elif stack: idx[stack.pop()] = m.start()
     return idx
-
 
 def _build_def_map(text, brace_idx):
     def_map = {}
@@ -316,7 +286,6 @@ def _build_def_map(text, brace_idx):
         if bc is None: continue
         def_map[name] = (node_type, bo + 1, bc)
     return def_map
-
 
 def _build_global_field_uses(text):
     positions = set()
@@ -346,15 +315,10 @@ def _direct_children(text, cs, ce, brace_idx, def_map, field_uses):
     while pos < ce:
         dm = _DIRECT_RE.search(text, pos, ce)
         um = _STANDALONE_USE_RE.search(text, pos, ce)
-
         while um is not None and um.start() in field_uses:
             um = _STANDALONE_USE_RE.search(text, um.end(), ce)
-
-        if dm is None and um is None:
-            break
-
+        if dm is None and um is None: break
         use_first = (um is not None) and (dm is None or um.start() < dm.start())
-
         if use_first:
             name = um.group(1)
             entry = def_map.get(name)
@@ -365,11 +329,9 @@ def _direct_children(text, cs, ce, brace_idx, def_map, field_uses):
         else:
             node = dm.group(1)
             brace_open = text.find('{', dm.start())
-            if brace_open == -1 or brace_open >= ce:
-                pos = dm.end(); continue
+            if brace_open == -1 or brace_open >= ce: pos = dm.end(); continue
             brace_close = brace_idx.get(brace_open)
-            if brace_close is None or brace_close > ce:
-                pos = dm.end(); continue
+            if brace_close is None or brace_close > ce: pos = dm.end(); continue
             yield node, dm.start(), brace_open + 1, brace_close
             pos = brace_close + 1
 
@@ -389,7 +351,6 @@ def _axis_angle_to_mat4(x, y, z, angle):
     m[2,0]=t*x*z-s*y; m[2,1]=t*y*z+s*x; m[2,2]=t*z*z+c
     return m
 
-
 def _parse_floats(text, pos_tuple):
     nums = _NUM_RE.findall(text[pos_tuple[0]:pos_tuple[1]])
     return np.array(nums, dtype=np.float64) if nums else None
@@ -405,14 +366,14 @@ def _build_faces(indices):
         if idx < 0:
             if len(fan) >= 3:
                 for j in range(1, len(fan) - 1):
-                    faces.append((fan[0], fan[j], fan[j + 1]))
+                    faces.append((fan[0], fan[j], fan[j+1]))
             fan = []
         else:
             fan.append(idx)
     if len(fan) >= 3:
         for j in range(1, len(fan) - 1):
-            faces.append((fan[0], fan[j], fan[j + 1]))
-    return np.array(faces, dtype=np.int64) if faces else np.empty((0, 3), dtype=np.int64)
+            faces.append((fan[0], fan[j], fan[j+1]))
+    return np.array(faces, dtype=np.int64) if faces else np.empty((0,3), dtype=np.int64)
 
 
 # ---------------------------------------------------------------------------
@@ -428,13 +389,11 @@ def _extract_points(text, ncs, nce, bracket_idx):
     if floats is None or len(floats) < 9 or len(floats) % 3 != 0: return None
     return floats.reshape(-1, 3)
 
-
 def _extract_diffuse(text, ncs, nce):
-    hdr = text[ncs: min(ncs + 512, nce)]
+    hdr = text[ncs: min(ncs+512, nce)]
     dc = _DC_RE.search(hdr)
     if not dc: return None
-    return [int(float(dc.group(i)) * 255) for i in (1, 2, 3)] + [255]
-
+    return [int(float(dc.group(i))*255) for i in (1,2,3)] + [255]
 
 def _inline_coord(text, ncs, nce, brace_idx, bracket_idx, def_map):
     cm = _COORD_FIELD_RE.search(text, ncs, nce)
@@ -443,7 +402,7 @@ def _inline_coord(text, ncs, nce, brace_idx, bracket_idx, def_map):
         if bo != -1 and bo < nce:
             bc = brace_idx.get(bo)
             if bc is not None and bc <= nce:
-                r = _extract_points(text, bo + 1, bc, bracket_idx)
+                r = _extract_points(text, bo+1, bc, bracket_idx)
                 if r is not None: return r
     um = _COORD_USE_RE.search(text, ncs, nce)
     if um:
@@ -459,12 +418,10 @@ def _inline_coord(text, ncs, nce, brace_idx, bracket_idx, def_map):
 # VRML walker
 # ---------------------------------------------------------------------------
 
-# Pure container nodes (no transform, no state change — just scope)
 _CONTAINERS = frozenset({
-    'Separator', 'Group', 'Switch', 'TransformSeparator',
-    'Shape', 'Anchor', 'Billboard', 'Collision',
+    'Separator','Group','Switch','TransformSeparator',
+    'Shape','Anchor','Billboard','Collision',
 })
-
 
 def _walk(text, meshes, brace_idx, bracket_idx, def_map, field_uses, progress_cb=None):
     from trimesh.visual.material import PBRMaterial
@@ -484,26 +441,16 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_map, field_uses, progress_cb
         for node, node_pos, ncs, nce in _direct_children(
                 text, cs, ce, brace_idx, def_map, field_uses):
 
-            # ----------------------------------------------------------------
-            # MatrixTransform: apply matrix AND push children to stack
-            # (VRML 1.0: property node with no children — push is harmless;
-            #  VRML 2.0: grouping node whose children live inside the block)
-            # ----------------------------------------------------------------
             if node == 'MatrixTransform':
                 vm = _MTX_VALS_RE.search(text, ncs, nce)
                 if vm:
-                    mat = np.array([float(vm.group(i)) for i in range(1, 17)],
-                                   dtype=np.float64).reshape(4, 4)
+                    mat = np.array([float(vm.group(i)) for i in range(1,17)],
+                                   dtype=np.float64).reshape(4,4)
                     current_matrix = parent_matrix @ mat
-                # Push block content — picks up any children in VRML 2.0 usage
-                stack.append((ncs, nce, current_matrix,
-                              current_coord, list(current_color)))
+                stack.append((ncs, nce, current_matrix, current_coord, list(current_color)))
 
-            # ----------------------------------------------------------------
-            # Transform: apply transform AND push children to stack
-            # ----------------------------------------------------------------
             elif node == 'Transform':
-                hdr = text[ncs: min(ncs + 800, nce)]
+                hdr = text[ncs: min(ncs+800, nce)]
                 M = np.eye(4)
                 tr = _TR1_RE.search(hdr)
                 if tr:
@@ -514,31 +461,20 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_map, field_uses, progress_cb
                                                 float(ro.group(3)), float(ro.group(4)))
                 sc = _SC1_RE.search(hdr)
                 if sc:
-                    sx = float(sc.group(1))
-                    sy = float(sc.group(2)) if sc.group(2) else sx
-                    sz = float(sc.group(3)) if sc.group(3) else sx
+                    sx=float(sc.group(1)); sy=float(sc.group(2)) if sc.group(2) else sx
+                    sz=float(sc.group(3)) if sc.group(3) else sx
                     M = M @ np.diag([sx, sy, sz, 1.0])
                 current_matrix = parent_matrix @ M
-                # Push block content with updated matrix so nested
-                # children (VRML 2.0 style) are processed correctly
-                stack.append((ncs, nce, current_matrix,
-                              current_coord, list(current_color)))
+                stack.append((ncs, nce, current_matrix, current_coord, list(current_color)))
 
-            # ----------------------------------------------------------------
-            # Geometry state nodes (VRML 1.0 sibling style)
-            # ----------------------------------------------------------------
-            elif node in ('Coordinate3', 'Coordinate'):
+            elif node in ('Coordinate3','Coordinate'):
                 coords = _extract_points(text, ncs, nce, bracket_idx)
-                if coords is not None:
-                    current_coord = coords
+                if coords is not None: current_coord = coords
 
             elif node == 'Material':
                 col = _extract_diffuse(text, ncs, nce)
                 if col: current_color = col
 
-            # ----------------------------------------------------------------
-            # VRML 2.0 Appearance
-            # ----------------------------------------------------------------
             elif node == 'Appearance':
                 for child, _, ccs, cce in _direct_children(
                         text, ncs, nce, brace_idx, def_map, field_uses):
@@ -547,69 +483,55 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_map, field_uses, progress_cb
                         if col: current_color = col
                         break
 
-            # ----------------------------------------------------------------
-            # Pure container nodes — push scope inheriting current state
-            # ----------------------------------------------------------------
             elif node in _CONTAINERS:
-                stack.append((ncs, nce, current_matrix,
-                              current_coord, list(current_color)))
+                stack.append((ncs, nce, current_matrix, current_coord, list(current_color)))
 
             elif node == 'LOD':
-                # Use only the first (highest-detail) child
                 for child_node, _, ccs, cce in _direct_children(
                         text, ncs, nce, brace_idx, def_map, field_uses):
-                    if child_node in _CONTAINERS or child_node in ('LOD', 'Transform', 'MatrixTransform'):
-                        stack.append((ccs, cce, current_matrix,
-                                      current_coord, list(current_color)))
+                    if child_node in _CONTAINERS or child_node in ('LOD','Transform','MatrixTransform'):
+                        stack.append((ccs, cce, current_matrix, current_coord, list(current_color)))
                         break
 
-            # ----------------------------------------------------------------
-            # Geometry
-            # ----------------------------------------------------------------
             elif node == 'IndexedFaceSet':
                 total_tried += 1
-                coord_to_use = (_inline_coord(text, ncs, nce, brace_idx,
-                                              bracket_idx, def_map)
+                coord_to_use = (_inline_coord(text, ncs, nce, brace_idx, bracket_idx, def_map)
                                 or current_coord)
                 if coord_to_use is None: continue
-
                 ci_m = _CI_RE.search(text, ncs, nce)
                 if ci_m is None: continue
                 ci_pp = _bracket_pos(text, ci_m.start(), nce, bracket_idx)
                 if ci_pp is None: continue
-
                 indices = [int(x) for x in re.findall(r'-?\d+', text[ci_pp[0]:ci_pp[1]])]
                 if not indices: continue
-
                 faces = _build_faces(indices)
                 if len(faces) == 0: continue
                 valid = np.all((faces >= 0) & (faces < len(coord_to_use)), axis=1)
                 faces = faces[valid]
                 if len(faces) == 0: continue
 
-                mesh = trimesh.Trimesh(vertices=coord_to_use.copy(),
-                                       faces=faces, process=False)
+                mesh = trimesh.Trimesh(vertices=coord_to_use.copy(), faces=faces, process=False)
                 if not np.allclose(current_matrix, np.eye(4)):
                     mesh.apply_transform(current_matrix)
 
                 r, g, b, a = current_color
+                from trimesh.visual.material import PBRMaterial
                 pbr = PBRMaterial(
                     baseColorFactor=np.array([r/255.0, g/255.0, b/255.0, a/255.0]),
-                    metallicFactor=0.0,
-                    roughnessFactor=0.7,
+                    metallicFactor=0.0, roughnessFactor=0.7,
                 )
                 mesh.visual = trimesh.visual.TextureVisuals(material=pbr)
                 meshes.append(mesh)
 
                 if progress_cb and len(meshes) % 50 == 0:
-                    pct = int(20 + min(ncs / file_len, 1.0) * 55)
+                    pct = int(20 + min(ncs/file_len, 1.0)*55)
                     progress_cb(pct, f'Parsing... {len(meshes)} parts found')
 
     logger.info('IFS tried: %d  succeeded: %d', total_tried, len(meshes))
 
 
 # ---------------------------------------------------------------------------
-# Post-process helpers
+# Post-process
 # ---------------------------------------------------------------------------
 
 def _apply_gray(meshes):
@@ -621,7 +543,6 @@ def _apply_gray(meshes):
         m.visual = trimesh.visual.TextureVisuals(material=pbr)
     return meshes
 
-
 def _merge_by_color(meshes):
     import trimesh
     groups: dict = {}
@@ -630,9 +551,7 @@ def _merge_by_color(meshes):
             key = tuple(round(float(x), 2) for x in m.visual.material.baseColorFactor)
         except Exception:
             key = ('default',)
-        if key not in groups:
-            groups[key] = []
-        groups[key].append(m)
+        groups.setdefault(key, []).append(m)
     result = []
     for key, group in groups.items():
         if len(group) == 1:
@@ -644,30 +563,128 @@ def _merge_by_color(meshes):
     logger.info('Merged %d parts -> %d color groups', len(meshes), len(result))
     return result
 
-
 def _simplify_list(meshes, max_faces):
     total = sum(len(m.faces) for m in meshes)
-    if total <= max_faces:
-        return meshes
+    if total <= max_faces: return meshes
     ratio = max_faces / total
     out = []
     for m in meshes:
-        target = max(4, int(len(m.faces) * ratio))
+        target = max(4, int(len(m.faces)*ratio))
         simplified = m
-        for method in ('simplify_quadric_decimation', 'simplify_quadratic_decimation'):
+        for method in ('simplify_quadric_decimation','simplify_quadratic_decimation'):
             if hasattr(m, method):
                 try:
                     simplified = getattr(m, method)(target)
                     simplified.visual = m.visual
-                except Exception:
-                    pass
+                except Exception: pass
                 break
         out.append(simplified)
     logger.info('Simplify: %d -> %d faces', total, sum(len(m.faces) for m in out))
     return out
 
 
-def _export_glb(meshes):
+# ---------------------------------------------------------------------------
+# GLB export (standard + Draco)
+# ---------------------------------------------------------------------------
+
+def _glb_pack(json_dict, bin_buf):
+    """Pack JSON + binary buffer into a GLB binary."""
+    json_bytes = json.dumps(json_dict, separators=(',',':')).encode('utf-8')
+    # 4-byte align JSON
+    while len(json_bytes) % 4:
+        json_bytes += b' '
+    # 4-byte align BIN
+    while len(bin_buf) % 4:
+        bin_buf.append(0)
+    bin_bytes = bytes(bin_buf)
+    total = 12 + 8 + len(json_bytes) + (8 + len(bin_bytes) if bin_bytes else 0)
+    out = struct.pack('<III', 0x46546C67, 2, total)
+    out += struct.pack('<II', len(json_bytes), 0x4E4F534A) + json_bytes
+    if bin_bytes:
+        out += struct.pack('<II', len(bin_bytes), 0x004E4942) + bin_bytes
+    return out
+
+
+def _export_glb_draco(meshes):
+    """Build GLB with KHR_draco_mesh_compression."""
+    import DracoPy
+
+    gltf = {
+        "asset": {"version": "2.0", "generator": "vrml-converter"},
+        "extensionsUsed": ["KHR_draco_mesh_compression"],
+        "extensionsRequired": ["KHR_draco_mesh_compression"],
+        "scene": 0,
+        "scenes": [{"nodes": list(range(len(meshes)))}],
+        "nodes": [{"mesh": i} for i in range(len(meshes))],
+        "meshes": [], "accessors": [], "bufferViews": [],
+        "buffers": [{"byteLength": 0}], "materials": [],
+    }
+    bin_buf = bytearray()
+
+    for mesh in meshes:
+        verts = np.asarray(mesh.vertices, dtype=np.float32)
+        faces = np.asarray(mesh.faces,    dtype=np.uint32)
+
+        # Draco encode — try numpy API first, fall back to list API
+        try:
+            draco_bytes = DracoPy.encode(verts, faces)
+        except Exception:
+            draco_bytes = DracoPy.encode_mesh_to_buffer(
+                verts.flatten().tolist(), faces.flatten().tolist())
+
+        # 4-byte align
+        while len(bin_buf) % 4:
+            bin_buf.append(0)
+        bv_offset = len(bin_buf)
+        bin_buf.extend(draco_bytes)
+
+        bv_idx = len(gltf["bufferViews"])
+        gltf["bufferViews"].append({
+            "buffer": 0, "byteOffset": bv_offset, "byteLength": len(draco_bytes)
+        })
+
+        # Accessors (no bufferView — data comes from Draco)
+        pos_acc = len(gltf["accessors"])
+        gltf["accessors"].append({
+            "componentType": 5126, "count": len(verts), "type": "VEC3",
+            "min": verts.min(0).tolist(), "max": verts.max(0).tolist(),
+        })
+        idx_acc = len(gltf["accessors"])
+        gltf["accessors"].append({
+            "componentType": 5125, "count": int(faces.size), "type": "SCALAR",
+        })
+
+        # Material
+        try:
+            color = [float(c) for c in mesh.visual.material.baseColorFactor]
+        except Exception:
+            color = [0.82, 0.82, 0.82, 1.0]
+        mat_idx = len(gltf["materials"])
+        gltf["materials"].append({
+            "pbrMetallicRoughness": {
+                "baseColorFactor": color,
+                "metallicFactor": 0.0, "roughnessFactor": 0.7,
+            }
+        })
+
+        gltf["meshes"].append({"primitives": [{
+            "attributes": {"POSITION": pos_acc},
+            "indices": idx_acc,
+            "material": mat_idx,
+            "extensions": {
+                "KHR_draco_mesh_compression": {
+                    "bufferView": bv_idx,
+                    "attributes": {"POSITION": 0},
+                }
+            }
+        }]})
+
+    gltf["buffers"][0]["byteLength"] = len(bin_buf)
+    return _glb_pack(gltf, bin_buf)
+
+
+def _export_glb_standard(meshes):
+    """Standard uncompressed GLB via trimesh Scene."""
     import trimesh
     scene = trimesh.Scene()
     for i, m in enumerate(meshes):
@@ -675,18 +692,28 @@ def _export_glb(meshes):
     return scene.export(file_type='glb')
 
 
+def _export_glb(meshes):
+    if _DRACO_OK:
+        try:
+            result = _export_glb_draco(meshes)
+            logger.info('Draco GLB: %.2f MB', len(result)/1e6)
+            return result
+        except Exception as e:
+            logger.warning('Draco export failed (%s), falling back to standard GLB', e)
+    return _export_glb_standard(meshes)
+
+
 def _export_flat(meshes, file_type):
     import trimesh
     combined = trimesh.util.concatenate(meshes)
     return combined.export(file_type=file_type)
-
 
 def _to_bytes(out):
     return out.encode('utf-8') if isinstance(out, str) else bytes(out)
 
 
 # ---------------------------------------------------------------------------
-# Background conversion job
+# Background job
 # ---------------------------------------------------------------------------
 
 def _set_progress(job_id, pct, label=''):
@@ -695,35 +722,26 @@ def _set_progress(job_id, pct, label=''):
             _jobs[job_id]['pct'] = pct
             _jobs[job_id]['label'] = label
 
-
 def _run_job(job_id, src_path, out_format, max_faces, color_mode, stem):
     def prog(pct, label): _set_progress(job_id, pct, label)
-
     try:
         prog(5,  'Reading file...')
         text = src_path.read_text(encoding='utf-8', errors='replace')
-
         prog(8,  'Building brace index...')
         brace_idx = _build_brace_index(text)
-
         prog(11, 'Building bracket index...')
         bracket_idx = _build_bracket_index(text)
-
         prog(13, 'Scanning DEF map...')
         def_map = _build_def_map(text, brace_idx)
-        logger.info('DEF map: %d entries', len(def_map))
-
         prog(15, 'Pre-computing field references...')
         field_uses = _build_global_field_uses(text)
-
         prog(18, 'Parsing geometry...')
         meshes = []
-        _walk(text, meshes, brace_idx, bracket_idx, def_map, field_uses,
-              progress_cb=prog)
+        _walk(text, meshes, brace_idx, bracket_idx, def_map, field_uses, progress_cb=prog)
         del text
 
         if not meshes:
-            raise ValueError('No geometry found - check terminal for details.')
+            raise ValueError('No geometry found')
 
         n_parts = len(meshes)
         prog(76, f'Found {n_parts} parts, applying color...')
@@ -737,11 +755,8 @@ def _run_job(job_id, src_path, out_format, max_faces, color_mode, stem):
         meshes = _merge_by_color(meshes)
         n_merged = len(meshes)
 
-        prog(91, f'Exporting {n_merged} mesh groups...')
-        if out_format == 'glb':
-            raw = _export_glb(meshes)
-        else:
-            raw = _export_flat(meshes, out_format)
+        prog(91, f'Exporting {n_merged} groups{" (Draco)" if (_DRACO_OK and out_format=="glb") else ""}...')
+        raw = _export_glb(meshes) if out_format == 'glb' else _export_flat(meshes, out_format)
         out_bytes = _to_bytes(raw)
         del meshes
 
@@ -750,22 +765,21 @@ def _run_job(job_id, src_path, out_format, max_faces, color_mode, stem):
         size = len(out_bytes)
         del out_bytes
 
-        logger.info('Job %s done: %.2f MB', job_id, size / 1e6)
+        logger.info('Job %s done: %.2f MB', job_id, size/1e6)
         with _jobs_lock:
             _jobs[job_id].update({
-                'status': 'done', 'pct': 100, 'label': 'Done!',
-                'result_path': result_path, 'result_size': size,
-                'stem': stem, 'out_format': out_format,
-                'n_parts': n_parts, 'n_merged': n_merged,
+                'status':'done','pct':100,'label':'Done!',
+                'result_path':result_path,'result_size':size,
+                'stem':stem,'out_format':out_format,
+                'n_parts':n_parts,'n_merged':n_merged,
+                'draco':_DRACO_OK and out_format=='glb',
             })
-
     except Exception:
         err = traceback.format_exc()
         logger.error(err)
         short = err.strip().splitlines()[-1]
         with _jobs_lock:
-            _jobs[job_id].update({'status': 'error', 'error': short,
-                                  'pct': 0, 'label': 'Error'})
+            _jobs[job_id].update({'status':'error','error':short,'pct':0,'label':'Error'})
     finally:
         if src_path.exists():
             try: src_path.unlink()
@@ -778,77 +792,58 @@ def _run_job(job_id, src_path, out_format, max_faces, color_mode, stem):
 
 @app.route('/')
 def index():
-    return render_template_string(HTML)
-
+    return render_template_string(HTML, draco=_DRACO_OK)
 
 @app.route('/start', methods=['POST'])
 def start():
     f = request.files.get('file')
-    if not f or not f.filename:
-        return jsonify(detail='No file received.'), 400
+    if not f or not f.filename: return jsonify(detail='No file received.'), 400
     ext = f.filename.rsplit('.', 1)[-1].lower()
-    if ext not in ('wrl', 'vrml'):
-        return jsonify(detail=f'Only .wrl/.vrml supported (got .{ext}).'), 400
-
-    out_format = request.form.get('out_format', 'glb').lower()
-    if out_format not in ('glb', 'obj', 'stl'): out_format = 'glb'
+    if ext not in ('wrl','vrml'): return jsonify(detail=f'Only .wrl/.vrml supported.'), 400
+    out_format = request.form.get('out_format','glb').lower()
+    if out_format not in ('glb','obj','stl'): out_format = 'glb'
     max_faces  = max(5000, min(int(request.form.get('max_faces', 500000)), 10_000_000))
-    color_mode = request.form.get('color_mode', 'actual')
+    color_mode = request.form.get('color_mode','actual')
     stem       = Path(f.filename).stem
-
     tmp = tempfile.NamedTemporaryFile(suffix=f'.{ext}', delete=False)
-    f.save(tmp)
-    tmp.close()
-    src_path = Path(tmp.name)
-
+    f.save(tmp); tmp.close()
     job_id = str(uuid.uuid4())
     with _jobs_lock:
-        _jobs[job_id] = {'status': 'running', 'pct': 0, 'label': 'Starting...'}
-
+        _jobs[job_id] = {'status':'running','pct':0,'label':'Starting...'}
     t = threading.Thread(target=_run_job,
-                         args=(job_id, src_path, out_format, max_faces, color_mode, stem),
-                         daemon=True)
+        args=(job_id, Path(tmp.name), out_format, max_faces, color_mode, stem),
+        daemon=True)
     t.start()
     return jsonify(job_id=job_id)
-
 
 @app.route('/progress/<job_id>')
 def progress(job_id):
     def generate():
         while True:
-            with _jobs_lock:
-                job = _jobs.get(job_id)
+            with _jobs_lock: job = _jobs.get(job_id)
             if job is None:
-                yield f'data: {json.dumps({"status": "error", "error": "Job not found"})}\n\n'
+                yield f'data: {json.dumps({"status":"error","error":"Job not found"})}\n\n'
                 return
-            payload = {'pct': job.get('pct', 0), 'label': job.get('label', ''),
-                       'status': job.get('status', 'running')}
+            payload = {'pct':job.get('pct',0),'label':job.get('label',''),'status':job.get('status','running')}
             if job.get('status') == 'done':
-                payload.update({'size': job.get('result_size', 0),
-                                'parts': job.get('n_parts', ''),
-                                'merged': job.get('n_merged', '')})
+                payload.update({'size':job.get('result_size',0),'parts':job.get('n_parts',''),
+                                'merged':job.get('n_merged',''),'draco':job.get('draco',False)})
             elif job.get('status') == 'error':
-                payload['error'] = job.get('error', 'Unknown error')
+                payload['error'] = job.get('error','Unknown error')
             yield f'data: {json.dumps(payload)}\n\n'
-            if job.get('status') in ('done', 'error'):
-                return
+            if job.get('status') in ('done','error'): return
             time.sleep(0.5)
-
     return Response(generate(), mimetype='text/event-stream',
-                    headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
-
+                    headers={'Cache-Control':'no-cache','X-Accel-Buffering':'no'})
 
 @app.route('/download/<job_id>')
 def download(job_id):
-    with _jobs_lock:
-        job = _jobs.get(job_id)
+    with _jobs_lock: job = _jobs.get(job_id)
     if not job or job.get('status') != 'done':
-        return jsonify(detail='Not ready or job not found.'), 404
-    mime = {'glb': 'model/gltf-binary', 'obj': 'text/plain',
-            'stl': 'application/octet-stream'}[job['out_format']]
+        return jsonify(detail='Not ready.'), 404
+    mime = {'glb':'model/gltf-binary','obj':'text/plain','stl':'application/octet-stream'}[job['out_format']]
     return send_file(job['result_path'], mimetype=mime, as_attachment=True,
                      download_name=f"{job['stem']}.{job['out_format']}")
-
 
 if __name__ == '__main__':
     print('\n  VRML / WRL Converter  ->  http://localhost:5555\n')

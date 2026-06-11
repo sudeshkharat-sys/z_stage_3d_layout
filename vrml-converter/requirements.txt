@@ -1,3 +1,4 @@
 flask
 trimesh[easy]
 numpy
+DracoPy
