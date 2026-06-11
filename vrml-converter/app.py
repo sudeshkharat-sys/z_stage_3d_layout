@@ -855,88 +855,36 @@ def _export_glb_draco(meshes):
 # ── GLB export (Draco → standard fallback) ────────────────────────────────────
 def _export_glb_standard(meshes):
     """
-    Build a compact GLB manually: float32 positions + uint32 indices only.
-    No normals (Three.js computes them), no UVs — minimises file size.
+    Export using trimesh Scene with PBR materials — compatible with all GLB viewers.
+    Each color group becomes a named node (part_0, part_1, …) so the sidebar works.
     """
-    bin_chunks = []
-    bin_offset = 0
-    accessors = []
-    buffer_views = []
-    mesh_primitives = []
-    materials = []
+    import trimesh
+    from trimesh.visual.material import PBRMaterial
 
-    for m in meshes:
-        verts = np.asarray(m.vertices, dtype=np.float32)
-        faces = np.asarray(m.faces, dtype=np.uint32)
-
-        # ── vertex buffer view ──
-        vb = verts.tobytes()
-        bv_verts = len(buffer_views)
-        buffer_views.append({"buffer": 0, "byteOffset": bin_offset, "byteLength": len(vb),
-                              "byteStride": 12, "target": 34962})
-        bin_chunks.append(vb)
-        bin_offset += len(vb)
-        pad = (4 - len(vb) % 4) % 4
-        if pad:
-            bin_chunks.append(b'\x00' * pad); bin_offset += pad
-
-        # ── index buffer view ──
-        ib = faces.tobytes()
-        bv_idx = len(buffer_views)
-        buffer_views.append({"buffer": 0, "byteOffset": bin_offset, "byteLength": len(ib),
-                              "target": 34963})
-        bin_chunks.append(ib)
-        bin_offset += len(ib)
-        pad = (4 - len(ib) % 4) % 4
-        if pad:
-            bin_chunks.append(b'\x00' * pad); bin_offset += pad
-
-        vmin = verts.min(axis=0).tolist()
-        vmax = verts.max(axis=0).tolist()
-        pos_acc = len(accessors)
-        accessors.append({"bufferView": bv_verts, "byteOffset": 0, "componentType": 5126,
-                           "count": len(verts), "type": "VEC3", "min": vmin, "max": vmax})
-        idx_acc = len(accessors)
-        accessors.append({"bufferView": bv_idx, "byteOffset": 0, "componentType": 5125,
-                           "count": int(faces.size), "type": "SCALAR"})
-
+    scene = trimesh.scene.Scene()
+    for i, m in enumerate(meshes):
+        # read stored face color
         fc = m.visual.face_colors if hasattr(m.visual, 'face_colors') else None
         c = list(fc[0]) if (fc is not None and hasattr(fc, '__len__') and len(fc) > 0) else list(_DEFAULT_COLOR)
         r, g, b, a = (c + [255])[:4]
-        mat_idx = len(materials)
-        materials.append({
-            "pbrMetallicRoughness": {
-                "baseColorFactor": [r/255, g/255, b/255, a/255],
-                "metallicFactor": 0.0, "roughnessFactor": 0.7,
-            },
-            "doubleSided": True,
-        })
-        mesh_primitives.append({"attributes": {"POSITION": pos_acc}, "indices": idx_acc,
-                                 "material": mat_idx})
+        try:
+            mat = PBRMaterial(
+                baseColorFactor=[r/255, g/255, b/255, a/255],
+                metallicFactor=0.0,
+                roughnessFactor=0.7,
+            )
+            m2 = trimesh.Trimesh(vertices=m.vertices, faces=m.faces, process=False)
+            m2.visual = trimesh.visual.TextureVisuals(material=mat)
+        except Exception:
+            m2 = m
+        scene.add_geometry(m2, node_name=f'part_{i}')
 
-    bin_data = b''.join(bin_chunks)
-    gltf = {
-        "asset": {"version": "2.0", "generator": "vrml-converter"},
-        "scene": 0,
-        "scenes": [{"nodes": [0]}],
-        "nodes": [{"mesh": 0}],
-        "meshes": [{"primitives": mesh_primitives}],
-        "materials": materials,
-        "accessors": accessors,
-        "bufferViews": buffer_views,
-        "buffers": [{"byteLength": len(bin_data)}],
-    }
-    json_bytes = json.dumps(gltf, separators=(',', ':')).encode('utf-8')
-    json_pad = (4 - len(json_bytes) % 4) % 4
-    json_bytes += b' ' * json_pad
-    glb_len = 12 + 8 + len(json_bytes) + 8 + len(bin_data)
-    return (struct.pack('<III', 0x46546C67, 2, glb_len)
-            + struct.pack('<II', len(json_bytes), 0x4E4F534A) + json_bytes
-            + struct.pack('<II', len(bin_data), 0x004E4942) + bin_data)
+    raw = scene.export(file_type='glb')
+    return bytes(raw) if not isinstance(raw, bytes) else raw
 
 
 def _export_glb(meshes):
-    """Export list of meshes as GLB. Tries Draco first, falls back to compact standard GLB."""
+    """Export list of meshes as GLB. Tries Draco first, falls back to trimesh Scene."""
     draco_bytes = _export_glb_draco(meshes)
     if draco_bytes:
         return draco_bytes, True
