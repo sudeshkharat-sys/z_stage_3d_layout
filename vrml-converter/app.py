@@ -4,6 +4,8 @@ Properly handles VRML 1.0 (Open Inventor) state machine:
   - Direct-child-only scanning per Separator
   - MatrixTransform / Transform applied at the correct scope level
   - Coordinate3 / Material / IndexedFaceSet sibling relationship respected
+  - coord + color state inherited into nested Separators (fixes missing parts)
+  - GLB uses per-part PBR materials (metalness=0) for correct color in Three.js
 
 Usage:
     pip install flask trimesh[easy] numpy
@@ -133,7 +135,7 @@ async function convert(){
       rb.innerHTML='&#9989; Done! <span class="stats">'+fmt(xhr.response.size)+'</span>';
     }else{xhr.response.text().then(t=>{let m='Conversion failed.';try{m=JSON.parse(t).detail||m;}catch(_){}rb.className='result err';rb.style.display='block';rb.textContent='✗ '+m;});}
   };
-  xhr.onerror=()=>{clearInterval(tk);btn.disabled=false;rb.className='result err';rb.style.display='block';rb.textContent='✗ Network error.';};
+  xhr.onerror=()=>{clearInterval(tk);btn.disabled=false;rb.className='result err';rb.style.display='block';rb.textContent='✗ Network error.'};
   xhr.send(form);
 }
 </script>
@@ -141,7 +143,7 @@ async function convert(){
 """
 
 
-# ── Compiled patterns ─────────────────────────────────────────────────────
+# ── Compiled patterns ───────────────────────────────────────────────────────────────────────────
 
 _FLT         = r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?'
 _NUM_RE      = re.compile(r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?')
@@ -170,7 +172,7 @@ _SC1_RE      = re.compile(rf'\bscaleFactor\s+({_FLT})(?:\s+({_FLT})\s+({_FLT}))?
 _RO1_RE      = re.compile(rf'\brotation\s+({_FLT})\s+({_FLT})\s+({_FLT})\s+({_FLT})')
 
 
-# ── Index builders ────────────────────────────────────────────────────────────
+# ── Index builders ───────────────────────────────────────────────────────────────────────────────
 
 def _build_brace_index(text):
     logger.info('Building brace index …')
@@ -190,7 +192,7 @@ def _build_bracket_index(text):
     return idx
 
 
-# ── Position helpers ────────────────────────────────────────────────────────────
+# ── Position helpers ────────────────────────────────────────────────────────────────────────────
 
 def _brace_pos(text, start, brace_idx):
     p = text.find('{', start)
@@ -206,7 +208,7 @@ def _bracket_pos(text, start, end, bracket_idx):
     return (p + 1, cl) if (cl is not None and cl <= end) else None
 
 
-# ── Direct-child scanner ────────────────────────────────────────────────────────────
+# ── Direct-child scanner ────────────────────────────────────────────────────────────────────────────
 
 def _direct_children(text, cs, ce, brace_idx):
     """
@@ -232,7 +234,7 @@ def _direct_children(text, cs, ce, brace_idx):
         pos = brace_close + 1
 
 
-# ── Math helpers ───────────────────────────────────────────────────────────────────────
+# ── Math helpers ───────────────────────────────────────────────────────────────────────────────────────
 
 def _axis_angle_to_mat4(x, y, z, angle):
     L = np.sqrt(x*x + y*y + z*z)
@@ -251,7 +253,7 @@ def _parse_floats(text, pos_tuple):
     return np.array(nums, dtype=np.float64) if nums else None
 
 
-# ── Face builder ──────────────────────────────────────────────────────────────
+# ── Face builder ────────────────────────────────────────────────────────────────────────────────
 
 def _build_faces(indices):
     faces, fan = [], []
@@ -269,23 +271,28 @@ def _build_faces(indices):
     return np.array(faces, dtype=np.int64) if faces else np.empty((0, 3), dtype=np.int64)
 
 
-# ── VRML 1.0 state-machine walker ──────────────────────────────────────────────────────
+# ── VRML 1.0 state-machine walker ──────────────────────────────────────────────────────────────────────
 
 _CONTAINERS = frozenset({'Separator', 'Group', 'Switch', 'TransformSeparator'})
 
 
 def _walk(text, meshes, brace_idx, bracket_idx):
     import trimesh
+    from trimesh.visual.material import PBRMaterial
 
-    stack = [(0, len(text), np.eye(4))]
+    # Stack entries: (cs, ce, parent_matrix, parent_coord, parent_color)
+    # parent_coord and parent_color are inherited so nested Separators
+    # can still find geometry defined in an outer scope.
+    _DEFAULT_COLOR = [230, 230, 230, 255]
+    stack = [(0, len(text), np.eye(4), None, list(_DEFAULT_COLOR))]
     total_tried = 0
 
     while stack:
-        cs, ce, parent_matrix = stack.pop()
+        cs, ce, parent_matrix, parent_coord, parent_color = stack.pop()
 
         current_matrix = np.copy(parent_matrix)
-        current_coord  = None
-        current_color  = [230, 230, 230, 255]  # light gray default
+        current_coord  = parent_coord          # inherit from parent scope
+        current_color  = list(parent_color)    # inherit from parent scope
 
         for node, node_pos, ncs, nce in _direct_children(text, cs, ce, brace_idx):
 
@@ -330,12 +337,16 @@ def _walk(text, meshes, brace_idx, bracket_idx):
                     current_color = [int(float(dc.group(i)) * 255) for i in (1, 2, 3)] + [255]
 
             elif node in _CONTAINERS:
-                stack.append((ncs, nce, current_matrix))
+                # Pass current coord+color into nested scope so geometry
+                # defined inside can find a parent-level Coordinate3/Material.
+                stack.append((ncs, nce, current_matrix,
+                              current_coord, list(current_color)))
 
             elif node == 'LOD':
                 for child_node, _, ccs, cce in _direct_children(text, ncs, nce, brace_idx):
                     if child_node in _CONTAINERS or child_node == 'LOD':
-                        stack.append((ccs, cce, current_matrix))
+                        stack.append((ccs, cce, current_matrix,
+                                      current_coord, list(current_color)))
                         break
 
             elif node == 'IndexedFaceSet':
@@ -366,7 +377,19 @@ def _walk(text, meshes, brace_idx, bracket_idx):
                                        faces=faces, process=False)
                 if not np.allclose(current_matrix, np.eye(4)):
                     mesh.apply_transform(current_matrix)
-                mesh.visual.face_colors = current_color
+
+                # Use a proper PBR material so Three.js renders the correct
+                # color without needing an environment map.  metalness=0
+                # prevents the "everything black" issue caused by unlit
+                # metallic surfaces.
+                r, g, b, a = current_color
+                pbr = PBRMaterial(
+                    baseColorFactor=np.array([r / 255.0, g / 255.0, b / 255.0, a / 255.0]),
+                    metallicFactor=0.0,
+                    roughnessFactor=0.7,
+                )
+                mesh.visual = trimesh.visual.TextureVisuals(material=pbr)
+
                 meshes.append(mesh)
                 logger.info('  part %d: %d verts  %d faces  color=%s',
                             len(meshes), len(current_coord), len(faces), current_color[:3])
@@ -375,7 +398,6 @@ def _walk(text, meshes, brace_idx, bracket_idx):
 
 
 def _parse_vrml(src: Path):
-    import trimesh
     logger.info('Reading %s (%.1f MB) …', src.name, src.stat().st_size / 1e6)
     text = src.read_text(encoding='utf-8', errors='replace')
     brace_idx   = _build_brace_index(text)
@@ -385,33 +407,60 @@ def _parse_vrml(src: Path):
     _walk(text, meshes, brace_idx, bracket_idx)
     if not meshes:
         raise ValueError('No geometry found — check terminal for details.')
-    logger.info('Concatenating %d meshes …', len(meshes))
+    logger.info('Parsed %d mesh parts', len(meshes))
+    return meshes
+
+
+def _simplify_list(meshes, max_faces):
+    """Simplify the concatenated mesh but return individual parts for GLB."""
+    import trimesh
+    total = sum(len(m.faces) for m in meshes)
+    if total <= max_faces:
+        return meshes
+    ratio = max_faces / total
+    logger.info('Simplifying %d total faces → target %d (ratio %.2f) …', total, max_faces, ratio)
+    out = []
+    for m in meshes:
+        target = max(4, int(len(m.faces) * ratio))
+        simplified = m
+        for method in ('simplify_quadric_decimation', 'simplify_quadratic_decimation'):
+            if hasattr(m, method):
+                try:
+                    simplified = getattr(m, method)(target)
+                    # Preserve the PBR visual from the original part
+                    simplified.visual = m.visual
+                except Exception:
+                    pass
+                break
+        out.append(simplified)
+    after = sum(len(m.faces) for m in out)
+    logger.info('After simplification: %d faces across %d parts', after, len(out))
+    return out
+
+
+def _export_glb(meshes):
+    """Export as a GLB Scene preserving per-part PBR materials."""
+    import trimesh
+    scene = trimesh.Scene()
+    for i, m in enumerate(meshes):
+        scene.add_geometry(m, node_name=f'part_{i}')
+    raw = scene.export(file_type='glb')
+    return raw
+
+
+def _export_flat(meshes, file_type):
+    """Concatenate all parts and export as OBJ or STL."""
+    import trimesh
     combined = trimesh.util.concatenate(meshes)
     logger.info('Combined: %d faces  %d verts', len(combined.faces), len(combined.vertices))
-    return combined
-
-
-def _simplify(mesh, max_faces):
-    if len(mesh.faces) <= max_faces:
-        return mesh
-    logger.info('Simplifying %d → ~%d faces …', len(mesh.faces), max_faces)
-    for method in ('simplify_quadric_decimation', 'simplify_quadratic_decimation'):
-        if hasattr(mesh, method):
-            try:
-                r = getattr(mesh, method)(max_faces)
-                logger.info('After simplification: %d faces', len(r.faces))
-                return r
-            except Exception as exc:
-                logger.warning('Simplification skipped: %s', exc)
-                return mesh
-    return mesh
+    return combined.export(file_type=file_type)
 
 
 def _to_bytes(out):
     return out.encode('utf-8') if isinstance(out, str) else bytes(out)
 
 
-# ── Flask routes ────────────────────────────────────────────────────────────────────────
+# ── Flask routes ───────────────────────────────────────────────────────────────────────────────────────
 
 @app.route('/')
 def index():
@@ -436,8 +485,14 @@ def convert():
         with tempfile.NamedTemporaryFile(suffix=f'.{ext}', delete=False) as tmp:
             tmp_path = Path(tmp.name)
             f.save(tmp)
-        mesh = _simplify(_parse_vrml(tmp_path), max_faces)
-        raw  = mesh.export(file_type=out_format)
+        meshes = _parse_vrml(tmp_path)
+        meshes = _simplify_list(meshes, max_faces)
+
+        if out_format == 'glb':
+            raw = _export_glb(meshes)
+        else:
+            raw = _export_flat(meshes, out_format)
+
         out_bytes = _to_bytes(raw)
         logger.info('Output: %.2f MB  format=%s', len(out_bytes) / 1e6, out_format)
         mime = {'glb': 'model/gltf-binary', 'obj': 'text/plain',
