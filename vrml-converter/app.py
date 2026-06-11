@@ -1,9 +1,10 @@
-"""VRML 1.0 + 2.0 / WRL → GLB / OBJ / STL Converter
+"""VRML 1.0 + 2.0 / WRL -> GLB / OBJ / STL Converter
 
-Handles both VRML 1.0 (Open Inventor) and VRML 2.0 (VRML97):
-  VRML 1.0: Coordinate3 + Material siblings → IndexedFaceSet
-  VRML 2.0: Shape → Appearance → Material; IndexedFaceSet with inline coord
-  - coord + color state inherited into nested Separators/Groups
+Handles VRML 1.0 (Open Inventor) and VRML 2.0 (VRML97) including DEF/USE:
+  VRML 1.0: Coordinate3 + Material siblings -> IndexedFaceSet
+  VRML 2.0: Shape -> Appearance -> Material; IFS with inline coord
+  DEF/USE: pre-scans all DEF declarations; USE references are resolved
+  - coord + color inherited into nested Separators/Groups/Shapes
   - GLB uses per-part PBRMaterial (metalness=0) for correct color in Three.js
   - Color mode: actual VRML colors or uniform light gray
 
@@ -82,7 +83,7 @@ HTML = """
 <body>
 <div class="card">
   <h1>&#127922; VRML / WRL Converter</h1>
-  <p class="sub">Supports VRML 1.0 &amp; 2.0 &mdash; runs locally on CPU</p>
+  <p class="sub">Supports VRML 1.0 &amp; 2.0 + DEF/USE &mdash; runs locally on CPU</p>
 
   <label>1. Choose your WRL / VRML file</label>
   <div class="drop-zone" id="dropZone" onclick="document.getElementById('fileInput').click()">
@@ -119,7 +120,7 @@ HTML = """
   <button id="convertBtn" onclick="convert()" disabled>Convert</button>
   <div class="progress-wrap" id="progressWrap">
     <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
-    <div class="progress-label" id="progressLabel">Uploading…</div>
+    <div class="progress-label" id="progressLabel">Uploading...</div>
   </div>
   <div class="result" id="resultBox"></div>
 </div>
@@ -136,7 +137,7 @@ async function convert(){
   if(!chosenFile)return;
   const btn=document.getElementById('convertBtn'),pw=document.getElementById('progressWrap'),
     pf=document.getElementById('progressFill'),pl=document.getElementById('progressLabel'),rb=document.getElementById('resultBox');
-  btn.disabled=true;rb.style.display='none';pw.style.display='block';pf.style.width='5%';pl.textContent='Uploading…';
+  btn.disabled=true;rb.style.display='none';pw.style.display='block';pf.style.width='5%';pl.textContent='Uploading...';
   const form=new FormData();
   form.append('file',chosenFile);
   form.append('out_format',document.getElementById('outFmt').value);
@@ -144,8 +145,8 @@ async function convert(){
   const cm=document.querySelector('input[name=colorMode]:checked');
   form.append('color_mode', cm ? cm.value : 'actual');
   const xhr=new XMLHttpRequest();xhr.open('POST','/convert');xhr.responseType='blob';
-  xhr.upload.onprogress=e=>{if(e.lengthComputable){const p=Math.round(e.loaded/e.total*50);pf.style.width=p+'%';pl.textContent='Uploading… '+p+'%';}};
-  let fp=50;const tk=setInterval(()=>{fp=Math.min(fp+(fp<70?2:fp<88?.8:.2),94);pf.style.width=fp+'%';pl.textContent='Converting… '+Math.round(fp)+'%';},600);
+  xhr.upload.onprogress=e=>{if(e.lengthComputable){const p=Math.round(e.loaded/e.total*50);pf.style.width=p+'%';pl.textContent='Uploading... '+p+'%';}};
+  let fp=50;const tk=setInterval(()=>{fp=Math.min(fp+(fp<70?2:fp<88?.8:.2),94);pf.style.width=fp+'%';pl.textContent='Converting... '+Math.round(fp)+'%';},600);
   xhr.onload=()=>{
     clearInterval(tk);pf.style.width='100%';pl.textContent='Done!';btn.disabled=false;
     if(xhr.status===200){
@@ -153,9 +154,9 @@ async function convert(){
       a.href=url;a.download=base+'.'+document.getElementById('outFmt').value;a.click();URL.revokeObjectURL(url);
       rb.className='result ok';rb.style.display='block';
       rb.innerHTML='&#9989; Done! <span class="stats">'+fmt(xhr.response.size)+'</span>';
-    }else{xhr.response.text().then(t=>{let m='Conversion failed.';try{m=JSON.parse(t).detail||m;}catch(_){}rb.className='result err';rb.style.display='block';rb.textContent='✗ '+m;});}
+    }else{xhr.response.text().then(t=>{let m='Conversion failed.';try{m=JSON.parse(t).detail||m;}catch(_){}rb.className='result err';rb.style.display='block';rb.textContent='x '+m;});}
   };
-  xhr.onerror=()=>{clearInterval(tk);btn.disabled=false;rb.className='result err';rb.style.display='block';rb.textContent='✗ Network error.'};
+  xhr.onerror=()=>{clearInterval(tk);btn.disabled=false;rb.className='result err';rb.style.display='block';rb.textContent='x Network error.'};
   xhr.send(form);
 }
 </script>
@@ -163,15 +164,15 @@ async function convert(){
 """
 
 
-# ── Compiled patterns ───────────────────────────────────────────────────────────
+# -- Compiled patterns --------------------------------------------------------
 
 _FLT         = r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?'
 _NUM_RE      = re.compile(r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?')
 _BRACE_RE    = re.compile(r'[{}]')
 _BRACKET_RE  = re.compile(r'[\[\]]')
 
-# Includes VRML 2.0 nodes: Shape, Appearance, Coordinate (no "3")
-# Note: \bCoordinate\b won't match Coordinate3 because 3 is \w (no word boundary after e)
+# VRML 1.0 + 2.0 node keywords (Coordinate before Coordinate3 would be wrong;
+# keep Coordinate3 first so it matches before the shorter Coordinate)
 _DIRECT_RE = re.compile(
     r'\b(MatrixTransform|Transform|Separator|Group|LOD|Switch'
     r'|TransformSeparator|Coordinate3|Coordinate|IndexedFaceSet|IndexedLineSet'
@@ -185,22 +186,26 @@ _DIRECT_RE = re.compile(
     r')\s*\{'
 )
 
-_PT_RE       = re.compile(r'\bpoint\s*\[')
-_CI_RE       = re.compile(r'\bcoordIndex\s*\[')
-_DC_RE       = re.compile(rf'diffuseColor\s+({_FLT})\s+({_FLT})\s+({_FLT})')
-_FLT16       = r'\s+'.join([rf'({_FLT})'] * 16)
-_MTX_VALS_RE = re.compile(r'\bmatrix\s+' + _FLT16)
-_TR1_RE      = re.compile(rf'\btranslation\s+({_FLT})\s+({_FLT})\s+({_FLT})')
-_SC1_RE      = re.compile(rf'\bscaleFactor\s+({_FLT})(?:\s+({_FLT})\s+({_FLT}))?')
-_RO1_RE      = re.compile(rf'\brotation\s+({_FLT})\s+({_FLT})\s+({_FLT})\s+({_FLT})')
-# VRML 2.0: inline coord field inside IndexedFaceSet
+# DEF / USE patterns
+_DEF_RE      = re.compile(r'\bDEF\s+(\w+)\s+(\w+)\s*\{')
+_USE_RE      = re.compile(r'\bUSE\s+(\w+)')
+
+_PT_RE          = re.compile(r'\bpoint\s*\[')
+_CI_RE          = re.compile(r'\bcoordIndex\s*\[')
+_DC_RE          = re.compile(rf'diffuseColor\s+({_FLT})\s+({_FLT})\s+({_FLT})')
+_FLT16          = r'\s+'.join([rf'({_FLT})'] * 16)
+_MTX_VALS_RE    = re.compile(r'\bmatrix\s+' + _FLT16)
+_TR1_RE         = re.compile(rf'\btranslation\s+({_FLT})\s+({_FLT})\s+({_FLT})')
+_SC1_RE         = re.compile(rf'\bscaleFactor\s+({_FLT})(?:\s+({_FLT})\s+({_FLT}))?')
+_RO1_RE         = re.compile(rf'\brotation\s+({_FLT})\s+({_FLT})\s+({_FLT})\s+({_FLT})')
 _COORD_FIELD_RE = re.compile(r'\bcoord\s+(?:DEF\s+\w+\s+)?Coordinate\s*\{')
+_COORD_USE_RE   = re.compile(r'\bcoord\s+USE\s+(\w+)')
 
 
-# ── Index builders ─────────────────────────────────────────────────────────────────────
+# -- Index builders -----------------------------------------------------------
 
 def _build_brace_index(text):
-    logger.info('Building brace index …')
+    logger.info('Building brace index ...')
     idx, stack = {}, []
     for m in _BRACE_RE.finditer(text):
         if m.group() == '{': stack.append(m.start())
@@ -217,7 +222,26 @@ def _build_bracket_index(text):
     return idx
 
 
-# ── Position helpers ──────────────────────────────────────────────────────────────────────
+def _build_def_map(text, brace_idx):
+    """Pre-scan entire file for DEF name NodeType { ... } declarations.
+    Returns dict: name -> (node_type, content_start, content_end)
+    """
+    def_map = {}
+    for m in _DEF_RE.finditer(text):
+        name      = m.group(1)
+        node_type = m.group(2)
+        bo = text.find('{', m.start())
+        if bo == -1:
+            continue
+        bc = brace_idx.get(bo)
+        if bc is None:
+            continue
+        def_map[name] = (node_type, bo + 1, bc)
+    logger.info('DEF map: %d entries', len(def_map))
+    return def_map
+
+
+# -- Position helpers ---------------------------------------------------------
 
 def _bracket_pos(text, start, end, bracket_idx):
     p = text.find('[', start)
@@ -226,33 +250,54 @@ def _bracket_pos(text, start, end, bracket_idx):
     return (p + 1, cl) if (cl is not None and cl <= end) else None
 
 
-# ── Direct-child scanner ──────────────────────────────────────────────────────────────────
+# -- Direct-child scanner (with USE resolution) -------------------------------
 
-def _direct_children(text, cs, ce, brace_idx):
+def _direct_children(text, cs, ce, brace_idx, def_map):
     """
     Yield (node_name, keyword_pos, content_cs, content_ce) for every
-    direct child node in [cs, ce).  Skips nested content by jumping to
-    brace_close+1 after each matched node.
+    direct child node in [cs, ce), including USE'd nodes resolved via def_map.
     """
     pos = cs
     while pos < ce:
-        m = _DIRECT_RE.search(text, pos, ce)
-        if m is None:
+        # Find next explicit node keyword
+        dm = _DIRECT_RE.search(text, pos, ce)
+        # Find next USE reference
+        um = _USE_RE.search(text, pos, ce)
+
+        if dm is None and um is None:
             break
-        node = m.group(1)
-        brace_open = text.find('{', m.start())
-        if brace_open == -1 or brace_open >= ce:
-            pos = m.end()
-            continue
-        brace_close = brace_idx.get(brace_open)
-        if brace_close is None or brace_close > ce:
-            pos = m.end()
-            continue
-        yield node, m.start(), brace_open + 1, brace_close
-        pos = brace_close + 1
+
+        # Pick whichever comes first
+        use_first = (um is not None) and (dm is None or um.start() < dm.start())
+
+        if use_first:
+            name = um.group(1)
+            entry = def_map.get(name)
+            if entry:
+                node_type, dcs, dce = entry
+                yield node_type, um.start(), dcs, dce
+            pos = um.end()
+        else:
+            node = dm.group(1)
+            brace_open = text.find('{', dm.start())
+            if brace_open == -1 or brace_open >= ce:
+                pos = dm.end()
+                continue
+            brace_close = brace_idx.get(brace_open)
+            if brace_close is None or brace_close > ce:
+                pos = dm.end()
+                continue
+            # Also register inline DEF if present (DEF name NodeType {)
+            # so later USE references in sibling nodes can resolve it
+            def_pre = text[max(pos, dm.start()-64):dm.start()]
+            def_m = re.search(r'\bDEF\s+(\w+)\s*$', def_pre)
+            if def_m and def_m.group(1) not in def_map:
+                def_map[def_m.group(1)] = (node, brace_open + 1, brace_close)
+            yield node, dm.start(), brace_open + 1, brace_close
+            pos = brace_close + 1
 
 
-# ── Math helpers ───────────────────────────────────────────────────────────────────────────────
+# -- Math helpers -------------------------------------------------------------
 
 def _axis_angle_to_mat4(x, y, z, angle):
     L = np.sqrt(x*x + y*y + z*z)
@@ -271,7 +316,7 @@ def _parse_floats(text, pos_tuple):
     return np.array(nums, dtype=np.float64) if nums else None
 
 
-# ── Face builder ──────────────────────────────────────────────────────────────────────────
+# -- Face builder -------------------------------------------------------------
 
 def _build_faces(indices):
     faces, fan = [], []
@@ -289,10 +334,9 @@ def _build_faces(indices):
     return np.array(faces, dtype=np.int64) if faces else np.empty((0, 3), dtype=np.int64)
 
 
-# ── Helpers: extract coord array and color from VRML blocks ────────────────────────
+# -- Coord / color extraction helpers -----------------------------------------
 
 def _extract_points(text, ncs, nce, bracket_idx):
-    """Return (N,3) float array from a Coordinate/Coordinate3 block, or None."""
     pt_m = _PT_RE.search(text, ncs, nce)
     if not pt_m:
         return None
@@ -306,7 +350,6 @@ def _extract_points(text, ncs, nce, bracket_idx):
 
 
 def _extract_diffuse(text, ncs, nce):
-    """Return [r,g,b,255] ints from a Material block, or None."""
     hdr = text[ncs: min(ncs + 512, nce)]
     dc = _DC_RE.search(hdr)
     if not dc:
@@ -314,30 +357,40 @@ def _extract_diffuse(text, ncs, nce):
     return [int(float(dc.group(i)) * 255) for i in (1, 2, 3)] + [255]
 
 
-def _inline_coord(text, ncs, nce, brace_idx, bracket_idx):
+def _inline_coord(text, ncs, nce, brace_idx, bracket_idx, def_map):
+    """VRML 2.0: resolve coord field inside an IndexedFaceSet.
+    Handles both inline Coordinate{} and coord USE name references.
     """
-    VRML 2.0: look for `coord Coordinate { point [...] }` inside an
-    IndexedFaceSet block and return the vertex array, or None.
-    """
+    # Inline: coord [DEF name] Coordinate { point [...] }
     cm = _COORD_FIELD_RE.search(text, ncs, nce)
-    if not cm:
-        return None
-    bo = text.find('{', cm.start())
-    if bo == -1 or bo >= nce:
-        return None
-    bc = brace_idx.get(bo)
-    if bc is None or bc > nce:
-        return None
-    return _extract_points(text, bo + 1, bc, bracket_idx)
+    if cm:
+        bo = text.find('{', cm.start())
+        if bo != -1 and bo < nce:
+            bc = brace_idx.get(bo)
+            if bc is not None and bc <= nce:
+                result = _extract_points(text, bo + 1, bc, bracket_idx)
+                if result is not None:
+                    return result
+
+    # USE reference: coord USE SomeName
+    um = _COORD_USE_RE.search(text, ncs, nce)
+    if um:
+        entry = def_map.get(um.group(1))
+        if entry:
+            _, dcs, dce = entry
+            result = _extract_points(text, dcs, dce, bracket_idx)
+            if result is not None:
+                return result
+
+    return None
 
 
-# ── VRML state-machine walker (1.0 + 2.0) ─────────────────────────────────────────
+# -- VRML state-machine walker (1.0 + 2.0 + DEF/USE) -------------------------
 
-# Nodes that create a new scope but inherit parent coord/color state
 _CONTAINERS = frozenset({'Separator', 'Group', 'Switch', 'TransformSeparator', 'Shape'})
 
 
-def _walk(text, meshes, brace_idx, bracket_idx):
+def _walk(text, meshes, brace_idx, bracket_idx, def_map):
     import trimesh
     from trimesh.visual.material import PBRMaterial
 
@@ -345,17 +398,18 @@ def _walk(text, meshes, brace_idx, bracket_idx):
     # Stack: (cs, ce, matrix, coord, color)
     stack = [(0, len(text), np.eye(4), None, list(_DEFAULT_COLOR))]
     total_tried = 0
+    seen_ifs = set()  # avoid processing the same IFS content range twice (DEF reuse)
 
     while stack:
         cs, ce, parent_matrix, parent_coord, parent_color = stack.pop()
 
         current_matrix = np.copy(parent_matrix)
-        current_coord  = parent_coord       # inherited
-        current_color  = list(parent_color) # inherited
+        current_coord  = parent_coord
+        current_color  = list(parent_color)
 
-        for node, node_pos, ncs, nce in _direct_children(text, cs, ce, brace_idx):
+        for node, node_pos, ncs, nce in _direct_children(text, cs, ce, brace_idx, def_map):
 
-            # ─ Transforms ───────────────────────────────────────────────────────────
+            # -- Transforms ---------------------------------------------------
             if node == 'MatrixTransform':
                 vm = _MTX_VALS_RE.search(text, ncs, nce)
                 if vm:
@@ -381,7 +435,7 @@ def _walk(text, meshes, brace_idx, bracket_idx):
                     M = M @ np.diag([sx, sy, sz, 1.0])
                 current_matrix = parent_matrix @ M
 
-            # ─ Geometry state (VRML 1.0 siblings) ──────────────────────────────
+            # -- Geometry state (VRML 1.0 siblings) ---------------------------
             elif node in ('Coordinate3', 'Coordinate'):
                 coords = _extract_points(text, ncs, nce, bracket_idx)
                 if coords is not None:
@@ -392,37 +446,42 @@ def _walk(text, meshes, brace_idx, bracket_idx):
                 if col:
                     current_color = col
 
-            # ─ VRML 2.0 Appearance node (extracts Material color) ──────────────
+            # -- VRML 2.0 Appearance ------------------------------------------
             elif node == 'Appearance':
-                for child, _, ccs, cce in _direct_children(text, ncs, nce, brace_idx):
+                for child, _, ccs, cce in _direct_children(text, ncs, nce, brace_idx, def_map):
                     if child == 'Material':
                         col = _extract_diffuse(text, ccs, cce)
                         if col:
                             current_color = col
                         break
 
-            # ─ Containers: push scope inheriting current coord+color ────────────
+            # -- Containers: push scope inheriting current state ---------------
             elif node in _CONTAINERS:
                 stack.append((ncs, nce, current_matrix,
                               current_coord, list(current_color)))
 
             elif node == 'LOD':
-                # Use only the highest-detail child
-                for child_node, _, ccs, cce in _direct_children(text, ncs, nce, brace_idx):
+                for child_node, _, ccs, cce in _direct_children(text, ncs, nce, brace_idx, def_map):
                     if child_node in _CONTAINERS or child_node == 'LOD':
                         stack.append((ccs, cce, current_matrix,
                                       current_coord, list(current_color)))
                         break
 
-            # ─ Geometry ────────────────────────────────────────────────────────────
+            # -- Geometry -----------------------------------------------------
             elif node == 'IndexedFaceSet':
                 total_tried += 1
 
-                # VRML 2.0: coord may be embedded inside the IFS block
-                coord_to_use = (_inline_coord(text, ncs, nce, brace_idx, bracket_idx)
+                # Skip duplicate IFS content ranges (same DEF reused at same
+                # position would double-add geometry)
+                if (ncs, nce) in seen_ifs:
+                    continue
+                seen_ifs.add((ncs, nce))
+
+                # VRML 2.0: coord may be inline or a USE ref inside the IFS
+                coord_to_use = (_inline_coord(text, ncs, nce, brace_idx,
+                                              bracket_idx, def_map)
                                 or current_coord)
                 if coord_to_use is None:
-                    logger.debug('  IFS #%d skipped: no coord', total_tried)
                     continue
 
                 ci_m = _CI_RE.search(text, ncs, nce)
@@ -463,24 +522,24 @@ def _walk(text, meshes, brace_idx, bracket_idx):
     logger.info('IFS tried: %d  succeeded: %d', total_tried, len(meshes))
 
 
-# ── Parse + post-process ───────────────────────────────────────────────────────────────
+# -- Parse + post-process -----------------------------------------------------
 
 def _parse_vrml(src: Path):
-    logger.info('Reading %s (%.1f MB) …', src.name, src.stat().st_size / 1e6)
+    logger.info('Reading %s (%.1f MB) ...', src.name, src.stat().st_size / 1e6)
     text = src.read_text(encoding='utf-8', errors='replace')
     brace_idx   = _build_brace_index(text)
     bracket_idx = _build_bracket_index(text)
-    logger.info('Walking VRML tree …')
+    def_map     = _build_def_map(text, brace_idx)
+    logger.info('Walking VRML tree ...')
     meshes = []
-    _walk(text, meshes, brace_idx, bracket_idx)
+    _walk(text, meshes, brace_idx, bracket_idx, def_map)
     if not meshes:
-        raise ValueError('No geometry found — check terminal for details.')
+        raise ValueError('No geometry found - check terminal for details.')
     logger.info('Parsed %d mesh parts', len(meshes))
     return meshes
 
 
 def _apply_gray(meshes):
-    """Override all part materials to neutral light gray."""
     from trimesh.visual.material import PBRMaterial
     import trimesh
     gray = np.array([0.82, 0.82, 0.82, 1.0])
@@ -495,7 +554,8 @@ def _simplify_list(meshes, max_faces):
     if total <= max_faces:
         return meshes
     ratio = max_faces / total
-    logger.info('Simplifying %d total faces → target %d (ratio %.2f) …', total, max_faces, ratio)
+    logger.info('Simplifying %d total faces -> target %d (ratio %.2f) ...',
+                total, max_faces, ratio)
     out = []
     for m in meshes:
         target = max(4, int(len(m.faces) * ratio))
@@ -504,7 +564,7 @@ def _simplify_list(meshes, max_faces):
             if hasattr(m, method):
                 try:
                     simplified = getattr(m, method)(target)
-                    simplified.visual = m.visual  # preserve PBR
+                    simplified.visual = m.visual
                 except Exception:
                     pass
                 break
@@ -533,7 +593,7 @@ def _to_bytes(out):
     return out.encode('utf-8') if isinstance(out, str) else bytes(out)
 
 
-# ── Flask routes ──────────────────────────────────────────────────────────────────
+# -- Flask routes -------------------------------------------------------------
 
 @app.route('/')
 def index():
@@ -567,7 +627,8 @@ def convert():
 
         raw = _export_glb(meshes) if out_format == 'glb' else _export_flat(meshes, out_format)
         out_bytes = _to_bytes(raw)
-        logger.info('Output: %.2f MB  format=%s  color=%s', len(out_bytes)/1e6, out_format, color_mode)
+        logger.info('Output: %.2f MB  format=%s  color=%s',
+                    len(out_bytes)/1e6, out_format, color_mode)
 
         mime = {'glb': 'model/gltf-binary', 'obj': 'text/plain',
                 'stl': 'application/octet-stream'}[out_format]
@@ -577,7 +638,7 @@ def convert():
         return jsonify(detail=str(ve)), 422
     except Exception:
         logger.error(traceback.format_exc())
-        return jsonify(detail='Conversion failed — check terminal.'), 500
+        return jsonify(detail='Conversion failed - check terminal.'), 500
     finally:
         if tmp_path and tmp_path.exists():
             try: tmp_path.unlink()
@@ -585,5 +646,5 @@ def convert():
 
 
 if __name__ == '__main__':
-    print('\n  VRML / WRL Converter  →  http://localhost:5555\n')
+    print('\n  VRML / WRL Converter  ->  http://localhost:5555\n')
     app.run(host='0.0.0.0', port=5555, debug=False)
