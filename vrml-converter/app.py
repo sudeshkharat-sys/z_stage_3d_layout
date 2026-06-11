@@ -5,6 +5,8 @@ Speed / size improvements vs previous version:
   - Same-color meshes merged before export (fewer GLB primitives, smaller file)
   - Background thread + SSE progress stream (real server-side %)
   - Proper two-step flow: POST /start -> SSE /progress/<id> -> GET /download/<id>
+  - Transform/MatrixTransform now push children to stack (VRML 2.0 grouping fix)
+  - Anchor, Billboard, Collision added as containers
 
 Usage:
     pip install flask trimesh[easy] numpy
@@ -32,7 +34,6 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024 * 1024
 
-# in-memory job store: job_id -> dict
 _jobs: dict = {}
 _jobs_lock = threading.Lock()
 
@@ -164,7 +165,6 @@ async function startConvert() {
   pf.style.width = '2%';
   pl.textContent = 'Uploading...';
 
-  // ---- Phase 1: upload file and get job_id ----
   const form = new FormData();
   form.append('file', chosenFile);
   form.append('out_format', document.getElementById('outFmt').value);
@@ -200,11 +200,9 @@ async function startConvert() {
   pf.style.width = '32%';
   pl.textContent = 'Processing...';
 
-  // ---- Phase 2: stream real progress via SSE ----
   const evtSrc = new EventSource('/progress/' + jobId);
   evtSrc.onmessage = async (e) => {
     const data = JSON.parse(e.data);
-    // Map server 0-100 into 30-100 range on the bar
     const barPct = 30 + Math.round(data.pct * 0.70);
     pf.style.width = barPct + '%';
     pl.textContent = data.label || 'Processing...';
@@ -213,7 +211,6 @@ async function startConvert() {
       evtSrc.close();
       pf.style.width = '100%';
       pl.textContent = 'Done!';
-      // trigger download
       const a = document.createElement('a');
       const base = chosenFile.name.replace(/\\.[^.]+$/, '');
       a.href = '/download/' + jobId;
@@ -221,7 +218,9 @@ async function startConvert() {
       a.click();
       rb.className = 'result ok';
       rb.style.display = 'block';
-      rb.innerHTML = '&#9989; Done! <div class="stats">' + fmt(data.size) + ' &mdash; ' + (data.parts || '') + ' parts merged into ' + (data.merged || '') + ' color groups</div>';
+      rb.innerHTML = '&#9989; Done! <div class="stats">' + fmt(data.size)
+        + ' &mdash; ' + (data.parts || 0) + ' parts &rarr; '
+        + (data.merged || 0) + ' color groups</div>';
       btn.disabled = false;
     } else if (data.status === 'error') {
       evtSrc.close();
@@ -253,10 +252,13 @@ _NUM_RE      = re.compile(r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?')
 _BRACE_RE    = re.compile(r'[{}]')
 _BRACKET_RE  = re.compile(r'[\[\]]')
 
+# All node keywords that start a { } block.
+# Transform and MatrixTransform included here so _direct_children finds them;
+# they are handled specially in _walk (matrix computed AND children pushed).
 _DIRECT_RE = re.compile(
     r'\b(MatrixTransform|Transform|Separator|Group|LOD|Switch'
     r'|TransformSeparator|Coordinate3|Coordinate|IndexedFaceSet|IndexedLineSet'
-    r'|Shape|Appearance'
+    r'|Shape|Appearance|Anchor|Billboard|Collision'
     r'|Material|MaterialBinding|Normal|NormalBinding|ShapeHints'
     r'|Info|Texture2|Texture2Transform|TextureCoordinate2'
     r'|PointLight|DirectionalLight|SpotLight|OrthographicCamera|PerspectiveCamera'
@@ -317,9 +319,6 @@ def _build_def_map(text, brace_idx):
 
 
 def _build_global_field_uses(text):
-    """Pre-compute positions of all field-value USE tokens in the file.
-    Much faster than scanning per-scope.
-    """
     positions = set()
     for m in _FIELD_USE_RE.finditer(text):
         pos = text.index('USE', m.start())
@@ -343,17 +342,11 @@ def _bracket_pos(text, start, end, bracket_idx):
 # ---------------------------------------------------------------------------
 
 def _direct_children(text, cs, ce, brace_idx, def_map, field_uses):
-    """
-    Yield (node_name, kw_pos, content_cs, content_ce) for every direct child
-    node in [cs, ce), including standalone USE nodes resolved via def_map.
-    Field-value USEs (coord USE x, ...) are excluded via the global field_uses set.
-    """
     pos = cs
     while pos < ce:
         dm = _DIRECT_RE.search(text, pos, ce)
         um = _STANDALONE_USE_RE.search(text, pos, ce)
 
-        # skip USE matches that are field values
         while um is not None and um.start() in field_uses:
             um = _STANDALONE_USE_RE.search(text, um.end(), ce)
 
@@ -423,7 +416,7 @@ def _build_faces(indices):
 
 
 # ---------------------------------------------------------------------------
-# Coord / color extraction helpers
+# Coord / color extraction
 # ---------------------------------------------------------------------------
 
 def _extract_points(text, ncs, nce, bracket_idx):
@@ -466,12 +459,16 @@ def _inline_coord(text, ncs, nce, brace_idx, bracket_idx, def_map):
 # VRML walker
 # ---------------------------------------------------------------------------
 
-_CONTAINERS = frozenset({'Separator', 'Group', 'Switch', 'TransformSeparator', 'Shape'})
+# Pure container nodes (no transform, no state change — just scope)
+_CONTAINERS = frozenset({
+    'Separator', 'Group', 'Switch', 'TransformSeparator',
+    'Shape', 'Anchor', 'Billboard', 'Collision',
+})
 
 
 def _walk(text, meshes, brace_idx, bracket_idx, def_map, field_uses, progress_cb=None):
-    import trimesh
     from trimesh.visual.material import PBRMaterial
+    import trimesh
 
     _DEFAULT_COLOR = [210, 210, 210, 255]
     stack = [(0, len(text), np.eye(4), None, list(_DEFAULT_COLOR))]
@@ -487,15 +484,26 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_map, field_uses, progress_cb
         for node, node_pos, ncs, nce in _direct_children(
                 text, cs, ce, brace_idx, def_map, field_uses):
 
+            # ----------------------------------------------------------------
+            # MatrixTransform: apply matrix AND push children to stack
+            # (VRML 1.0: property node with no children — push is harmless;
+            #  VRML 2.0: grouping node whose children live inside the block)
+            # ----------------------------------------------------------------
             if node == 'MatrixTransform':
                 vm = _MTX_VALS_RE.search(text, ncs, nce)
                 if vm:
                     mat = np.array([float(vm.group(i)) for i in range(1, 17)],
                                    dtype=np.float64).reshape(4, 4)
                     current_matrix = parent_matrix @ mat
+                # Push block content — picks up any children in VRML 2.0 usage
+                stack.append((ncs, nce, current_matrix,
+                              current_coord, list(current_color)))
 
+            # ----------------------------------------------------------------
+            # Transform: apply transform AND push children to stack
+            # ----------------------------------------------------------------
             elif node == 'Transform':
-                hdr = text[ncs: min(ncs + 600, nce)]
+                hdr = text[ncs: min(ncs + 800, nce)]
                 M = np.eye(4)
                 tr = _TR1_RE.search(hdr)
                 if tr:
@@ -511,7 +519,14 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_map, field_uses, progress_cb
                     sz = float(sc.group(3)) if sc.group(3) else sx
                     M = M @ np.diag([sx, sy, sz, 1.0])
                 current_matrix = parent_matrix @ M
+                # Push block content with updated matrix so nested
+                # children (VRML 2.0 style) are processed correctly
+                stack.append((ncs, nce, current_matrix,
+                              current_coord, list(current_color)))
 
+            # ----------------------------------------------------------------
+            # Geometry state nodes (VRML 1.0 sibling style)
+            # ----------------------------------------------------------------
             elif node in ('Coordinate3', 'Coordinate'):
                 coords = _extract_points(text, ncs, nce, bracket_idx)
                 if coords is not None:
@@ -521,6 +536,9 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_map, field_uses, progress_cb
                 col = _extract_diffuse(text, ncs, nce)
                 if col: current_color = col
 
+            # ----------------------------------------------------------------
+            # VRML 2.0 Appearance
+            # ----------------------------------------------------------------
             elif node == 'Appearance':
                 for child, _, ccs, cce in _direct_children(
                         text, ncs, nce, brace_idx, def_map, field_uses):
@@ -529,18 +547,25 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_map, field_uses, progress_cb
                         if col: current_color = col
                         break
 
+            # ----------------------------------------------------------------
+            # Pure container nodes — push scope inheriting current state
+            # ----------------------------------------------------------------
             elif node in _CONTAINERS:
                 stack.append((ncs, nce, current_matrix,
                               current_coord, list(current_color)))
 
             elif node == 'LOD':
+                # Use only the first (highest-detail) child
                 for child_node, _, ccs, cce in _direct_children(
                         text, ncs, nce, brace_idx, def_map, field_uses):
-                    if child_node in _CONTAINERS or child_node == 'LOD':
+                    if child_node in _CONTAINERS or child_node in ('LOD', 'Transform', 'MatrixTransform'):
                         stack.append((ccs, cce, current_matrix,
                                       current_coord, list(current_color)))
                         break
 
+            # ----------------------------------------------------------------
+            # Geometry
+            # ----------------------------------------------------------------
             elif node == 'IndexedFaceSet':
                 total_tried += 1
                 coord_to_use = (_inline_coord(text, ncs, nce, brace_idx,
@@ -568,7 +593,6 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_map, field_uses, progress_cb
                     mesh.apply_transform(current_matrix)
 
                 r, g, b, a = current_color
-                from trimesh.visual.material import PBRMaterial
                 pbr = PBRMaterial(
                     baseColorFactor=np.array([r/255.0, g/255.0, b/255.0, a/255.0]),
                     metallicFactor=0.0,
@@ -577,7 +601,6 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_map, field_uses, progress_cb
                 mesh.visual = trimesh.visual.TextureVisuals(material=pbr)
                 meshes.append(mesh)
 
-                # emit progress every 50 parts based on file position
                 if progress_cb and len(meshes) % 50 == 0:
                     pct = int(20 + min(ncs / file_len, 1.0) * 55)
                     progress_cb(pct, f'Parsing... {len(meshes)} parts found')
@@ -600,9 +623,6 @@ def _apply_gray(meshes):
 
 
 def _merge_by_color(meshes):
-    """Merge meshes that share the same base color into one mesh per color group.
-    Dramatically reduces GLB primitive count and file size.
-    """
     import trimesh
     groups: dict = {}
     for m in meshes:
@@ -613,7 +633,6 @@ def _merge_by_color(meshes):
         if key not in groups:
             groups[key] = []
         groups[key].append(m)
-
     result = []
     for key, group in groups.items():
         if len(group) == 1:
@@ -678,8 +697,7 @@ def _set_progress(job_id, pct, label=''):
 
 
 def _run_job(job_id, src_path, out_format, max_faces, color_mode, stem):
-    def prog(pct, label):
-        _set_progress(job_id, pct, label)
+    def prog(pct, label): _set_progress(job_id, pct, label)
 
     try:
         prog(5,  'Reading file...')
@@ -702,7 +720,7 @@ def _run_job(job_id, src_path, out_format, max_faces, color_mode, stem):
         meshes = []
         _walk(text, meshes, brace_idx, bracket_idx, def_map, field_uses,
               progress_cb=prog)
-        del text  # free 2 GB string ASAP
+        del text
 
         if not meshes:
             raise ValueError('No geometry found - check terminal for details.')
@@ -727,7 +745,6 @@ def _run_job(job_id, src_path, out_format, max_faces, color_mode, stem):
         out_bytes = _to_bytes(raw)
         del meshes
 
-        # save result to a temp file for download
         result_path = src_path.with_suffix(f'.out.{out_format}')
         result_path.write_bytes(out_bytes)
         size = len(out_bytes)
@@ -736,15 +753,10 @@ def _run_job(job_id, src_path, out_format, max_faces, color_mode, stem):
         logger.info('Job %s done: %.2f MB', job_id, size / 1e6)
         with _jobs_lock:
             _jobs[job_id].update({
-                'status':      'done',
-                'pct':         100,
-                'label':       'Done!',
-                'result_path': result_path,
-                'result_size': size,
-                'stem':        stem,
-                'out_format':  out_format,
-                'n_parts':     n_parts,
-                'n_merged':    n_merged,
+                'status': 'done', 'pct': 100, 'label': 'Done!',
+                'result_path': result_path, 'result_size': size,
+                'stem': stem, 'out_format': out_format,
+                'n_parts': n_parts, 'n_merged': n_merged,
             })
 
     except Exception:
@@ -771,7 +783,6 @@ def index():
 
 @app.route('/start', methods=['POST'])
 def start():
-    """Receive the file, start background conversion, return job_id immediately."""
     f = request.files.get('file')
     if not f or not f.filename:
         return jsonify(detail='No file received.'), 400
@@ -780,13 +791,11 @@ def start():
         return jsonify(detail=f'Only .wrl/.vrml supported (got .{ext}).'), 400
 
     out_format = request.form.get('out_format', 'glb').lower()
-    if out_format not in ('glb', 'obj', 'stl'):
-        out_format = 'glb'
+    if out_format not in ('glb', 'obj', 'stl'): out_format = 'glb'
     max_faces  = max(5000, min(int(request.form.get('max_faces', 500000)), 10_000_000))
     color_mode = request.form.get('color_mode', 'actual')
     stem       = Path(f.filename).stem
 
-    # save upload to temp file
     tmp = tempfile.NamedTemporaryFile(suffix=f'.{ext}', delete=False)
     f.save(tmp)
     tmp.close()
@@ -805,7 +814,6 @@ def start():
 
 @app.route('/progress/<job_id>')
 def progress(job_id):
-    """SSE stream of real server-side progress for a conversion job."""
     def generate():
         while True:
             with _jobs_lock:
@@ -813,15 +821,12 @@ def progress(job_id):
             if job is None:
                 yield f'data: {json.dumps({"status": "error", "error": "Job not found"})}\n\n'
                 return
-            payload = {
-                'pct':    job.get('pct', 0),
-                'label':  job.get('label', ''),
-                'status': job.get('status', 'running'),
-            }
+            payload = {'pct': job.get('pct', 0), 'label': job.get('label', ''),
+                       'status': job.get('status', 'running')}
             if job.get('status') == 'done':
-                payload['size']   = job.get('result_size', 0)
-                payload['parts']  = job.get('n_parts', '')
-                payload['merged'] = job.get('n_merged', '')
+                payload.update({'size': job.get('result_size', 0),
+                                'parts': job.get('n_parts', ''),
+                                'merged': job.get('n_merged', '')})
             elif job.get('status') == 'error':
                 payload['error'] = job.get('error', 'Unknown error')
             yield f'data: {json.dumps(payload)}\n\n'
@@ -835,20 +840,14 @@ def progress(job_id):
 
 @app.route('/download/<job_id>')
 def download(job_id):
-    """Send the converted file once the job is complete."""
     with _jobs_lock:
         job = _jobs.get(job_id)
     if not job or job.get('status') != 'done':
         return jsonify(detail='Not ready or job not found.'), 404
-
-    result_path = job['result_path']
-    out_format  = job['out_format']
-    stem        = job['stem']
     mime = {'glb': 'model/gltf-binary', 'obj': 'text/plain',
-            'stl': 'application/octet-stream'}[out_format]
-
-    return send_file(result_path, mimetype=mime, as_attachment=True,
-                     download_name=f'{stem}.{out_format}')
+            'stl': 'application/octet-stream'}[job['out_format']]
+    return send_file(job['result_path'], mimetype=mime, as_attachment=True,
+                     download_name=f"{job['stem']}.{job['out_format']}")
 
 
 if __name__ == '__main__':
