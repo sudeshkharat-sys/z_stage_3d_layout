@@ -615,7 +615,7 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                 if vm:
                     mat = np.array([float(vm.group(i)) for i in range(1, 17)],
                                    dtype=np.float64).reshape(4, 4)
-                    current_matrix = parent_matrix @ mat
+                    current_matrix = current_matrix @ mat   # accumulate, not reset
                 stack.append((ncs, nce, current_matrix, current_coord, list(current_color)))
 
             elif node == 'Transform':
@@ -634,9 +634,8 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                     sy = float(sc.group(2)) if sc.group(2) else sx
                     sz = float(sc.group(3)) if sc.group(3) else sx
                     M = M @ np.diag([sx, sy, sz, 1.0])
-                new_matrix = parent_matrix @ M
-                current_matrix = new_matrix
-                stack.append((ncs, nce, new_matrix, current_coord, list(current_color)))
+                current_matrix = current_matrix @ M         # accumulate, not reset
+                stack.append((ncs, nce, current_matrix, current_coord, list(current_color)))
 
             elif node == 'Coordinate3':
                 pt_m = _PT_RE.search(text, ncs, nce)
