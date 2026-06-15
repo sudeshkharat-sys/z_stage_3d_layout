@@ -592,6 +592,10 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
     while stack:
         cs, ce, parent_matrix, parent_coord, parent_color = stack.pop()
 
+        if collector.total_faces >= collector.max_faces:
+            collector.skipped += 1
+            continue
+
         if progress_cb:
             progress_cb(cs, text_len)
 
