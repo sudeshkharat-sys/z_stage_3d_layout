@@ -274,16 +274,28 @@ def _brace_close(brace_idx, pos):
 
 
 def _build_def_map(text, brace_idx):
+    # Collect only the names that are actually USEd — avoids building 255K entries
+    # when only 651 will ever be looked up.
+    use_names = set()
+    for m in _USE_STANDALONE_RE.finditer(text):
+        use_names.add(m.group(1))
+    for m in _FIELD_USE_RE.finditer(text):
+        use_names.add(m.group(2))   # group 2 = name after USE
+    logger.info('USE names referenced: %d', len(use_names))
+
     def_map = {}
     for m in _DEF_RE.finditer(text):
-        name, node_type = m.group(1), m.group(2)
+        name = m.group(1)
+        if name not in use_names:
+            continue   # skip — nothing ever USEs this DEF
+        node_type = m.group(2)
         bo = text.find('{', m.start())
         if bo == -1:
             continue
         bc = _brace_close(brace_idx, bo)
         if bc is not None:
             def_map[name] = (node_type, bo + 1, bc)
-    logger.info('DEF map: %d named nodes', len(def_map))
+    logger.info('DEF map: %d entries (skipped %d unused)', len(def_map), len(use_names) - len(def_map))
     return def_map
 
 
