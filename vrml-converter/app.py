@@ -226,12 +226,13 @@ _FIELD_USE_RE      = re.compile(
 
 _PT_RE          = re.compile(r'\bpoint\s*\[')
 _CI_RE          = re.compile(r'\bcoordIndex\s*\[')
-_DC_RE          = re.compile(rf'\bdiffuseColor\s+\[?\s*({_FLT})\s+({_FLT})\s+({_FLT})')
-_FLT16          = r'\s+'.join([rf'({_FLT})'] * 16)
+_SEP            = r'[\s,]+'   # VRML allows commas as optional separators between values
+_DC_RE          = re.compile(rf'\bdiffuseColor\s+\[?{_SEP}?({_FLT}){_SEP}({_FLT}){_SEP}({_FLT})')
+_FLT16          = _SEP.join([rf'({_FLT})'] * 16)
 _MTX_VALS_RE    = re.compile(r'\bmatrix\s+' + _FLT16)
-_TR1_RE         = re.compile(rf'\btranslation\s+({_FLT})\s+({_FLT})\s+({_FLT})')
-_SC1_RE         = re.compile(rf'\bscaleFactor\s+({_FLT})(?:\s+({_FLT})\s+({_FLT}))?')
-_RO1_RE         = re.compile(rf'\brotation\s+({_FLT})\s+({_FLT})\s+({_FLT})\s+({_FLT})')
+_TR1_RE         = re.compile(rf'\btranslation\s+({_FLT}){_SEP}({_FLT}){_SEP}({_FLT})')
+_SC1_RE         = re.compile(rf'\bscaleFactor\s+({_FLT})(?:{_SEP}({_FLT}){_SEP}({_FLT}))?')
+_RO1_RE         = re.compile(rf'\brotation\s+({_FLT}){_SEP}({_FLT}){_SEP}({_FLT}){_SEP}({_FLT})')
 _COORD_FIELD_RE = re.compile(r'\bcoord\s+(?:DEF\s+\S+\s+)?Coordinate\s*\{')
 _COORD_USE_RE   = re.compile(r'\bcoord\s+USE\s+(\S+)')
 
@@ -494,14 +495,22 @@ class _MeshCollector:
 
     def _parse_geo(self, text, ncs, nce, brace_idx, def_map, parent_coord):
         key = (ncs, nce)
-        if key in self._geo_cache:
-            return self._geo_cache[key]
+        cached = self._geo_cache.get(key, 'MISS')
+        if cached != 'MISS':
+            if cached is None:
+                return None
+            cached_coord, cached_faces = cached
+            if cached_coord is not None:
+                # inline coord — stable, reuse directly
+                return cached
+            # no inline coord: faces are cached but coord comes from caller
+            if parent_coord is None:
+                return None
+            valid = np.all((cached_faces >= 0) & (cached_faces < len(parent_coord)), axis=1)
+            faces = cached_faces[valid]
+            return (parent_coord, faces) if len(faces) > 0 else None
+
         ifs_coord = _inline_coord(text, ncs, nce, brace_idx, def_map)
-        if ifs_coord is None:
-            ifs_coord = parent_coord
-        if ifs_coord is None:
-            self._geo_cache[key] = None
-            return None
         ci_m = _CI_RE.search(text, ncs, nce)
         if ci_m is None:
             self._geo_cache[key] = None
@@ -518,17 +527,33 @@ class _MeshCollector:
         if len(faces) == 0:
             self._geo_cache[key] = None
             return None
-        valid = np.all((faces >= 0) & (faces < len(ifs_coord)), axis=1)
-        faces = faces[valid]
-        if len(faces) == 0:
-            self._geo_cache[key] = None
-            return None
-        result = (ifs_coord, faces)
-        self._geo_cache[key] = result
-        if len(self._geo_cache) <= 3:
-            logger.info('Geo cache #%d: %d verts %d faces', len(self._geo_cache),
-                        len(ifs_coord), len(faces))
-        return result
+
+        if ifs_coord is not None:
+            # inline coord: cache coord+faces together (stable across calls)
+            valid = np.all((faces >= 0) & (faces < len(ifs_coord)), axis=1)
+            faces = faces[valid]
+            if len(faces) == 0:
+                self._geo_cache[key] = None
+                return None
+            result = (ifs_coord, faces)
+            self._geo_cache[key] = result
+            if len(self._geo_cache) <= 3:
+                logger.info('Geo cache #%d (inline): %d verts %d faces',
+                            len(self._geo_cache), len(ifs_coord), len(faces))
+            return result
+        else:
+            # no inline coord: cache only faces (coord varies per caller)
+            self._geo_cache[key] = (None, faces)
+            if parent_coord is None:
+                return None
+            valid = np.all((faces >= 0) & (faces < len(parent_coord)), axis=1)
+            faces = faces[valid]
+            if len(faces) == 0:
+                return None
+            if len(self._geo_cache) <= 3:
+                logger.info('Geo cache #%d (parent coord): %d verts %d faces',
+                            len(self._geo_cache), len(parent_coord), len(faces))
+            return (parent_coord, faces)
 
     def add_ifs(self, text, ncs, nce, brace_idx, def_map, transform, color, parent_coord):
         if self.total_faces >= self.max_faces:
@@ -596,6 +621,8 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
     stack = [(0, len(text), np.eye(4), None, list(_DEFAULT_COLOR))]
     total_tried = 0
     text_len = len(text)
+    _mtx_parsed = [0]   # MatrixTransform nodes successfully parsed
+    _mtx_failed = [0]   # MatrixTransform nodes where regex failed (comma issue?)
 
     while stack:
         cs, ce, parent_matrix, parent_coord, parent_color = stack.pop()
@@ -623,7 +650,14 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                         logger.info('FIRST MatrixTransform raw 4x4:\n%s', mat)
                         logger.info('  row3(OI translation?) = %s', mat[3, :3])
                         logger.info('  col3(GL translation?) = %s', mat[:3, 3])
+                        logger.info('  raw text snippet: %r', text[ncs:min(ncs+120, nce)])
+                    _mtx_parsed[0] += 1
                     current_matrix = current_matrix @ mat
+                else:
+                    _mtx_failed[0] += 1
+                    if _mtx_failed[0] <= 3:
+                        logger.warning('MatrixTransform regex FAILED — snippet: %r',
+                                       text[ncs:min(ncs+120, nce)])
                 stack.append((ncs, nce, current_matrix, current_coord, list(current_color)))
 
             elif node == 'Transform':
@@ -716,7 +750,8 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                 collector.add_ifs(text, ncs, nce, brace_idx, def_map,
                                   current_matrix, color, current_coord)
 
-    logger.info('IFS tried=%d', total_tried)
+    logger.info('IFS tried=%d  MatrixTransform: parsed=%d failed=%d',
+                total_tried, _mtx_parsed[0], _mtx_failed[0])
 
 
 # ── Post-processing ────────────────────────────────────────────────────────────
