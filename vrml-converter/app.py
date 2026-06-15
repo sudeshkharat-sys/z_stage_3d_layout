@@ -700,7 +700,7 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                 collector.add_ifs(text, ncs, nce, brace_idx, def_map,
                                   current_matrix, color, current_coord)
 
-    logger.info('IFS tried=%d succeeded=%d', total_tried, len(meshes))
+    logger.info('IFS tried=%d', total_tried)
 
 
 # ── Post-processing ────────────────────────────────────────────────────────────
