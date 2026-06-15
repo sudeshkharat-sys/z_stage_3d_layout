@@ -547,9 +547,11 @@ class _MeshCollector:
         verts, faces = geo
 
         # Apply transform
+        # VRML 1.0 (Open Inventor) uses row vectors: v_world = v_local @ M
+        # Translation is in the last ROW of the matrix, so h @ M (no transpose).
         if not np.allclose(transform, np.eye(4)):
             h = np.hstack([verts, np.ones((len(verts), 1), dtype=np.float64)])
-            verts = (h @ transform.T)[:, :3]
+            verts = (h @ transform)[:, :3]
         else:
             verts = verts.copy()
 
