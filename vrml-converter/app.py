@@ -120,8 +120,8 @@ HTML = r"""
       </select>
     </div>
     <div class="field">
-      <label>3. Max faces</label>
-      <input type="number" id="maxFaces" value="500000" min="5000" max="10000000" step="50000"/>
+      <label>3. Max faces <span style="color:#64748b;font-size:.78rem">(use 5M+ for large files)</span></label>
+      <input type="number" id="maxFaces" value="5000000" min="5000" max="100000000" step="500000"/>
     </div>
   </div>
   <div style="margin-bottom:1.5rem">
@@ -478,7 +478,7 @@ class _MeshCollector:
       part from consuming the entire face budget.
     """
 
-    def __init__(self, max_faces, max_instances_per_def=2000):
+    def __init__(self, max_faces, max_instances_per_def=50000):
         self.max_faces             = max_faces
         self.max_instances_per_def = max_instances_per_def
         self.total_faces           = 0
@@ -790,9 +790,10 @@ def _parse_vrml(src: Path, color_mode: str, max_faces: int = 500_000, progress_c
     _walk(text, collector, brace_idx, def_map, field_use_positions,
           color_mode, prescan=prescan, progress_cb=_walker_cb)
 
-    logger.info('Walk done: total_faces=%d geo_cache=%d groups=%d skipped=%d',
+    sample_colors = list(collector._groups.keys())[:5]
+    logger.info('Walk done: total_faces=%d geo_cache=%d groups=%d skipped=%d colors=%s',
                 collector.total_faces, len(collector._geo_cache),
-                len(collector._groups), collector.skipped)
+                len(collector._groups), collector.skipped, sample_colors)
 
     if progress_cb:
         progress_cb(82, 100, 'Finalizing meshes…')
@@ -891,7 +892,7 @@ def start():
     out_format = request.form.get('out_format', 'glb').lower()
     if out_format not in ('glb', 'obj', 'stl'):
         out_format = 'glb'
-    max_faces  = max(5000, min(int(request.form.get('max_faces', 500000)), 10_000_000))
+    max_faces  = max(5000, min(int(request.form.get('max_faces', 5_000_000)), 100_000_000))
     color_mode = request.form.get('color_mode', 'actual')
     if color_mode not in ('actual', 'gray'):
         color_mode = 'actual'
