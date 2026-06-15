@@ -219,8 +219,9 @@ _DIRECT_RE = re.compile(
 
 _DEF_RE            = re.compile(r'\bDEF\s+(\S+)\s+(\w+)\s*\{')
 _USE_STANDALONE_RE = re.compile(r'(?<!\w)USE\s+(\S+)')
+# Capture group 1 = the word USE so we can get its position without text.index()
 _FIELD_USE_RE      = re.compile(
-    r'\b(?:coord|appearance|geometry|material|color|normal|texCoord|children)\s+USE\s+(\S+)'
+    r'\b(?:coord|appearance|geometry|material|color|normal|texCoord|children)\s+(USE)\s+(\S+)'
 )
 
 _PT_RE          = re.compile(r'\bpoint\s*\[')
@@ -250,9 +251,10 @@ def _build_brace_index(text):
     return idx
 
 
-def _build_bracket_index(text):
+def _build_bracket_index_local(text, start, end):
+    """Build bracket index only within [start, end] — avoids scanning the full file."""
     idx, stack = {}, []
-    for m in _BRACKET_RE.finditer(text):
+    for m in _BRACKET_RE.finditer(text, start, end):
         if m.group() == '[':
             stack.append(m.start())
         elif stack:
@@ -277,18 +279,26 @@ def _build_def_map(text, brace_idx):
 def _build_field_use_positions(text):
     positions = set()
     for m in _FIELD_USE_RE.finditer(text):
-        use_pos = text.index('USE', m.start())
-        positions.add(use_pos)
+        positions.add(m.start(1))   # start of captured 'USE' group — no text.index() call
     return positions
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
-def _bracket_pos(text, start, end, bracket_idx):
+def _bracket_pos(text, start, end, bracket_idx=None):
+    """Find matching [ ] within [start, end). bracket_idx unused — kept for compat."""
     p = text.find('[', start)
     if p == -1 or p >= end:
         return None
-    cl = bracket_idx.get(p)
-    return (p + 1, cl) if (cl is not None and cl <= end) else None
+    # Walk forward to find the matching ] (local scan, not full-file index)
+    depth = 0
+    for i in range(p, end):
+        if text[i] == '[':
+            depth += 1
+        elif text[i] == ']':
+            depth -= 1
+            if depth == 0:
+                return (p + 1, i)
+    return None
 
 
 def _axis_angle_to_mat4(x, y, z, angle):
@@ -380,7 +390,7 @@ def _direct_children(text, cs, ce, brace_idx, def_map, field_use_positions):
 
 
 # ── Inline coord resolver ──────────────────────────────────────────────────────
-def _inline_coord(text, ncs, nce, brace_idx, bracket_idx, def_map):
+def _inline_coord(text, ncs, nce, brace_idx, def_map):
     cm = _COORD_FIELD_RE.search(text, ncs, nce)
     if cm:
         bo = text.find('{', cm.start())
@@ -389,7 +399,7 @@ def _inline_coord(text, ncs, nce, brace_idx, bracket_idx, def_map):
             if bc is not None and bc <= nce:
                 pm = _PT_RE.search(text, bo + 1, bc)
                 if pm:
-                    pp = _bracket_pos(text, pm.start(), bc, bracket_idx)
+                    pp = _bracket_pos(text, pm.start(), bc)
                     if pp:
                         floats = _parse_floats(text, pp)
                         if floats is not None and len(floats) >= 9 and len(floats) % 3 == 0:
@@ -401,7 +411,7 @@ def _inline_coord(text, ncs, nce, brace_idx, bracket_idx, def_map):
             _, dcs, dce = entry
             pm = _PT_RE.search(text, dcs, dce)
             if pm:
-                pp = _bracket_pos(text, pm.start(), dce, bracket_idx)
+                pp = _bracket_pos(text, pm.start(), dce)
                 if pp:
                     floats = _parse_floats(text, pp)
                     if floats is not None and len(floats) >= 9 and len(floats) % 3 == 0:
@@ -413,7 +423,7 @@ def _inline_coord(text, ncs, nce, brace_idx, bracket_idx, def_map):
 _CONTAINERS_V1 = frozenset({'Separator', 'Group', 'Switch', 'TransformSeparator'})
 
 
-def _walk(text, meshes, brace_idx, bracket_idx, def_map, field_use_positions,
+def _walk(text, meshes, brace_idx, def_map, field_use_positions,
           color_mode, progress_cb=None):
     import trimesh
 
@@ -465,7 +475,7 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_map, field_use_positions,
             elif node == 'Coordinate3':
                 pt_m = _PT_RE.search(text, ncs, nce)
                 if pt_m:
-                    pp = _bracket_pos(text, pt_m.start(), nce, bracket_idx)
+                    pp = _bracket_pos(text, pt_m.start(), nce)
                     if pp:
                         floats = _parse_floats(text, pp)
                         if floats is not None and len(floats) >= 9 and len(floats) % 3 == 0:
@@ -474,7 +484,7 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_map, field_use_positions,
             elif node == 'Coordinate':
                 pt_m = _PT_RE.search(text, ncs, nce)
                 if pt_m:
-                    pp = _bracket_pos(text, pt_m.start(), nce, bracket_idx)
+                    pp = _bracket_pos(text, pt_m.start(), nce)
                     if pp:
                         floats = _parse_floats(text, pp)
                         if floats is not None and len(floats) >= 9 and len(floats) % 3 == 0:
@@ -513,14 +523,14 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_map, field_use_positions,
                     elif child_node == 'Coordinate':
                         pt_m = _PT_RE.search(text, ccs, cce)
                         if pt_m:
-                            pp = _bracket_pos(text, pt_m.start(), cce, bracket_idx)
+                            pp = _bracket_pos(text, pt_m.start(), cce)
                             if pp:
                                 floats = _parse_floats(text, pp)
                                 if floats is not None and len(floats) >= 9 and len(floats) % 3 == 0:
                                     shape_coord = floats.reshape(-1, 3)
                     elif child_node == 'IndexedFaceSet':
                         total_tried += 1
-                        ifs_coord = _inline_coord(text, ccs, cce, brace_idx, bracket_idx, def_map)
+                        ifs_coord = _inline_coord(text, ccs, cce, brace_idx, def_map)
                         if ifs_coord is None:
                             ifs_coord = shape_coord
                         if ifs_coord is None:
@@ -528,7 +538,7 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_map, field_use_positions,
                         ci_m = _CI_RE.search(text, ccs, cce)
                         if ci_m is None:
                             continue
-                        ci_pp = _bracket_pos(text, ci_m.start(), cce, bracket_idx)
+                        ci_pp = _bracket_pos(text, ci_m.start(), cce)
                         if ci_pp is None:
                             continue
                         indices = _parse_face_indices(text, ci_pp[0], ci_pp[1])
@@ -557,7 +567,7 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_map, field_use_positions,
 
             elif node == 'IndexedFaceSet':
                 total_tried += 1
-                ifs_coord = _inline_coord(text, ncs, nce, brace_idx, bracket_idx, def_map)
+                ifs_coord = _inline_coord(text, ncs, nce, brace_idx, def_map)
                 if ifs_coord is None:
                     ifs_coord = current_coord
                 if ifs_coord is None:
@@ -565,7 +575,7 @@ def _walk(text, meshes, brace_idx, bracket_idx, def_map, field_use_positions,
                 ci_m = _CI_RE.search(text, ncs, nce)
                 if ci_m is None:
                     continue
-                ci_pp = _bracket_pos(text, ci_m.start(), nce, bracket_idx)
+                ci_pp = _bracket_pos(text, ci_m.start(), nce)
                 if ci_pp is None:
                     continue
                 indices = _parse_face_indices(text, ci_pp[0], ci_pp[1])
@@ -643,7 +653,7 @@ def _parse_vrml(src: Path, color_mode: str, progress_cb=None):
     if progress_cb:
         progress_cb(5, 100, 'Building index…')
     brace_idx           = _build_brace_index(text)
-    bracket_idx         = _build_bracket_index(text)
+    # bracket index built locally per-node — avoids scanning 1 GB for [] pairs
     def_map             = _build_def_map(text, brace_idx)
     field_use_positions = _build_field_use_positions(text)
 
@@ -664,7 +674,7 @@ def _parse_vrml(src: Path, color_mode: str, progress_cb=None):
             if progress_cb:
                 progress_cb(pct, 100, f'Parsing… {pct}%')
 
-    _walk(text, meshes, brace_idx, bracket_idx, def_map, field_use_positions,
+    _walk(text, meshes, brace_idx, def_map, field_use_positions,
           color_mode, progress_cb=_walker_cb)
 
     if not meshes:
