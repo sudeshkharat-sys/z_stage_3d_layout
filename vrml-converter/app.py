@@ -465,14 +465,126 @@ def _inline_coord(text, ncs, nce, brace_idx, def_map):
     return None
 
 
-# ── VRML walker ────────────────────────────────────────────────────────────────
+# ── Mesh collector: cache + merge-as-you-go ───────────────────────────────────
+class _MeshCollector:
+    """
+    Accumulates geometry across millions of USE instances without creating
+    individual trimesh objects per instance.
+
+    - Caches (vertices, faces) by content-range key — parses each unique DEF once.
+    - Groups accumulated arrays by color, so _merge_by_color isn't needed.
+    - Caps total faces at max_faces to prevent runaway memory for huge assemblies.
+    - Per-DEF instance cap (max_instances_per_def) prevents one repeated tiny
+      part from consuming the entire face budget.
+    """
+
+    def __init__(self, max_faces, max_instances_per_def=2000):
+        self.max_faces             = max_faces
+        self.max_instances_per_def = max_instances_per_def
+        self.total_faces           = 0
+        # color_key → {'verts': [np arrays], 'faces': [np arrays], 'offset': int}
+        self._groups    = {}
+        # (ncs, nce) → (vertices_array, faces_array) or None if unparseable
+        self._geo_cache = {}
+        # (ncs, nce) → instance count (for per-DEF cap)
+        self._inst_cnt  = {}
+        self.skipped    = 0
+
+    def _parse_geo(self, text, ncs, nce, brace_idx, def_map, parent_coord):
+        key = (ncs, nce)
+        if key in self._geo_cache:
+            return self._geo_cache[key]
+        ifs_coord = _inline_coord(text, ncs, nce, brace_idx, def_map)
+        if ifs_coord is None:
+            ifs_coord = parent_coord
+        if ifs_coord is None:
+            self._geo_cache[key] = None
+            return None
+        ci_m = _CI_RE.search(text, ncs, nce)
+        if ci_m is None:
+            self._geo_cache[key] = None
+            return None
+        ci_pp = _bracket_pos(text, ci_m.start(), nce)
+        if ci_pp is None:
+            self._geo_cache[key] = None
+            return None
+        indices = _parse_face_indices(text, ci_pp[0], ci_pp[1])
+        if len(indices) == 0:
+            self._geo_cache[key] = None
+            return None
+        faces = _build_faces(indices)
+        if len(faces) == 0:
+            self._geo_cache[key] = None
+            return None
+        valid = np.all((faces >= 0) & (faces < len(ifs_coord)), axis=1)
+        faces = faces[valid]
+        if len(faces) == 0:
+            self._geo_cache[key] = None
+            return None
+        result = (ifs_coord, faces)
+        self._geo_cache[key] = result
+        return result
+
+    def add_ifs(self, text, ncs, nce, brace_idx, def_map, transform, color, parent_coord):
+        if self.total_faces >= self.max_faces:
+            self.skipped += 1
+            return False
+        key = (ncs, nce)
+        cnt = self._inst_cnt.get(key, 0)
+        if cnt >= self.max_instances_per_def:
+            self.skipped += 1
+            return True
+        self._inst_cnt[key] = cnt + 1
+
+        geo = self._parse_geo(text, ncs, nce, brace_idx, def_map, parent_coord)
+        if geo is None:
+            return True
+        verts, faces = geo
+
+        # Apply transform
+        if not np.allclose(transform, np.eye(4)):
+            h = np.hstack([verts, np.ones((len(verts), 1), dtype=np.float64)])
+            verts = (h @ transform.T)[:, :3]
+        else:
+            verts = verts.copy()
+
+        color_key = tuple(color)
+        if color_key not in self._groups:
+            self._groups[color_key] = {'verts': [], 'faces': [], 'offset': 0}
+        g = self._groups[color_key]
+        g['faces'].append(faces + g['offset'])
+        g['verts'].append(verts)
+        g['offset'] += len(verts)
+        self.total_faces += len(faces)
+        return True
+
+    def finalize(self):
+        import trimesh
+        result = []
+        for color_key, g in self._groups.items():
+            if not g['verts']:
+                continue
+            verts = np.concatenate(g['verts'])
+            faces = np.concatenate(g['faces'])
+            try:
+                m = trimesh.Trimesh(vertices=verts, faces=faces, process=True)
+            except Exception:
+                m = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+            m.visual.face_colors = list(color_key)
+            result.append(m)
+        total_f = sum(len(m.faces) for m in result)
+        total_v = sum(len(m.vertices) for m in result)
+        logger.info('Collector: %d color groups, %d faces, %d verts (skipped %d over-limit)',
+                    len(result), total_f, total_v, self.skipped)
+        return result
+
+
+
 _CONTAINERS_V1 = frozenset({'Separator', 'Group', 'Switch', 'TransformSeparator'})
 
 
-def _walk(text, meshes, brace_idx, def_map, field_use_positions,
+def _walk(text, collector, brace_idx, def_map, field_use_positions,
           color_mode, prescan, progress_cb=None):
-    import trimesh
-
     stack = [(0, len(text), np.eye(4), None, list(_DEFAULT_COLOR))]
     total_tried = 0
     text_len = len(text)
@@ -572,33 +684,9 @@ def _walk(text, meshes, brace_idx, def_map, field_use_positions,
                                     shape_coord = floats.reshape(-1, 3)
                     elif child_node == 'IndexedFaceSet':
                         total_tried += 1
-                        ifs_coord = _inline_coord(text, ccs, cce, brace_idx, def_map)
-                        if ifs_coord is None:
-                            ifs_coord = shape_coord
-                        if ifs_coord is None:
-                            continue
-                        ci_m = _CI_RE.search(text, ccs, cce)
-                        if ci_m is None:
-                            continue
-                        ci_pp = _bracket_pos(text, ci_m.start(), cce)
-                        if ci_pp is None:
-                            continue
-                        indices = _parse_face_indices(text, ci_pp[0], ci_pp[1])
-                        if len(indices) == 0:
-                            continue
-                        faces = _build_faces(indices)
-                        if len(faces) == 0:
-                            continue
-                        valid = np.all((faces >= 0) & (faces < len(ifs_coord)), axis=1)
-                        faces = faces[valid]
-                        if len(faces) == 0:
-                            continue
                         color = list(_DEFAULT_COLOR) if color_mode == 'gray' else list(shape_color)
-                        mesh = trimesh.Trimesh(vertices=ifs_coord.copy(), faces=faces, process=False)
-                        if not np.allclose(current_matrix, np.eye(4)):
-                            mesh.apply_transform(current_matrix)
-                        mesh.visual.face_colors = color
-                        meshes.append(mesh)
+                        collector.add_ifs(text, ccs, cce, brace_idx, def_map,
+                                          current_matrix, color, shape_coord)
 
             elif node == 'LOD':
                 for child_node, _, ccs, cce in _direct_children(prescan, ncs, nce):
@@ -608,35 +696,9 @@ def _walk(text, meshes, brace_idx, def_map, field_use_positions,
 
             elif node == 'IndexedFaceSet':
                 total_tried += 1
-                ifs_coord = _inline_coord(text, ncs, nce, brace_idx, def_map)
-                if ifs_coord is None:
-                    ifs_coord = current_coord
-                if ifs_coord is None:
-                    continue
-                ci_m = _CI_RE.search(text, ncs, nce)
-                if ci_m is None:
-                    continue
-                ci_pp = _bracket_pos(text, ci_m.start(), nce)
-                if ci_pp is None:
-                    continue
-                indices = _parse_face_indices(text, ci_pp[0], ci_pp[1])
-                if len(indices) == 0:
-                    continue
-                faces = _build_faces(indices)
-                if len(faces) == 0:
-                    continue
-                valid = np.all((faces >= 0) & (faces < len(ifs_coord)), axis=1)
-                faces = faces[valid]
-                if len(faces) == 0:
-                    continue
                 color = list(_DEFAULT_COLOR) if color_mode == 'gray' else list(current_color)
-                mesh = trimesh.Trimesh(vertices=ifs_coord.copy(), faces=faces, process=False)
-                if not np.allclose(current_matrix, np.eye(4)):
-                    mesh.apply_transform(current_matrix)
-                mesh.visual.face_colors = color
-                meshes.append(mesh)
-                logger.info('  part %d: %d verts %d faces color=%s',
-                            len(meshes), len(ifs_coord), len(faces), color[:3])
+                collector.add_ifs(text, ncs, nce, brace_idx, def_map,
+                                  current_matrix, color, current_coord)
 
     logger.info('IFS tried=%d succeeded=%d', total_tried, len(meshes))
 
@@ -686,7 +748,7 @@ def _simplify(mesh, max_faces):
 
 
 # ── VRML parse entry point ─────────────────────────────────────────────────────
-def _parse_vrml(src: Path, color_mode: str, progress_cb=None):
+def _parse_vrml(src: Path, color_mode: str, max_faces: int = 500_000, progress_cb=None):
     import trimesh
     logger.info('Reading %s (%.1f MB) …', src.name, src.stat().st_size / 1e6)
     text = src.read_text(encoding='utf-8', errors='replace')
@@ -705,10 +767,9 @@ def _parse_vrml(src: Path, color_mode: str, progress_cb=None):
     if progress_cb:
         progress_cb(15, 100, 'Parsing geometry…')
 
-    meshes   = []
-    text_len = len(text)
-    last_pct = [15]
-    max_pos  = [0]
+    collector = _MeshCollector(max_faces=max_faces)
+    last_pct  = [15]
+    max_pos   = [0]
 
     def _walker_cb(pos, total):
         if pos > max_pos[0]:
@@ -719,16 +780,15 @@ def _parse_vrml(src: Path, color_mode: str, progress_cb=None):
             if progress_cb:
                 progress_cb(pct, 100, f'Parsing… {pct}%')
 
-    _walk(text, meshes, brace_idx, def_map, field_use_positions,
+    _walk(text, collector, brace_idx, def_map, field_use_positions,
           color_mode, prescan=prescan, progress_cb=_walker_cb)
 
+    if progress_cb:
+        progress_cb(82, 100, 'Finalizing meshes…')
+    meshes = collector.finalize()
     if not meshes:
         raise ValueError('No geometry found in file.')
-
-    if progress_cb:
-        progress_cb(82, 100, 'Merging color groups…')
-    meshes = _merge_by_color(meshes)
-    logger.info('After merge: %d groups', len(meshes))
+    logger.info('Final: %d color groups', len(meshes))
     return meshes
 
 def _build_glb_scene(meshes):
@@ -775,24 +835,16 @@ def _run_job(jid, tmp_path, out_format, max_faces, color_mode):
             last_pct[0] = pct
             _job_set(jid, pct=pct, label=label)
 
-        meshes = _parse_vrml(tmp_path, color_mode, progress_cb=cb)
+        meshes = _parse_vrml(tmp_path, color_mode, max_faces=max_faces, progress_cb=cb)
 
-        _job_set(jid, pct=91, label='Simplifying…')
-        combined = trimesh.util.concatenate(meshes)
-        combined = _simplify(combined, max_faces)
-
-        _job_set(jid, pct=95, label=f'Exporting {out_format.upper()}…')
+        _job_set(jid, pct=93, label=f'Exporting {out_format.upper()}…')
 
         if out_format == 'glb':
-            # Use scene with PBR materials so colors appear correctly in Three.js.
-            # If simplification ran, meshes list may not match simplified geometry,
-            # so fall back to plain export in that case.
-            simplified = len(combined.faces) < sum(len(m.faces) for m in meshes)
-            if simplified:
-                raw = combined.export(file_type='glb')
-            else:
-                raw = _build_glb_scene(meshes)
+            raw = _build_glb_scene(meshes)
         else:
+            import trimesh as _trimesh
+            combined = _trimesh.util.concatenate(meshes)
+            combined = _simplify(combined, max_faces)
             raw = combined.export(file_type=out_format)
 
         out_bytes = bytes(raw) if not isinstance(raw, bytes) else raw
