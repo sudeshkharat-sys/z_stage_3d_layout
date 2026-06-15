@@ -240,26 +240,37 @@ _DEFAULT_COLOR = (230, 230, 230, 255)
 
 # ── Index builders ─────────────────────────────────────────────────────────────
 def _build_brace_index(text):
+    """
+    Build brace pair index as two sorted numpy arrays instead of a Python dict.
+    For 9M pairs: dict ≈ 550 MB, numpy ≈ 140 MB — 4× less memory.
+    Lookup: brace_close(pos) = binary search in opens array.
+    """
     logger.info('Building brace index …')
-    idx, stack = {}, []
+    opens_list, closes_list, stack = [], [], []
     for m in _BRACE_RE.finditer(text):
         if m.group() == '{':
             stack.append(m.start())
         elif stack:
-            idx[stack.pop()] = m.start()
-    logger.info('Brace index: %d pairs', len(idx))
-    return idx
+            o = stack.pop()
+            opens_list.append(o)
+            closes_list.append(m.start())
+    opens  = np.array(opens_list,  dtype=np.int64)
+    closes = np.array(closes_list, dtype=np.int64)
+    order  = np.argsort(opens)
+    opens  = opens[order]
+    closes = closes[order]
+    logger.info('Brace index: %d pairs', len(opens))
+    return opens, closes
 
 
-def _build_bracket_index_local(text, start, end):
-    """Build bracket index only within [start, end] — avoids scanning the full file."""
-    idx, stack = {}, []
-    for m in _BRACKET_RE.finditer(text, start, end):
-        if m.group() == '[':
-            stack.append(m.start())
-        elif stack:
-            idx[stack.pop()] = m.start()
-    return idx
+def _brace_close(brace_idx, pos):
+    """Return close-brace position for the open-brace at pos, or None."""
+    opens, closes = brace_idx
+    i = np.searchsorted(opens, pos)
+    if i < len(opens) and opens[i] == pos:
+        return int(closes[i])
+    return None
+
 
 
 def _build_def_map(text, brace_idx):
@@ -269,7 +280,7 @@ def _build_def_map(text, brace_idx):
         bo = text.find('{', m.start())
         if bo == -1:
             continue
-        bc = brace_idx.get(bo)
+        bc = _brace_close(brace_idx, bo)
         if bc is not None:
             def_map[name] = (node_type, bo + 1, bc)
     logger.info('DEF map: %d named nodes', len(def_map))
@@ -376,7 +387,7 @@ def _direct_children(text, cs, ce, brace_idx, def_map, field_use_positions):
             if brace_open == -1 or brace_open >= ce:
                 pos = nm.end()
                 continue
-            brace_close = brace_idx.get(brace_open)
+            brace_close = _brace_close(brace_idx, brace_open)
             if brace_close is None or brace_close > ce:
                 pos = nm.end()
                 continue
@@ -395,7 +406,7 @@ def _inline_coord(text, ncs, nce, brace_idx, def_map):
     if cm:
         bo = text.find('{', cm.start())
         if bo != -1 and bo < nce:
-            bc = brace_idx.get(bo)
+            bc = _brace_close(brace_idx, bo)
             if bc is not None and bc <= nce:
                 pm = _PT_RE.search(text, bo + 1, bc)
                 if pm:
