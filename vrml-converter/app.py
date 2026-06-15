@@ -523,6 +523,9 @@ class _MeshCollector:
             return None
         result = (ifs_coord, faces)
         self._geo_cache[key] = result
+        if len(self._geo_cache) <= 3:
+            logger.info('Geo cache #%d: %d verts %d faces', len(self._geo_cache),
+                        len(ifs_coord), len(faces))
         return result
 
     def add_ifs(self, text, ncs, nce, brace_idx, def_map, transform, color, parent_coord):
@@ -786,6 +789,10 @@ def _parse_vrml(src: Path, color_mode: str, max_faces: int = 500_000, progress_c
 
     _walk(text, collector, brace_idx, def_map, field_use_positions,
           color_mode, prescan=prescan, progress_cb=_walker_cb)
+
+    logger.info('Walk done: total_faces=%d geo_cache=%d groups=%d skipped=%d',
+                collector.total_faces, len(collector._geo_cache),
+                len(collector._groups), collector.skipped)
 
     if progress_cb:
         progress_cb(82, 100, 'Finalizing meshes…')
