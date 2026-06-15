@@ -546,14 +546,13 @@ class _MeshCollector:
             return True
         verts, faces = geo
 
-        # Apply transform
+        # Apply transform — GL convention (translation in last column): h @ M.T
         if not np.allclose(transform, np.eye(4)):
             h = np.hstack([verts, np.ones((len(verts), 1), dtype=np.float64)])
-            verts = (h @ transform)[:, :3]
+            verts = (h @ transform.T)[:, :3]
             if len(self._geo_cache) <= 2:
-                logger.info('IFS transform applied: v[0] %s -> %s',
+                logger.info('IFS transform: v[0] %s -> %s',
                             geo[0][0].tolist(), verts[0].tolist())
-                logger.info('  transform matrix:\n%s', transform)
         else:
             verts = verts.copy()
 
