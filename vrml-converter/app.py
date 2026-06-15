@@ -372,44 +372,67 @@ def _extract_diffuse(text, cs, ce):
     return None
 
 
-# ── Direct-child scanner ───────────────────────────────────────────────────────
-def _direct_children(text, cs, ce, brace_idx, def_map, field_use_positions):
-    pos = cs
-    while pos < ce:
-        nm = _DIRECT_RE.search(text, pos, ce)
-        um = _USE_STANDALONE_RE.search(text, pos, ce)
-        if nm is None and um is None:
-            break
-        use_first = (nm is None) or (um is not None and um.start() < nm.start())
+# ── Pre-scanner: single pass, replaces O(N×depth) regex scanning ───────────────
+def _prescan_nodes(text, brace_idx, def_map, field_use_positions):
+    """
+    One global pass over the text collecting every node and USE position.
+    Returns sorted numpy arrays so _direct_children can binary-search instead
+    of calling regex.search on every loop iteration (O(N×depth) → O(N+log N)).
+    """
+    logger.info('Pre-scanning node positions…')
+    entries = []  # (pos, node_type, content_start, content_end, is_use)
 
-        if use_first:
-            if um.start() in field_use_positions:
-                pos = um.end()
-                continue
-            entry = def_map.get(um.group(1))
-            if entry is None:
-                pos = um.end()
-                continue
-            node_type, dcs, dce = entry
-            yield node_type, um.start(), dcs, dce
-            pos = um.end()
+    for m in _DIRECT_RE.finditer(text):
+        bo = text.find('{', m.start())
+        if bo == -1:
+            continue
+        bc = _brace_close(brace_idx, bo)
+        if bc is None:
+            continue
+        entries.append((m.start(), m.group(1), bo + 1, bc, False))
+
+    for m in _USE_STANDALONE_RE.finditer(text):
+        if m.start() in field_use_positions:
+            continue
+        entry = def_map.get(m.group(1))
+        if entry is None:
+            continue
+        node_type, dcs, dce = entry
+        entries.append((m.start(), node_type, dcs, dce, True))
+
+    entries.sort(key=lambda x: x[0])
+    n = len(entries)
+    positions  = np.array([e[0] for e in entries], dtype=np.int64)
+    cs_arr     = np.array([e[2] for e in entries], dtype=np.int64)
+    ce_arr     = np.array([e[3] for e in entries], dtype=np.int64)
+    is_use_arr = np.array([e[4] for e in entries], dtype=bool)
+    node_types = [e[1] for e in entries]
+    logger.info('Pre-scan complete: %d entries', n)
+    return positions, node_types, cs_arr, ce_arr, is_use_arr
+
+
+# ── Direct-child iterator (O(log N) per scope via binary search) ───────────────
+def _direct_children(prescan, scope_cs, scope_ce):
+    positions, node_types, cs_arr, ce_arr, is_use_arr = prescan
+    idx = int(np.searchsorted(positions, scope_cs))
+    while idx < len(positions):
+        pos = int(positions[idx])
+        if pos >= scope_ce:
+            break
+        ncs    = int(cs_arr[idx])
+        nce    = int(ce_arr[idx])
+        nt     = node_types[idx]
+        is_use = bool(is_use_arr[idx])
+        if is_use:
+            yield nt, pos, ncs, nce
+            idx += 1
         else:
-            node = nm.group(1)
-            brace_open = text.find('{', nm.start())
-            if brace_open == -1 or brace_open >= ce:
-                pos = nm.end()
+            if nce > scope_ce:
+                idx += 1  # spans beyond scope — not a direct child
                 continue
-            brace_close = _brace_close(brace_idx, brace_open)
-            if brace_close is None or brace_close > ce:
-                pos = nm.end()
-                continue
-            # register inline DEF
-            prefix = text[max(cs, nm.start() - 40): nm.start()]
-            dm = re.search(r'\bDEF\s+(\S+)\s*$', prefix)
-            if dm and dm.group(1) not in def_map:
-                def_map[dm.group(1)] = (node, brace_open + 1, brace_close)
-            yield node, nm.start(), brace_open + 1, brace_close
-            pos = brace_close + 1
+            yield nt, pos, ncs, nce
+            # Jump past all grandchildren nested inside this child
+            idx = int(np.searchsorted(positions, nce + 1))
 
 
 # ── Inline coord resolver ──────────────────────────────────────────────────────
@@ -447,7 +470,7 @@ _CONTAINERS_V1 = frozenset({'Separator', 'Group', 'Switch', 'TransformSeparator'
 
 
 def _walk(text, meshes, brace_idx, def_map, field_use_positions,
-          color_mode, progress_cb=None):
+          color_mode, prescan, progress_cb=None):
     import trimesh
 
     stack = [(0, len(text), np.eye(4), None, list(_DEFAULT_COLOR))]
@@ -464,8 +487,7 @@ def _walk(text, meshes, brace_idx, def_map, field_use_positions,
         current_coord  = parent_coord
         current_color  = list(parent_color)
 
-        for node, node_pos, ncs, nce in _direct_children(
-                text, cs, ce, brace_idx, def_map, field_use_positions):
+        for node, node_pos, ncs, nce in _direct_children(prescan, cs, ce):
 
             if node == 'MatrixTransform':
                 vm = _MTX_VALS_RE.search(text, ncs, nce)
@@ -519,8 +541,7 @@ def _walk(text, meshes, brace_idx, def_map, field_use_positions,
                     current_color = col
 
             elif node == 'Appearance':
-                for child_node, _, ccs, cce in _direct_children(
-                        text, ncs, nce, brace_idx, def_map, field_use_positions):
+                for child_node, _, ccs, cce in _direct_children(prescan, ncs, nce):
                     if child_node == 'Material':
                         col = _extract_diffuse(text, ccs, cce)
                         if col:
@@ -533,11 +554,9 @@ def _walk(text, meshes, brace_idx, def_map, field_use_positions,
             elif node == 'Shape':
                 shape_color = list(current_color)
                 shape_coord = current_coord
-                for child_node, _, ccs, cce in _direct_children(
-                        text, ncs, nce, brace_idx, def_map, field_use_positions):
+                for child_node, _, ccs, cce in _direct_children(prescan, ncs, nce):
                     if child_node == 'Appearance':
-                        for sub, _, scs, sce in _direct_children(
-                                text, ccs, cce, brace_idx, def_map, field_use_positions):
+                        for sub, _, scs, sce in _direct_children(prescan, ccs, cce):
                             if sub == 'Material':
                                 col = _extract_diffuse(text, scs, sce)
                                 if col:
@@ -582,8 +601,7 @@ def _walk(text, meshes, brace_idx, def_map, field_use_positions,
                         meshes.append(mesh)
 
             elif node == 'LOD':
-                for child_node, _, ccs, cce in _direct_children(
-                        text, ncs, nce, brace_idx, def_map, field_use_positions):
+                for child_node, _, ccs, cce in _direct_children(prescan, ncs, nce):
                     if child_node in _CONTAINERS_V1 or child_node in ('LOD', 'Transform'):
                         stack.append((ccs, cce, current_matrix, current_coord, list(current_color)))
                         break
@@ -681,24 +699,28 @@ def _parse_vrml(src: Path, color_mode: str, progress_cb=None):
     field_use_positions = _build_field_use_positions(text)
 
     if progress_cb:
-        progress_cb(10, 100, 'Parsing geometry…')
+        progress_cb(10, 100, 'Pre-scanning nodes…')
+    prescan = _prescan_nodes(text, brace_idx, def_map, field_use_positions)
+
+    if progress_cb:
+        progress_cb(15, 100, 'Parsing geometry…')
 
     meshes   = []
     text_len = len(text)
-    last_pct = [10]
+    last_pct = [15]
     max_pos  = [0]
 
     def _walker_cb(pos, total):
         if pos > max_pos[0]:
             max_pos[0] = pos
-        pct = int(10 + 70 * max_pos[0] / max(total, 1))
+        pct = int(15 + 65 * max_pos[0] / max(total, 1))
         if pct > last_pct[0]:
             last_pct[0] = pct
             if progress_cb:
                 progress_cb(pct, 100, f'Parsing… {pct}%')
 
     _walk(text, meshes, brace_idx, def_map, field_use_positions,
-          color_mode, progress_cb=_walker_cb)
+          color_mode, prescan=prescan, progress_cb=_walker_cb)
 
     if not meshes:
         raise ValueError('No geometry found in file.')
