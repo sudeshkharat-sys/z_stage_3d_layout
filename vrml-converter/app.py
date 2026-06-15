@@ -547,11 +547,13 @@ class _MeshCollector:
         verts, faces = geo
 
         # Apply transform
-        # VRML 1.0 (Open Inventor) uses row vectors: v_world = v_local @ M
-        # Translation is in the last ROW of the matrix, so h @ M (no transpose).
         if not np.allclose(transform, np.eye(4)):
             h = np.hstack([verts, np.ones((len(verts), 1), dtype=np.float64)])
             verts = (h @ transform)[:, :3]
+            if len(self._geo_cache) <= 2:
+                logger.info('IFS transform applied: v[0] %s -> %s',
+                            geo[0][0].tolist(), verts[0].tolist())
+                logger.info('  transform matrix:\n%s', transform)
         else:
             verts = verts.copy()
 
@@ -617,7 +619,12 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                 if vm:
                     mat = np.array([float(vm.group(i)) for i in range(1, 17)],
                                    dtype=np.float64).reshape(4, 4)
-                    current_matrix = current_matrix @ mat   # accumulate, not reset
+                    if not hasattr(_walk, '_logged_mtx'):
+                        _walk._logged_mtx = True
+                        logger.info('FIRST MatrixTransform raw 4x4:\n%s', mat)
+                        logger.info('  row3(OI translation?) = %s', mat[3, :3])
+                        logger.info('  col3(GL translation?) = %s', mat[:3, 3])
+                    current_matrix = current_matrix @ mat
                 stack.append((ncs, nce, current_matrix, current_coord, list(current_color)))
 
             elif node == 'Transform':
