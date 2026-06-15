@@ -226,7 +226,7 @@ _FIELD_USE_RE      = re.compile(
 
 _PT_RE          = re.compile(r'\bpoint\s*\[')
 _CI_RE          = re.compile(r'\bcoordIndex\s*\[')
-_DC_RE          = re.compile(rf'\bdiffuseColor\s+({_FLT})\s+({_FLT})\s+({_FLT})')
+_DC_RE          = re.compile(rf'\bdiffuseColor\s+\[?\s*({_FLT})\s+({_FLT})\s+({_FLT})')
 _FLT16          = r'\s+'.join([rf'({_FLT})'] * 16)
 _MTX_VALS_RE    = re.compile(r'\bmatrix\s+' + _FLT16)
 _TR1_RE         = re.compile(rf'\btranslation\s+({_FLT})\s+({_FLT})\s+({_FLT})')
@@ -365,7 +365,9 @@ def _build_faces(indices):
 
 
 def _extract_diffuse(text, cs, ce):
-    hdr = text[cs: min(cs + 400, ce)]
+    # Search up to 800 chars — VRML 1.0 Material may have ambientColor/specularColor
+    # before diffuseColor, and diffuseColor may use bracket form: diffuseColor [ r g b ]
+    hdr = text[cs: min(cs + 800, ce)]
     dc = _DC_RE.search(hdr)
     if dc:
         return [int(float(dc.group(i)) * 255) for i in (1, 2, 3)] + [255]
