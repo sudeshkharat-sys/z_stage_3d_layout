@@ -241,6 +241,9 @@ _FLT16          = _SEP.join([rf'({_FLT})'] * 16)
 _MTX_VALS_RE    = re.compile(r'\bmatrix\s+' + _FLT16)
 _TR1_RE         = re.compile(rf'\btranslation\s+({_FLT}){_SEP}({_FLT}){_SEP}({_FLT})')
 _SC1_RE         = re.compile(rf'\bscaleFactor\s+({_FLT})(?:{_SEP}({_FLT}){_SEP}({_FLT}))?')
+_SCALE2_RE      = re.compile(rf'\bscale\s+({_FLT})(?:{_SEP}({_FLT}){_SEP}({_FLT}))?')
+_CENTER_RE      = re.compile(rf'\bcenter\s+({_FLT}){_SEP}({_FLT}){_SEP}({_FLT})')
+_SCALE_ORI_RE   = re.compile(rf'\bscaleOrientation\s+({_FLT}){_SEP}({_FLT}){_SEP}({_FLT}){_SEP}({_FLT})')
 _RO1_RE         = re.compile(rf'\brotation\s+({_FLT}){_SEP}({_FLT}){_SEP}({_FLT}){_SEP}({_FLT})')
 _COORD_FIELD_RE = re.compile(r'\bcoord\s+(?:DEF\s+\S+\s+)?Coordinate\s*\{')
 _COORD_USE_RE   = re.compile(r'\bcoord\s+USE\s+(\S+)')
@@ -696,20 +699,48 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
 
             elif node == 'Transform':
                 hdr = text[ncs: min(ncs + 600, nce)]
-                M = np.eye(4)
+
+                # VRML2 Transform composition: M = T . C . R . SR . S . SR^-1 . C^-1
+                # "center" sets the local pivot for rotation/scale — a part rotated
+                # around a nonzero center but composed as if center were the origin
+                # lands correctly *oriented* but offset in space (the floating-part
+                # symptom), since the rotation swings the whole offset-from-origin
+                # vector instead of just spinning around its own pivot.
+                T = np.eye(4)
                 tr = _TR1_RE.search(hdr)
                 if tr:
-                    M[0,3]=float(tr.group(1)); M[1,3]=float(tr.group(2)); M[2,3]=float(tr.group(3))
+                    T[0,3]=float(tr.group(1)); T[1,3]=float(tr.group(2)); T[2,3]=float(tr.group(3))
+
+                center = np.zeros(3)
+                cm = _CENTER_RE.search(hdr)
+                if cm:
+                    center = np.array([float(cm.group(i)) for i in (1, 2, 3)])
+
+                R = np.eye(4)
                 ro = _RO1_RE.search(hdr)
                 if ro:
-                    M = M @ _axis_angle_to_mat4(float(ro.group(1)), float(ro.group(2)),
-                                                float(ro.group(3)), float(ro.group(4)))
-                sc = _SC1_RE.search(hdr)
+                    R = _axis_angle_to_mat4(float(ro.group(1)), float(ro.group(2)),
+                                            float(ro.group(3)), float(ro.group(4)))
+
+                SR = np.eye(4)
+                so = _SCALE_ORI_RE.search(hdr)
+                if so:
+                    SR = _axis_angle_to_mat4(float(so.group(1)), float(so.group(2)),
+                                             float(so.group(3)), float(so.group(4)))
+
+                S = np.eye(4)
+                sc = _SCALE2_RE.search(hdr) or _SC1_RE.search(hdr)
                 if sc:
                     sx = float(sc.group(1))
                     sy = float(sc.group(2)) if sc.group(2) else sx
                     sz = float(sc.group(3)) if sc.group(3) else sx
-                    M = M @ np.diag([sx, sy, sz, 1.0])
+                    S = np.diag([sx, sy, sz, 1.0])
+
+                Cmat = np.eye(4); Cmat[:3, 3] = center
+                CmatInv = np.eye(4); CmatInv[:3, 3] = -center
+                SRinv = SR.T   # pure rotation (no translation) — transpose is the inverse
+
+                M = T @ Cmat @ R @ SR @ S @ SRinv @ CmatInv
                 current_matrix = current_matrix @ M         # accumulate, not reset
                 stack.append((ncs, nce, current_matrix, current_coord, list(current_color)))
 
