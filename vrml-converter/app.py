@@ -223,11 +223,20 @@ _USE_STANDALONE_RE = re.compile(r'(?<!\w)USE\s+(\S+)')
 _FIELD_USE_RE      = re.compile(
     r'\b(?:coord|appearance|geometry|material|color|normal|texCoord|children)\s+(USE)\s+(\S+)'
 )
+# Same field-level USE pattern, but capturing the field name itself (group 1) and
+# the referenced DEF name (group 2) — used to actually *resolve* these references.
+# Field-level USE (e.g. "geometry USE Part12") is excluded from the standalone-node
+# index (see field_use_positions) because it isn't a sibling node, it's a field
+# value — so without this resolver, every instance reusing a shared geometry or
+# appearance via USE silently contributes nothing (missing parts / forced gray).
+_FIELD_USE_NAMED_RE = re.compile(
+    r'\b(coord|appearance|geometry|material|color|normal|texCoord)\s+USE\s+(\S+)'
+)
 
 _PT_RE          = re.compile(r'\bpoint\s*\[')
 _CI_RE          = re.compile(r'\bcoordIndex\s*\[')
 _SEP            = r'[\s,]+'   # VRML allows commas as optional separators between values
-_DC_RE          = re.compile(rf'\bdiffuseColor\s+\[?{_SEP}?({_FLT}){_SEP}({_FLT}){_SEP}({_FLT})')
+_DC_RE          = re.compile(rf'\bdiffuseColor\s*\[?[\s,]*({_FLT}){_SEP}({_FLT}){_SEP}({_FLT})')
 _FLT16          = _SEP.join([rf'({_FLT})'] * 16)
 _MTX_VALS_RE    = re.compile(r'\bmatrix\s+' + _FLT16)
 _TR1_RE         = re.compile(rf'\btranslation\s+({_FLT}){_SEP}({_FLT}){_SEP}({_FLT})')
@@ -363,6 +372,28 @@ def _build_faces(indices):
         for j in range(1, len(fan) - 1):
             faces.append((fan[0], fan[j], fan[j + 1]))
     return np.array(faces, dtype=np.int32) if faces else np.empty((0, 3), dtype=np.int32)
+
+
+def _appearance_color(text, prescan, def_map, acs, ace, fallback):
+    """Resolve the color of an Appearance node's scope [acs, ace).
+
+    Handles both an inline `material Material {...}` child and a field-level
+    `material USE MatName` reference (the latter is invisible to the node
+    index, so it must be matched directly against the raw text).
+    """
+    for sub, _, scs, sce in _direct_children(prescan, acs, ace):
+        if sub == 'Material':
+            col = _extract_diffuse(text, scs, sce)
+            return col if col else fallback
+    fm = _FIELD_USE_NAMED_RE.search(text, acs, ace)
+    if fm and fm.group(1) == 'material':
+        entry = def_map.get(fm.group(2))
+        if entry:
+            _, mcs, mce = entry
+            col = _extract_diffuse(text, mcs, mce)
+            if col:
+                return col
+    return fallback
 
 
 def _extract_diffuse(text, cs, ce):
@@ -623,6 +654,9 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
     text_len = len(text)
     _mtx_parsed = [0]   # MatrixTransform nodes successfully parsed
     _mtx_failed = [0]   # MatrixTransform nodes where regex failed (comma issue?)
+    field_use_geo_resolved = [0]   # "geometry USE X" instances resolved to a mesh
+    field_use_geo_missing  = [0]   # "geometry USE X" pointing at an unknown/unparsed DEF
+    field_use_app_resolved = [0]   # "appearance USE X" / "material USE X" colors resolved
 
     while stack:
         cs, ce, parent_matrix, parent_coord, parent_color = stack.pop()
@@ -703,12 +737,7 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                     current_color = col
 
             elif node == 'Appearance':
-                for child_node, _, ccs, cce in _direct_children(prescan, ncs, nce):
-                    if child_node == 'Material':
-                        col = _extract_diffuse(text, ccs, cce)
-                        if col:
-                            current_color = col
-                        break
+                current_color = _appearance_color(text, prescan, def_map, ncs, nce, current_color)
 
             elif node in _CONTAINERS_V1:
                 stack.append((ncs, nce, current_matrix, current_coord, list(current_color)))
@@ -716,27 +745,60 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
             elif node == 'Shape':
                 shape_color = list(current_color)
                 shape_coord = current_coord
-                for child_node, _, ccs, cce in _direct_children(prescan, ncs, nce):
-                    if child_node == 'Appearance':
-                        for sub, _, scs, sce in _direct_children(prescan, ccs, cce):
-                            if sub == 'Material':
-                                col = _extract_diffuse(text, scs, sce)
-                                if col:
-                                    shape_color = col
-                                break
-                    elif child_node == 'Coordinate':
-                        pt_m = _PT_RE.search(text, ccs, cce)
-                        if pt_m:
-                            pp = _bracket_pos(text, pt_m.start(), cce)
-                            if pp:
-                                floats = _parse_floats(text, pp)
-                                if floats is not None and len(floats) >= 9 and len(floats) % 3 == 0:
-                                    shape_coord = floats.reshape(-1, 3)
-                    elif child_node == 'IndexedFaceSet':
-                        total_tried += 1
-                        color = list(_DEFAULT_COLOR) if color_mode == 'gray' else list(shape_color)
-                        collector.add_ifs(text, ccs, cce, brace_idx, def_map,
-                                          current_matrix, color, shape_coord)
+
+                # Walk inline child nodes (Appearance/Coordinate/IndexedFaceSet) and
+                # field-level USE references (appearance/geometry/coord USE Name)
+                # together, in document order, so e.g. "appearance USE X" sets the
+                # color before a later "geometry USE Y" consumes it.
+                events = [(p, 'node', nt, ccs, cce)
+                          for nt, p, ccs, cce in _direct_children(prescan, ncs, nce)]
+                events += [(fm.start(), 'use', fm.group(1), fm.group(2), None)
+                           for fm in _FIELD_USE_NAMED_RE.finditer(text, ncs, nce)]
+                events.sort(key=lambda e: e[0])
+
+                for _, kind, a, b, c in events:
+                    if kind == 'node':
+                        child_node, ccs, cce = a, b, c
+                        if child_node == 'Appearance':
+                            shape_color = _appearance_color(text, prescan, def_map, ccs, cce, shape_color)
+                        elif child_node == 'Coordinate':
+                            pt_m = _PT_RE.search(text, ccs, cce)
+                            if pt_m:
+                                pp = _bracket_pos(text, pt_m.start(), cce)
+                                if pp:
+                                    floats = _parse_floats(text, pp)
+                                    if floats is not None and len(floats) >= 9 and len(floats) % 3 == 0:
+                                        shape_coord = floats.reshape(-1, 3)
+                        elif child_node == 'IndexedFaceSet':
+                            total_tried += 1
+                            color = list(_DEFAULT_COLOR) if color_mode == 'gray' else list(shape_color)
+                            collector.add_ifs(text, ccs, cce, brace_idx, def_map,
+                                              current_matrix, color, shape_coord)
+                    else:
+                        field_name, use_name = a, b
+                        entry = def_map.get(use_name)
+                        if entry is None:
+                            if field_name == 'geometry':
+                                field_use_geo_missing[0] += 1
+                            continue
+                        ent_type, dcs, dce = entry
+                        if field_name == 'appearance' and ent_type == 'Appearance':
+                            shape_color = _appearance_color(text, prescan, def_map, dcs, dce, shape_color)
+                            field_use_app_resolved[0] += 1
+                        elif field_name == 'geometry' and ent_type == 'IndexedFaceSet':
+                            total_tried += 1
+                            field_use_geo_resolved[0] += 1
+                            color = list(_DEFAULT_COLOR) if color_mode == 'gray' else list(shape_color)
+                            collector.add_ifs(text, dcs, dce, brace_idx, def_map,
+                                              current_matrix, color, shape_coord)
+                        elif field_name == 'coord' and ent_type in ('Coordinate', 'Coordinate3'):
+                            pt_m = _PT_RE.search(text, dcs, dce)
+                            if pt_m:
+                                pp = _bracket_pos(text, pt_m.start(), dce)
+                                if pp:
+                                    floats = _parse_floats(text, pp)
+                                    if floats is not None and len(floats) >= 9 and len(floats) % 3 == 0:
+                                        shape_coord = floats.reshape(-1, 3)
 
             elif node == 'LOD':
                 for child_node, _, ccs, cce in _direct_children(prescan, ncs, nce):
@@ -750,8 +812,10 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                 collector.add_ifs(text, ncs, nce, brace_idx, def_map,
                                   current_matrix, color, current_coord)
 
-    logger.info('IFS tried=%d  MatrixTransform: parsed=%d failed=%d',
-                total_tried, _mtx_parsed[0], _mtx_failed[0])
+    logger.info('IFS tried=%d  MatrixTransform: parsed=%d failed=%d  '
+                'field-USE: geometry resolved=%d missing=%d  appearance/material resolved=%d',
+                total_tried, _mtx_parsed[0], _mtx_failed[0],
+                field_use_geo_resolved[0], field_use_geo_missing[0], field_use_app_resolved[0])
 
 
 # ── Post-processing ────────────────────────────────────────────────────────────
