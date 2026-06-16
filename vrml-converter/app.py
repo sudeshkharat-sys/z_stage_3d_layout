@@ -750,8 +750,15 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                 SRinv = SR.T   # pure rotation (no translation) — transpose is the inverse
 
                 M = T @ Cmat @ R @ SR @ S @ SRinv @ CmatInv
-                current_matrix = current_matrix @ M         # accumulate, not reset
-                stack.append((ncs, nce, current_matrix, current_coord, list(current_color)))
+                # NOTE: do not mutate current_matrix here. Unlike VRML1.0's
+                # MatrixTransform (a stateful Open Inventor operator that really
+                # does affect every later sibling in the same Separator), VRML2's
+                # Transform is tree-scoped — it must only affect ITS OWN children,
+                # never sibling nodes processed later in this same loop. Mutating
+                # current_matrix here would leak this Transform's translation/
+                # rotation into unrelated sibling parts placed later in the same
+                # children[] list, displacing them — the "floating part" bug.
+                stack.append((ncs, nce, current_matrix @ M, current_coord, list(current_color)))
 
             elif node == 'Coordinate3':
                 pt_m = _PT_RE.search(text, ncs, nce)
