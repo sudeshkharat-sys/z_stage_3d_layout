@@ -1022,7 +1022,12 @@ def _run_job(jid, tmp_path, out_format, max_faces, color_mode):
             combined = _simplify(combined, max_faces)
             raw = combined.export(file_type=out_format)
 
-        out_bytes = bytes(raw) if not isinstance(raw, bytes) else raw
+        if isinstance(raw, bytes):
+            out_bytes = raw
+        elif isinstance(raw, str):
+            out_bytes = raw.encode('utf-8')
+        else:
+            out_bytes = bytes(raw)
 
         _job_set(jid, pct=100, label='Done!', status='done',
                  result=out_bytes, parts=len(meshes), size=len(out_bytes))
