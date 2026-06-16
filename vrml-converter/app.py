@@ -1020,7 +1020,12 @@ def _run_job(jid, tmp_path, out_format, max_faces, color_mode):
             import trimesh as _trimesh
             combined = _trimesh.util.concatenate(meshes)
             combined = _simplify(combined, max_faces)
-            raw = combined.export(file_type=out_format)
+            # OBJ's per-vertex color extension (extra r g b columns on "v" lines)
+            # is read by MeshLab but not by Blender's importer, which then
+            # silently drops the geometry. GLB already carries color via
+            # proper materials, so disable it here for universal compatibility.
+            export_kwargs = {'include_color': False} if out_format == 'obj' else {}
+            raw = combined.export(file_type=out_format, **export_kwargs)
 
         if isinstance(raw, bytes):
             out_bytes = raw
