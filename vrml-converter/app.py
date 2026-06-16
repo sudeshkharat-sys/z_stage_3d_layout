@@ -698,7 +698,16 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                 stack.append((ncs, nce, current_matrix, current_coord, list(current_color)))
 
             elif node == 'Transform':
-                hdr = text[ncs: min(ncs + 600, nce)]
+                # Restrict the field search to text BEFORE the first nested '{' —
+                # Transform's own translation/rotation/scale/center fields are flat
+                # scalars with no braces of their own. Without this cutoff, a 600-char
+                # slice can spill into a child Shape's Appearance/Texture2Transform,
+                # which has its OWN unrelated "center"/"scale"/"translation"/"rotation"
+                # fields (texture-coordinate transform) — picking those up here sends
+                # the part flying to a wrong location (or off into space / "blank").
+                brace_pos = text.find('{', ncs, nce)
+                hdr_end = brace_pos if brace_pos != -1 else nce
+                hdr = text[ncs:hdr_end]
 
                 # VRML2 Transform composition: M = T . C . R . SR . S . SR^-1 . C^-1
                 # "center" sets the local pivot for rotation/scale — a part rotated
