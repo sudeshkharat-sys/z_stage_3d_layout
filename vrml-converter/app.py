@@ -526,6 +526,8 @@ class _MeshCollector:
         # (ncs, nce) → instance count (for per-DEF cap)
         self._inst_cnt  = {}
         self.skipped    = 0
+        self._n_calls   = 0
+        self._t_start   = time.time()
 
     def _parse_geo(self, text, ncs, nce, brace_idx, def_map, parent_coord):
         key = (ncs, nce)
@@ -590,6 +592,12 @@ class _MeshCollector:
             return (parent_coord, faces)
 
     def add_ifs(self, text, ncs, nce, brace_idx, def_map, transform, color, parent_coord):
+        self._n_calls += 1
+        if self._n_calls % 50_000 == 0:
+            logger.info('Progress heartbeat: %d Shape instances processed, '
+                        '%d faces so far, %d distinct geometries cached, %.1fs elapsed',
+                        self._n_calls, self.total_faces, len(self._geo_cache),
+                        time.time() - self._t_start)
         if self.total_faces >= self.max_faces:
             self.skipped += 1
             return False
