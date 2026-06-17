@@ -495,22 +495,14 @@ class _MeshCollector:
 
     def _parse_geo(self, text, ncs, nce, brace_idx, def_map, parent_coord):
         key = (ncs, nce)
-        cached = self._geo_cache.get(key, 'MISS')
-        if cached != 'MISS':
-            if cached is None:
-                return None
-            cached_coord, cached_faces = cached
-            if cached_coord is not None:
-                # inline coord — stable, reuse directly
-                return cached
-            # no inline coord: faces are cached but coord comes from caller
-            if parent_coord is None:
-                return None
-            valid = np.all((cached_faces >= 0) & (cached_faces < len(parent_coord)), axis=1)
-            faces = cached_faces[valid]
-            return (parent_coord, faces) if len(faces) > 0 else None
-
+        if key in self._geo_cache:
+            return self._geo_cache[key]
         ifs_coord = _inline_coord(text, ncs, nce, brace_idx, def_map)
+        if ifs_coord is None:
+            ifs_coord = parent_coord
+        if ifs_coord is None:
+            self._geo_cache[key] = None
+            return None
         ci_m = _CI_RE.search(text, ncs, nce)
         if ci_m is None:
             self._geo_cache[key] = None
@@ -527,33 +519,17 @@ class _MeshCollector:
         if len(faces) == 0:
             self._geo_cache[key] = None
             return None
-
-        if ifs_coord is not None:
-            # inline coord: cache coord+faces together (stable across calls)
-            valid = np.all((faces >= 0) & (faces < len(ifs_coord)), axis=1)
-            faces = faces[valid]
-            if len(faces) == 0:
-                self._geo_cache[key] = None
-                return None
-            result = (ifs_coord, faces)
-            self._geo_cache[key] = result
-            if len(self._geo_cache) <= 3:
-                logger.info('Geo cache #%d (inline): %d verts %d faces',
-                            len(self._geo_cache), len(ifs_coord), len(faces))
-            return result
-        else:
-            # no inline coord: cache only faces (coord varies per caller)
-            self._geo_cache[key] = (None, faces)
-            if parent_coord is None:
-                return None
-            valid = np.all((faces >= 0) & (faces < len(parent_coord)), axis=1)
-            faces = faces[valid]
-            if len(faces) == 0:
-                return None
-            if len(self._geo_cache) <= 3:
-                logger.info('Geo cache #%d (parent coord): %d verts %d faces',
-                            len(self._geo_cache), len(parent_coord), len(faces))
-            return (parent_coord, faces)
+        valid = np.all((faces >= 0) & (faces < len(ifs_coord)), axis=1)
+        faces = faces[valid]
+        if len(faces) == 0:
+            self._geo_cache[key] = None
+            return None
+        result = (ifs_coord, faces)
+        self._geo_cache[key] = result
+        if len(self._geo_cache) <= 3:
+            logger.info('Geo cache #%d: %d verts %d faces',
+                        len(self._geo_cache), len(ifs_coord), len(faces))
+        return result
 
     def add_ifs(self, text, ncs, nce, brace_idx, def_map, transform, color, parent_coord):
         if self.total_faces >= self.max_faces:
