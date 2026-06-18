@@ -223,19 +223,27 @@ _USE_STANDALONE_RE = re.compile(r'(?<!\w)USE\s+(\S+)')
 _FIELD_USE_RE      = re.compile(
     r'\b(?:coord|appearance|geometry|material|color|normal|texCoord|children)\s+(USE)\s+(\S+)'
 )
+# Same field-level USE pattern, but capturing the field name itself (group 1) and
+# the referenced DEF name (group 2) — used to actually *resolve* these references.
+# Field-level USE (e.g. "geometry USE Part12") is excluded from the standalone-node
+# index (see field_use_positions) because it isn't a sibling node, it's a field
+# value — so without this resolver, every instance reusing a shared geometry or
+# appearance via USE silently contributes nothing (missing parts / forced gray).
+_FIELD_USE_NAMED_RE = re.compile(
+    r'\b(coord|appearance|geometry|material|color|normal|texCoord)\s+USE\s+(\S+)'
+)
 
 _PT_RE          = re.compile(r'\bpoint\s*\[')
 _CI_RE          = re.compile(r'\bcoordIndex\s*\[')
 _SEP            = r'[\s,]+'   # VRML allows commas as optional separators between values
 _DC_RE          = re.compile(rf'\bdiffuseColor\s*\[?[\s,]*({_FLT}){_SEP}({_FLT}){_SEP}({_FLT})')
-# Field-level USE resolver — captures field name (group 1) and DEF name (group 2)
-_FIELD_USE_NAMED_RE = re.compile(
-    r'\b(coord|appearance|geometry|material|color|normal|texCoord)\s+USE\s+(\S+)'
-)
 _FLT16          = _SEP.join([rf'({_FLT})'] * 16)
 _MTX_VALS_RE    = re.compile(r'\bmatrix\s+' + _FLT16)
 _TR1_RE         = re.compile(rf'\btranslation\s+({_FLT}){_SEP}({_FLT}){_SEP}({_FLT})')
 _SC1_RE         = re.compile(rf'\bscaleFactor\s+({_FLT})(?:{_SEP}({_FLT}){_SEP}({_FLT}))?')
+_SCALE2_RE      = re.compile(rf'\bscale\s+({_FLT})(?:{_SEP}({_FLT}){_SEP}({_FLT}))?')
+_CENTER_RE      = re.compile(rf'\bcenter\s+({_FLT}){_SEP}({_FLT}){_SEP}({_FLT})')
+_SCALE_ORI_RE   = re.compile(rf'\bscaleOrientation\s+({_FLT}){_SEP}({_FLT}){_SEP}({_FLT}){_SEP}({_FLT})')
 _RO1_RE         = re.compile(rf'\brotation\s+({_FLT}){_SEP}({_FLT}){_SEP}({_FLT}){_SEP}({_FLT})')
 _COORD_FIELD_RE = re.compile(r'\bcoord\s+(?:DEF\s+\S+\s+)?Coordinate\s*\{')
 _COORD_USE_RE   = re.compile(r'\bcoord\s+USE\s+(\S+)')
@@ -370,7 +378,12 @@ def _build_faces(indices):
 
 
 def _appearance_color(text, prescan, def_map, acs, ace, fallback):
-    """Resolve color from an Appearance scope — handles both inline Material and material USE X."""
+    """Resolve the color of an Appearance node's scope [acs, ace).
+
+    Handles both an inline `material Material {...}` child and a field-level
+    `material USE MatName` reference (the latter is invisible to the node
+    index, so it must be matched directly against the raw text).
+    """
     for sub, _, scs, sce in _direct_children(prescan, acs, ace):
         if sub == 'Material':
             col = _extract_diffuse(text, scs, sce)
@@ -513,17 +526,27 @@ class _MeshCollector:
         # (ncs, nce) → instance count (for per-DEF cap)
         self._inst_cnt  = {}
         self.skipped    = 0
+        self._n_calls   = 0
+        self._t_start   = time.time()
 
     def _parse_geo(self, text, ncs, nce, brace_idx, def_map, parent_coord):
         key = (ncs, nce)
-        if key in self._geo_cache:
-            return self._geo_cache[key]
+        cached = self._geo_cache.get(key, 'MISS')
+        if cached != 'MISS':
+            if cached is None:
+                return None
+            cached_coord, cached_faces = cached
+            if cached_coord is not None:
+                # inline coord — stable, reuse directly
+                return cached
+            # no inline coord: faces are cached but coord comes from caller
+            if parent_coord is None:
+                return None
+            valid = np.all((cached_faces >= 0) & (cached_faces < len(parent_coord)), axis=1)
+            faces = cached_faces[valid]
+            return (parent_coord, faces) if len(faces) > 0 else None
+
         ifs_coord = _inline_coord(text, ncs, nce, brace_idx, def_map)
-        if ifs_coord is None:
-            ifs_coord = parent_coord
-        if ifs_coord is None:
-            self._geo_cache[key] = None
-            return None
         ci_m = _CI_RE.search(text, ncs, nce)
         if ci_m is None:
             self._geo_cache[key] = None
@@ -540,19 +563,41 @@ class _MeshCollector:
         if len(faces) == 0:
             self._geo_cache[key] = None
             return None
-        valid = np.all((faces >= 0) & (faces < len(ifs_coord)), axis=1)
-        faces = faces[valid]
-        if len(faces) == 0:
-            self._geo_cache[key] = None
-            return None
-        result = (ifs_coord, faces)
-        self._geo_cache[key] = result
-        if len(self._geo_cache) <= 3:
-            logger.info('Geo cache #%d: %d verts %d faces',
-                        len(self._geo_cache), len(ifs_coord), len(faces))
-        return result
+
+        if ifs_coord is not None:
+            # inline coord: cache coord+faces together (stable across calls)
+            valid = np.all((faces >= 0) & (faces < len(ifs_coord)), axis=1)
+            faces = faces[valid]
+            if len(faces) == 0:
+                self._geo_cache[key] = None
+                return None
+            result = (ifs_coord, faces)
+            self._geo_cache[key] = result
+            if len(self._geo_cache) <= 3:
+                logger.info('Geo cache #%d (inline): %d verts %d faces',
+                            len(self._geo_cache), len(ifs_coord), len(faces))
+            return result
+        else:
+            # no inline coord: cache only faces (coord varies per caller)
+            self._geo_cache[key] = (None, faces)
+            if parent_coord is None:
+                return None
+            valid = np.all((faces >= 0) & (faces < len(parent_coord)), axis=1)
+            faces = faces[valid]
+            if len(faces) == 0:
+                return None
+            if len(self._geo_cache) <= 3:
+                logger.info('Geo cache #%d (parent coord): %d verts %d faces',
+                            len(self._geo_cache), len(parent_coord), len(faces))
+            return (parent_coord, faces)
 
     def add_ifs(self, text, ncs, nce, brace_idx, def_map, transform, color, parent_coord):
+        self._n_calls += 1
+        if self._n_calls % 50_000 == 0:
+            logger.info('Progress heartbeat: %d Shape instances processed, '
+                        '%d faces so far, %d distinct geometries cached, %.1fs elapsed',
+                        self._n_calls, self.total_faces, len(self._geo_cache),
+                        time.time() - self._t_start)
         if self.total_faces >= self.max_faces:
             self.skipped += 1
             return False
@@ -620,6 +665,9 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
     text_len = len(text)
     _mtx_parsed = [0]   # MatrixTransform nodes successfully parsed
     _mtx_failed = [0]   # MatrixTransform nodes where regex failed (comma issue?)
+    field_use_geo_resolved = [0]   # "geometry USE X" instances resolved to a mesh
+    field_use_geo_missing  = [0]   # "geometry USE X" pointing at an unknown/unparsed DEF
+    field_use_app_resolved = [0]   # "appearance USE X" / "material USE X" colors resolved
 
     while stack:
         cs, ce, parent_matrix, parent_coord, parent_color = stack.pop()
@@ -658,36 +706,67 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                 stack.append((ncs, nce, current_matrix, current_coord, list(current_color)))
 
             elif node == 'Transform':
-                hdr = text[ncs: min(ncs + 600, nce)]
-                M = np.eye(4)
+                # Restrict the field search to text BEFORE the first nested '{' —
+                # Transform's own translation/rotation/scale/center fields are flat
+                # scalars with no braces of their own. Without this cutoff, a 600-char
+                # slice can spill into a child Shape's Appearance/Texture2Transform,
+                # which has its OWN unrelated "center"/"scale"/"translation"/"rotation"
+                # fields (texture-coordinate transform) — picking those up here sends
+                # the part flying to a wrong location (or off into space / "blank").
+                brace_pos = text.find('{', ncs, nce)
+                hdr_end = brace_pos if brace_pos != -1 else nce
+                hdr = text[ncs:hdr_end]
+
+                # VRML2 Transform composition: M = T . C . R . SR . S . SR^-1 . C^-1
+                # "center" sets the local pivot for rotation/scale — a part rotated
+                # around a nonzero center but composed as if center were the origin
+                # lands correctly *oriented* but offset in space (the floating-part
+                # symptom), since the rotation swings the whole offset-from-origin
+                # vector instead of just spinning around its own pivot.
+                T = np.eye(4)
                 tr = _TR1_RE.search(hdr)
                 if tr:
-                    M[0,3]=float(tr.group(1)); M[1,3]=float(tr.group(2)); M[2,3]=float(tr.group(3))
+                    T[0,3]=float(tr.group(1)); T[1,3]=float(tr.group(2)); T[2,3]=float(tr.group(3))
+
+                center = np.zeros(3)
+                cm = _CENTER_RE.search(hdr)
+                if cm:
+                    center = np.array([float(cm.group(i)) for i in (1, 2, 3)])
+
+                R = np.eye(4)
                 ro = _RO1_RE.search(hdr)
                 if ro:
-                    M = M @ _axis_angle_to_mat4(float(ro.group(1)), float(ro.group(2)),
-                                                float(ro.group(3)), float(ro.group(4)))
-                sc = _SC1_RE.search(hdr)
+                    R = _axis_angle_to_mat4(float(ro.group(1)), float(ro.group(2)),
+                                            float(ro.group(3)), float(ro.group(4)))
+
+                SR = np.eye(4)
+                so = _SCALE_ORI_RE.search(hdr)
+                if so:
+                    SR = _axis_angle_to_mat4(float(so.group(1)), float(so.group(2)),
+                                             float(so.group(3)), float(so.group(4)))
+
+                S = np.eye(4)
+                sc = _SCALE2_RE.search(hdr) or _SC1_RE.search(hdr)
                 if sc:
                     sx = float(sc.group(1))
                     sy = float(sc.group(2)) if sc.group(2) else sx
                     sz = float(sc.group(3)) if sc.group(3) else sx
-                    M = M @ np.diag([sx, sy, sz, 1.0])
-                # Distinguish VRML 2.0 grouping Transform (has actual child nodes like
-                # Shape/Transform/Separator in its body) from VRML 1.0 stateful Transform
-                # (body contains only field values, no sub-nodes).
-                # VRML 2.0: tree-scoped — must NOT mutate current_matrix for siblings or
-                # every later sibling part gets the wrong accumulated offset ("floating").
-                # VRML 1.0: stateful operator — MUST accumulate for siblings, same as
-                # MatrixTransform; not accumulating makes geometry collapse to origin.
-                _transform_has_children = any(
-                    True for _ in _direct_children(prescan, ncs, nce)
-                )
-                if _transform_has_children:
-                    stack.append((ncs, nce, current_matrix @ M, current_coord, list(current_color)))
-                else:
-                    current_matrix = current_matrix @ M
-                    stack.append((ncs, nce, current_matrix, current_coord, list(current_color)))
+                    S = np.diag([sx, sy, sz, 1.0])
+
+                Cmat = np.eye(4); Cmat[:3, 3] = center
+                CmatInv = np.eye(4); CmatInv[:3, 3] = -center
+                SRinv = SR.T   # pure rotation (no translation) — transpose is the inverse
+
+                M = T @ Cmat @ R @ SR @ S @ SRinv @ CmatInv
+                # NOTE: do not mutate current_matrix here. Unlike VRML1.0's
+                # MatrixTransform (a stateful Open Inventor operator that really
+                # does affect every later sibling in the same Separator), VRML2's
+                # Transform is tree-scoped — it must only affect ITS OWN children,
+                # never sibling nodes processed later in this same loop. Mutating
+                # current_matrix here would leak this Transform's translation/
+                # rotation into unrelated sibling parts placed later in the same
+                # children[] list, displacing them — the "floating part" bug.
+                stack.append((ncs, nce, current_matrix @ M, current_coord, list(current_color)))
 
             elif node == 'Coordinate3':
                 pt_m = _PT_RE.search(text, ncs, nce)
@@ -722,8 +801,10 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                 shape_color = list(current_color)
                 shape_coord = current_coord
 
-                # Merge inline child nodes and field-level USE refs in document order
-                # so e.g. "appearance USE X" sets color before "geometry USE Y" uses it.
+                # Walk inline child nodes (Appearance/Coordinate/IndexedFaceSet) and
+                # field-level USE references (appearance/geometry/coord USE Name)
+                # together, in document order, so e.g. "appearance USE X" sets the
+                # color before a later "geometry USE Y" consumes it.
                 events = [(p, 'node', nt, ccs, cce)
                           for nt, p, ccs, cce in _direct_children(prescan, ncs, nce)]
                 events += [(fm.start(), 'use', fm.group(1), fm.group(2), None)
@@ -752,12 +833,16 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                         field_name, use_name = a, b
                         entry = def_map.get(use_name)
                         if entry is None:
+                            if field_name == 'geometry':
+                                field_use_geo_missing[0] += 1
                             continue
                         ent_type, dcs, dce = entry
                         if field_name == 'appearance' and ent_type == 'Appearance':
                             shape_color = _appearance_color(text, prescan, def_map, dcs, dce, shape_color)
+                            field_use_app_resolved[0] += 1
                         elif field_name == 'geometry' and ent_type == 'IndexedFaceSet':
                             total_tried += 1
+                            field_use_geo_resolved[0] += 1
                             color = list(_DEFAULT_COLOR) if color_mode == 'gray' else list(shape_color)
                             collector.add_ifs(text, dcs, dce, brace_idx, def_map,
                                               current_matrix, color, shape_coord)
@@ -782,8 +867,10 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                 collector.add_ifs(text, ncs, nce, brace_idx, def_map,
                                   current_matrix, color, current_coord)
 
-    logger.info('IFS tried=%d  MatrixTransform: parsed=%d failed=%d',
-                total_tried, _mtx_parsed[0], _mtx_failed[0])
+    logger.info('IFS tried=%d  MatrixTransform: parsed=%d failed=%d  '
+                'field-USE: geometry resolved=%d missing=%d  appearance/material resolved=%d',
+                total_tried, _mtx_parsed[0], _mtx_failed[0],
+                field_use_geo_resolved[0], field_use_geo_missing[0], field_use_app_resolved[0])
 
 
 # ── Post-processing ────────────────────────────────────────────────────────────
@@ -835,7 +922,6 @@ def _parse_vrml(src: Path, color_mode: str, max_faces: int = 500_000, progress_c
     import trimesh
     logger.info('Reading %s (%.1f MB) …', src.name, src.stat().st_size / 1e6)
     text = src.read_text(encoding='utf-8', errors='replace')
-    logger.info('VRML header: %r', text[:40].strip())
 
     if progress_cb:
         progress_cb(5, 100, 'Building index…')
@@ -934,9 +1020,19 @@ def _run_job(jid, tmp_path, out_format, max_faces, color_mode):
             import trimesh as _trimesh
             combined = _trimesh.util.concatenate(meshes)
             combined = _simplify(combined, max_faces)
-            raw = combined.export(file_type=out_format)
+            # OBJ's per-vertex color extension (extra r g b columns on "v" lines)
+            # is read by MeshLab but not by Blender's importer, which then
+            # silently drops the geometry. GLB already carries color via
+            # proper materials, so disable it here for universal compatibility.
+            export_kwargs = {'include_color': False} if out_format == 'obj' else {}
+            raw = combined.export(file_type=out_format, **export_kwargs)
 
-        out_bytes = bytes(raw) if not isinstance(raw, bytes) else raw
+        if isinstance(raw, bytes):
+            out_bytes = raw
+        elif isinstance(raw, str):
+            out_bytes = raw.encode('utf-8')
+        else:
+            out_bytes = bytes(raw)
 
         _job_set(jid, pct=100, label='Done!', status='done',
                  result=out_bytes, parts=len(meshes), size=len(out_bytes))
@@ -979,7 +1075,7 @@ def start():
         f.save(tmp)
 
     jid = str(uuid.uuid4())
-    orig_stem = f.filename.rsplit('.', 1)[0]  # filename without extension
+    orig_stem = f.filename.rsplit('.', 1)[0]
     with _jobs_lock:
         _jobs[jid] = {'status': 'running', 'pct': 2, 'label': 'Queued…',
                       'result': None, 'format': out_format, 'orig_stem': orig_stem,
