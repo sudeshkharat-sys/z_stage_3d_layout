@@ -614,7 +614,7 @@ _CONTAINERS_V1 = frozenset({'Separator', 'Group', 'Switch', 'TransformSeparator'
 
 
 def _walk(text, collector, brace_idx, def_map, field_use_positions,
-          color_mode, prescan, is_vrml2=False, progress_cb=None):
+          color_mode, prescan, progress_cb=None):
     stack = [(0, len(text), np.eye(4), None, list(_DEFAULT_COLOR))]
     total_tried = 0
     text_len = len(text)
@@ -673,14 +673,19 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                     sy = float(sc.group(2)) if sc.group(2) else sx
                     sz = float(sc.group(3)) if sc.group(3) else sx
                     M = M @ np.diag([sx, sy, sz, 1.0])
-                if is_vrml2:
-                    # VRML 2.0: Transform is tree-scoped — only affects its own children,
-                    # not subsequent siblings. Don't mutate current_matrix here or every
-                    # later sibling in the same children[] list gets the wrong offset.
+                # Distinguish VRML 2.0 grouping Transform (has actual child nodes like
+                # Shape/Transform/Separator in its body) from VRML 1.0 stateful Transform
+                # (body contains only field values, no sub-nodes).
+                # VRML 2.0: tree-scoped — must NOT mutate current_matrix for siblings or
+                # every later sibling part gets the wrong accumulated offset ("floating").
+                # VRML 1.0: stateful operator — MUST accumulate for siblings, same as
+                # MatrixTransform; not accumulating makes geometry collapse to origin.
+                _transform_has_children = any(
+                    True for _ in _direct_children(prescan, ncs, nce)
+                )
+                if _transform_has_children:
                     stack.append((ncs, nce, current_matrix @ M, current_coord, list(current_color)))
                 else:
-                    # VRML 1.0: Transform is a stateful operator like MatrixTransform —
-                    # it accumulates and affects all subsequent siblings in the same Separator.
                     current_matrix = current_matrix @ M
                     stack.append((ncs, nce, current_matrix, current_coord, list(current_color)))
 
@@ -830,8 +835,7 @@ def _parse_vrml(src: Path, color_mode: str, max_faces: int = 500_000, progress_c
     import trimesh
     logger.info('Reading %s (%.1f MB) …', src.name, src.stat().st_size / 1e6)
     text = src.read_text(encoding='utf-8', errors='replace')
-    is_vrml2 = text.lstrip().startswith('#VRML V2.0')
-    logger.info('VRML version: %s', '2.0' if is_vrml2 else '1.0')
+    logger.info('VRML header: %r', text[:40].strip())
 
     if progress_cb:
         progress_cb(5, 100, 'Building index…')
@@ -861,7 +865,7 @@ def _parse_vrml(src: Path, color_mode: str, max_faces: int = 500_000, progress_c
                 progress_cb(pct, 100, f'Parsing… {pct}%')
 
     _walk(text, collector, brace_idx, def_map, field_use_positions,
-          color_mode, prescan=prescan, is_vrml2=is_vrml2, progress_cb=_walker_cb)
+          color_mode, prescan=prescan, progress_cb=_walker_cb)
 
     sample_colors = list(collector._groups.keys())[:5]
     logger.info('Walk done: total_faces=%d geo_cache=%d groups=%d skipped=%d colors=%s',
