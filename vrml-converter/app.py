@@ -979,9 +979,10 @@ def start():
         f.save(tmp)
 
     jid = str(uuid.uuid4())
+    orig_stem = f.filename.rsplit('.', 1)[0]  # filename without extension
     with _jobs_lock:
         _jobs[jid] = {'status': 'running', 'pct': 2, 'label': 'Queued…',
-                      'result': None, 'format': out_format,
+                      'result': None, 'format': out_format, 'orig_stem': orig_stem,
                       'parts': 0, 'size': 0, 'error': ''}
     threading.Thread(target=_run_job,
                      args=(jid, tmp_path, out_format, max_faces, color_mode),
@@ -1021,12 +1022,13 @@ def download(jid):
     fmt  = job.get('format', 'glb')
     mime = {'glb': 'model/gltf-binary', 'obj': 'text/plain',
             'stl': 'application/octet-stream'}.get(fmt, 'application/octet-stream')
+    stem = job.get('orig_stem', 'model')
     data = job['result']
     with _jobs_lock:
         if jid in _jobs:
             _jobs[jid]['result'] = None
     return send_file(io.BytesIO(data), mimetype=mime,
-                     as_attachment=True, download_name=f'model.{fmt}')
+                     as_attachment=True, download_name=f'{stem}.{fmt}')
 
 
 if __name__ == '__main__':
