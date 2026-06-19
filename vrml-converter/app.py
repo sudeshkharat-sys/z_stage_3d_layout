@@ -398,14 +398,25 @@ def _parse_face_indices(text, start, end):
 def _build_faces(indices):
     if len(indices) == 0:
         return np.empty((0, 3), dtype=np.int32)
-    # Fast path: if ALL polygons are triangles (pattern: v0 v1 v2 -1 repeated)
+    # Fast path — pure triangles (v0 v1 v2 -1 …): direct reshape, no loop
     if (len(indices) % 4 == 0
             and np.all(indices[3::4] < 0)
             and np.all(indices[0::4] >= 0)
             and np.all(indices[1::4] >= 0)
             and np.all(indices[2::4] >= 0)):
         return indices.reshape(-1, 4)[:, :3].astype(np.int32)
-    # General fan-triangulation (quads, polygons, mixed)
+    # Fast path — pure quads (v0 v1 v2 v3 -1 …): reshape + split into 2 tris
+    if (len(indices) % 5 == 0
+            and np.all(indices[4::5] < 0)
+            and np.all(indices[0::5] >= 0)
+            and np.all(indices[1::5] >= 0)
+            and np.all(indices[2::5] >= 0)
+            and np.all(indices[3::5] >= 0)):
+        q = indices.reshape(-1, 5)[:, :4]
+        t1 = q[:, [0, 1, 2]]
+        t2 = q[:, [0, 2, 3]]
+        return np.concatenate([t1, t2], axis=0).astype(np.int32)
+    # General fallback — mixed polygon sizes (pentagons etc.)
     faces = []
     fan = []
     for idx in indices:
