@@ -26,7 +26,7 @@ import uuid
 from pathlib import Path
 
 import numpy as np
-from flask import Flask, Response, jsonify, render_template_string, request, send_file
+from flask import Flask, Response, jsonify, make_response, render_template_string, request, send_file
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 logger = logging.getLogger(__name__)
@@ -1204,29 +1204,40 @@ def download(jid):
     mime = {'glb': 'model/gltf-binary', 'obj': 'text/plain',
             'stl': 'application/octet-stream'}.get(fmt, 'application/octet-stream')
 
-    # 1. Disk file recorded in job dict
-    out_path = job.get('out_path') if job else None
-    if out_path and Path(out_path).exists():
-        return send_file(out_path, mimetype=mime,
-                         as_attachment=True, download_name=f'{stem}.{fmt}')
+    # Find the output file — check job dict first, then disk by convention
+    out_path = None
+    p = job.get('out_path') if job else None
+    if p and Path(p).exists():
+        out_path = Path(p)
+    else:
+        for ext in ('glb', 'obj', 'stl'):
+            candidate = Path(tempfile.gettempdir()) / f'{jid}.{ext}'
+            if candidate.exists():
+                out_path = candidate
+                fmt  = ext
+                mime = {'glb':'model/gltf-binary','obj':'text/plain',
+                        'stl':'application/octet-stream'}.get(ext,'application/octet-stream')
+                break
 
-    # 2. Disk file by convention (survives server restarts / instance switches)
-    for ext in ('glb', 'obj', 'stl'):
-        candidate = Path(tempfile.gettempdir()) / f'{jid}.{ext}'
-        if candidate.exists():
-            m = {'glb':'model/gltf-binary','obj':'text/plain',
-                 'stl':'application/octet-stream'}.get(ext,'application/octet-stream')
-            return send_file(str(candidate), mimetype=m,
-                             as_attachment=True, download_name=f'{stem}.{ext}')
+    if out_path:
+        data = out_path.read_bytes()
+        resp = make_response(data)
+        resp.headers['Content-Type'] = mime
+        resp.headers['Content-Disposition'] = f'attachment; filename="{stem}.{fmt}"'
+        resp.headers['Content-Length'] = str(len(data))
+        return resp
 
-    # 3. Legacy in-memory result
+    # Legacy in-memory result
     data = job.get('result') if job else None
     if data:
         with _jobs_lock:
             if jid in _jobs:
                 _jobs[jid]['result'] = None
-        return send_file(io.BytesIO(data), mimetype=mime,
-                         as_attachment=True, download_name=f'{stem}.{fmt}')
+        resp = make_response(data)
+        resp.headers['Content-Type'] = mime
+        resp.headers['Content-Disposition'] = f'attachment; filename="{stem}.{fmt}"'
+        resp.headers['Content-Length'] = str(len(data))
+        return resp
 
     return jsonify(detail='File not found — please convert again.'), 404
 
