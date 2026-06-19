@@ -277,34 +277,28 @@ _DEFAULT_COLOR = (230, 230, 230, 255)
 # ── Index builders ─────────────────────────────────────────────────────────────
 def _build_brace_index(text):
     """
-    Build brace pair index as two sorted numpy arrays.
-    Uses numpy byte scan instead of regex — ~5x faster on large files.
+    Build brace pair index as two sorted numpy arrays instead of a Python dict.
+    For 9M pairs: dict ≈ 550 MB, numpy ≈ 140 MB — 4× less memory.
+    Lookup: brace_close(pos) = binary search in opens array.
+    Uses regex so positions are always correct Python string char positions,
+    even if the file contains non-ASCII characters in comments or strings.
     """
     logger.info('Building brace index …')
-    # Encode to bytes once; numpy finds all { and } positions in C speed
-    raw = text.encode('latin-1', errors='replace')
-    buf = np.frombuffer(raw, dtype=np.uint8)
-    open_pos  = np.where(buf == ord('{'))[0].tolist()
-    close_pos = np.where(buf == ord('}'))[0].tolist()
-    # Match opens to closes with a stack (must stay in-order)
     opens_list, closes_list, stack = [], [], []
-    oi = ci = 0
-    lo, lc = len(open_pos), len(close_pos)
-    while oi < lo or ci < lc:
-        op = open_pos[oi]  if oi < lo else len(raw)
-        cp = close_pos[ci] if ci < lc else len(raw)
-        if op < cp:
-            stack.append(op); oi += 1
-        else:
-            if stack:
-                opens_list.append(stack.pop())
-                closes_list.append(cp)
-            ci += 1
+    for m in _BRACE_RE.finditer(text):
+        if m.group() == '{':
+            stack.append(m.start())
+        elif stack:
+            o = stack.pop()
+            opens_list.append(o)
+            closes_list.append(m.start())
     opens  = np.array(opens_list,  dtype=np.int64)
     closes = np.array(closes_list, dtype=np.int64)
     order  = np.argsort(opens)
+    opens  = opens[order]
+    closes = closes[order]
     logger.info('Brace index: %d pairs', len(opens))
-    return opens[order], closes[order]
+    return opens, closes
 
 
 def _brace_close(brace_idx, pos):
