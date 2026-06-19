@@ -758,15 +758,25 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                 SRinv = SR.T   # pure rotation (no translation) — transpose is the inverse
 
                 M = T @ Cmat @ R @ SR @ S @ SRinv @ CmatInv
-                # NOTE: do not mutate current_matrix here. Unlike VRML1.0's
-                # MatrixTransform (a stateful Open Inventor operator that really
-                # does affect every later sibling in the same Separator), VRML2's
-                # Transform is tree-scoped — it must only affect ITS OWN children,
-                # never sibling nodes processed later in this same loop. Mutating
-                # current_matrix here would leak this Transform's translation/
-                # rotation into unrelated sibling parts placed later in the same
-                # children[] list, displacing them — the "floating part" bug.
-                stack.append((ncs, nce, current_matrix @ M, current_coord, list(current_color)))
+
+                # VRML 2.0 Transform is a grouping node (tree-scoped): it contains
+                # child nodes in its body and must NOT mutate current_matrix for
+                # siblings — doing so would leak its offset into every later sibling
+                # in the same children[] list, displacing them ("floating" bug).
+                #
+                # VRML 1.0 Transform is a stateful operator like MatrixTransform:
+                # it has NO child nodes, only field values. It MUST accumulate
+                # current_matrix for subsequent siblings in the same Separator scope.
+                #
+                # Distinguish by checking whether this Transform's body contains
+                # actual sub-nodes in the prescan. If it does → VRML 2.0 (scoped).
+                # If empty (only field values) → VRML 1.0 (stateful, accumulate).
+                _has_children = any(True for _ in _direct_children(prescan, ncs, nce))
+                if _has_children:
+                    stack.append((ncs, nce, current_matrix @ M, current_coord, list(current_color)))
+                else:
+                    current_matrix = current_matrix @ M
+                    stack.append((ncs, nce, current_matrix, current_coord, list(current_color)))
 
             elif node == 'Coordinate3':
                 pt_m = _PT_RE.search(text, ncs, nce)
