@@ -205,7 +205,7 @@ _BRACE_RE   = re.compile(r'[{}]')
 _BRACKET_RE = re.compile(r'[\[\]]')
 
 _DIRECT_RE = re.compile(
-    r'\b(MatrixTransform|Transform|Separator|Group|Switch'
+    r'\b(MatrixTransform|Transform|Separator|Group|Switch|LOD'
     r'|TransformSeparator|Coordinate3|IndexedFaceSet|IndexedLineSet'
     r'|Material|MaterialBinding|Normal|NormalBinding|ShapeHints'
     r'|Info|Texture2|Texture2Transform|TextureCoordinate2'
@@ -866,10 +866,12 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                                         shape_coord = floats.reshape(-1, 3)
 
             elif node == 'LOD':
-                for child_node, _, ccs, cce in _direct_children(prescan, ncs, nce):
-                    if child_node in _CONTAINERS_V1 or child_node in ('LOD', 'Transform'):
-                        stack.append((ccs, cce, current_matrix, current_coord, list(current_color)))
-                        break
+                # Use only the first (highest-detail) level to avoid geometry duplication.
+                # Without 'LOD' in _DIRECT_RE this handler never fires — LOD was the
+                # main reason bonnet/doors/many parts were invisible in large car files.
+                for _, _, ccs, cce in _direct_children(prescan, ncs, nce):
+                    stack.append((ccs, cce, current_matrix, current_coord, list(current_color)))
+                    break
 
             elif node == 'IndexedFaceSet':
                 total_tried += 1
