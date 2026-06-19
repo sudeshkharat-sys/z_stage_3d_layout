@@ -188,9 +188,32 @@ async function convert(){
     }
   };
   evtSrc.onerror=()=>{
-    if(evtSrc)evtSrc.close();evtSrc=null;
-    rb.className='result err';rb.style.display='block';rb.textContent='✗ Connection lost.';
-    btn.disabled=false;
+    if(evtSrc){evtSrc.close();evtSrc=null;}
+    // SSE dropped (timeout/proxy) but job keeps running — poll until done
+    pl.textContent='Reconnecting…';
+    const poll=setInterval(async()=>{
+      try{
+        const r=await fetch('/progress/'+jid+'/once');
+        if(!r.ok)return;
+        const d=await r.json();
+        pf.style.width=d.pct+'%';pl.textContent=d.label+' ('+d.pct+'%)';
+        if(d.status==='done'){
+          clearInterval(poll);
+          pf.style.width='100%';pl.textContent='Done!';
+          const a=document.createElement('a');
+          a.href='/download/'+jid;
+          a.download=chosenFile.name.replace(/\.[^.]+$/,'')+'.'+document.getElementById('outFmt').value;
+          a.click();
+          rb.className='result ok';rb.style.display='block';
+          rb.innerHTML='✅ Converted!<div class="stats">Output size: '+fmt(d.size)+'<br/>Parts merged: '+d.parts+'<br/>Color mode: '+(colorMode==='actual'?'Actual VRML colors':'Uniform light gray')+'</div>';
+          btn.disabled=false;
+        }else if(d.status==='error'){
+          clearInterval(poll);
+          rb.className='result err';rb.style.display='block';rb.textContent='✗ '+d.error;
+          btn.disabled=false;
+        }
+      }catch(e){}
+    },2000);
   };
 }
 </script>
@@ -1111,6 +1134,7 @@ def start():
 @app.route('/progress/<jid>')
 def progress(jid):
     def generate():
+        tick = 0
         while True:
             job = _job_get(jid)
             if not job:
@@ -1128,8 +1152,24 @@ def progress(jid):
             if job.get('status') in ('done', 'error'):
                 return
             time.sleep(0.4)
+            tick += 1
+            # Send SSE comment every 15s to keep proxy/browser connection alive
+            if tick % 38 == 0:
+                yield ': keep-alive\n\n'
     return Response(generate(), mimetype='text/event-stream',
-                    headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+                    headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no',
+                             'Connection': 'keep-alive'})
+
+
+@app.route('/progress/<jid>/once')
+def progress_once(jid):
+    """Single JSON snapshot of job state — used as SSE fallback for large files."""
+    job = _job_get(jid)
+    if not job:
+        return jsonify(status='error', error='Job not found', pct=0, label='Error')
+    return jsonify(pct=job.get('pct',0), label=job.get('label','…'),
+                   status=job.get('status','running'), parts=job.get('parts',0),
+                   size=job.get('size',0), error=job.get('error',''))
 
 
 @app.route('/download/<jid>')
