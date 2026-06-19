@@ -386,9 +386,13 @@ def _parse_floats(text, pos_tuple):
     chunk = text[pos_tuple[0]:pos_tuple[1]].replace(',', ' ')
     try:
         arr = np.fromstring(chunk, dtype=np.float64, sep=' ')
-        return arr if len(arr) > 0 else None
+        if len(arr) > 0:
+            return arr
     except Exception:
-        return None
+        pass
+    # Fallback: regex handles any unusual formatting
+    nums = _NUM_RE.findall(chunk)
+    return np.array(nums, dtype=np.float64) if nums else None
 
 
 def _parse_face_indices(text, start, end):
@@ -400,12 +404,13 @@ def _parse_face_indices(text, start, end):
 def _build_faces(indices):
     if len(indices) == 0:
         return np.empty((0, 3), dtype=np.int32)
-    # Fast path: if all polygons are triangles (terminator every 4th value)
-    # avoid the Python loop entirely.
-    if len(indices) % 4 == 0 and np.all(indices[3::4] < 0) and np.all(indices[:3:4] >= 0):
-        tri = indices.reshape(-1, 4)[:, :3]
-        if np.all(tri >= 0):
-            return tri.astype(np.int32)
+    # Fast path: if ALL polygons are triangles (pattern: v0 v1 v2 -1 repeated)
+    if (len(indices) % 4 == 0
+            and np.all(indices[3::4] < 0)
+            and np.all(indices[0::4] >= 0)
+            and np.all(indices[1::4] >= 0)
+            and np.all(indices[2::4] >= 0)):
+        return indices.reshape(-1, 4)[:, :3].astype(np.int32)
     # General fan-triangulation (quads, polygons, mixed)
     faces = []
     fan = []
