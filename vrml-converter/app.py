@@ -860,11 +860,13 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                                         shape_coord = floats.reshape(-1, 3)
 
             elif node == 'LOD':
-                # Push ALL LOD children — level entries may be any node type and
-                # the first prescan child is not guaranteed to be the highest-detail
-                # level. Taking only one silently drops all other parts.
+                # Take only the first (most-detailed) LOD level — including all
+                # levels duplicates geometry at wrong positions for lower-detail
+                # variants, making small parts appear floating. The first direct
+                # child is always the highest-detail level in both VRML1 and VRML2.
                 for _, _, ccs, cce in _direct_children(prescan, ncs, nce):
                     stack.append((ccs, cce, current_matrix, current_coord, list(current_color)))
+                    break
 
             elif node == 'IndexedFaceSet':
                 total_tried += 1
