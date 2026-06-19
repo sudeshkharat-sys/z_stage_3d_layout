@@ -666,17 +666,6 @@ class _MeshCollector:
             faces = np.concatenate(g['faces'])
             try:
                 m = trimesh.Trimesh(vertices=verts, faces=faces, process=True)
-                # Remove duplicate faces that arise from multiple LOD levels
-                # being included (same geometry at different detail counts).
-                # Sort each face's vertex indices, then unique across all faces.
-                if len(m.faces) > 0:
-                    sorted_faces = np.sort(m.faces, axis=1)
-                    _, unique_idx = np.unique(sorted_faces, axis=0, return_index=True)
-                    if len(unique_idx) < len(m.faces):
-                        m = trimesh.Trimesh(
-                            vertices=m.vertices,
-                            faces=m.faces[unique_idx],
-                            process=False)
             except Exception:
                 m = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
             m.visual.face_colors = list(color_key)
@@ -894,12 +883,13 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                                         shape_coord = floats.reshape(-1, 3)
 
             elif node == 'LOD':
-                # Process all LOD level children. Taking only the first level
-                # misses parts in this file where geometry lives at later levels.
-                # Lower-detail duplicates cause some minor floating but that is
-                # far better than missing entire parts (bonnet, door, etc.).
+                # Take only the first child (highest-detail level). All LOD
+                # levels represent the same parts — including extras triples
+                # geometry volume and causes phantom floating copies.
+                # No type-filter: the first child may be Shape/Transform/Group.
                 for _, _, ccs, cce in _direct_children(prescan, ncs, nce):
                     stack.append((ccs, cce, current_matrix, current_coord, list(current_color)))
+                    break
 
             elif node == 'IndexedFaceSet':
                 total_tried += 1
