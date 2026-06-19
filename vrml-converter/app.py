@@ -140,6 +140,18 @@ HTML = r"""
 </div>
 <script>
 let chosenFile=null, colorMode='actual', evtSrc=null;
+function showDone(d,jid){
+  const rb=document.getElementById('resultBox');
+  const btn=document.getElementById('convertBtn');
+  const pf=document.getElementById('progressFill');
+  const pl=document.getElementById('progressLabel');
+  pf.style.width='100%';pl.textContent='Done!';
+  const fname=(chosenFile?chosenFile.name.replace(/\.[^.]+$/,''):'model')+'.'+document.getElementById('outFmt').value;
+  rb.className='result ok';rb.style.display='block';
+  rb.innerHTML='✅ Converted!<div class="stats">Output size: '+fmt(d.size)+'<br/>Parts merged: '+d.parts+'<br/>Color mode: '+(colorMode==='actual'?'Actual VRML colors':'Uniform light gray')+'</div>'
+    +'<a href="/download/'+jid+'" download="'+fname+'" style="display:inline-block;margin-top:12px;padding:10px 24px;background:#4caf50;color:#fff;border-radius:6px;text-decoration:none;font-weight:bold;">⬇ Download '+fname+'</a>';
+  btn.disabled=false;
+}
 const dz=document.getElementById('dropZone');
 dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('dragover');});
 dz.addEventListener('dragleave',()=>dz.classList.remove('dragover'));
@@ -173,14 +185,7 @@ async function convert(){
     pl.textContent=d.label+' ('+d.pct+'%)';
     if(d.status==='done'){
       evtSrc.close();evtSrc=null;
-      pf.style.width='100%';pl.textContent='Done!';
-      const a=document.createElement('a');
-      a.href='/download/'+jid;
-      a.download=chosenFile.name.replace(/\.[^.]+$/,'')+'.'+document.getElementById('outFmt').value;
-      a.click();
-      rb.className='result ok';rb.style.display='block';
-      rb.innerHTML='✅ Converted!<div class="stats">Output size: '+fmt(d.size)+'<br/>Parts merged: '+d.parts+'<br/>Color mode: '+(colorMode==='actual'?'Actual VRML colors':'Uniform light gray')+'</div>';
-      btn.disabled=false;
+      showDone(d,jid);
     }else if(d.status==='error'){
       evtSrc.close();evtSrc=null;
       rb.className='result err';rb.style.display='block';rb.textContent='✗ '+d.error;
@@ -189,7 +194,6 @@ async function convert(){
   };
   evtSrc.onerror=()=>{
     if(evtSrc){evtSrc.close();evtSrc=null;}
-    // SSE dropped (timeout/proxy) but job keeps running — poll until done
     pl.textContent='Reconnecting…';
     const poll=setInterval(async()=>{
       try{
@@ -197,17 +201,8 @@ async function convert(){
         if(!r.ok)return;
         const d=await r.json();
         pf.style.width=d.pct+'%';pl.textContent=d.label+' ('+d.pct+'%)';
-        if(d.status==='done'){
-          clearInterval(poll);
-          pf.style.width='100%';pl.textContent='Done!';
-          const a=document.createElement('a');
-          a.href='/download/'+jid;
-          a.download=chosenFile.name.replace(/\.[^.]+$/,'')+'.'+document.getElementById('outFmt').value;
-          a.click();
-          rb.className='result ok';rb.style.display='block';
-          rb.innerHTML='✅ Converted!<div class="stats">Output size: '+fmt(d.size)+'<br/>Parts merged: '+d.parts+'<br/>Color mode: '+(colorMode==='actual'?'Actual VRML colors':'Uniform light gray')+'</div>';
-          btn.disabled=false;
-        }else if(d.status==='error'){
+        if(d.status==='done'){clearInterval(poll);showDone(d,jid);}
+        else if(d.status==='error'){
           clearInterval(poll);
           rb.className='result err';rb.style.display='block';rb.textContent='✗ '+d.error;
           btn.disabled=false;
@@ -1203,19 +1198,28 @@ def progress_once(jid):
 
 @app.route('/download/<jid>')
 def download(jid):
-    job = _job_get(jid)
+    job  = _job_get(jid)
     fmt  = job.get('format', 'glb') if job else 'glb'
+    stem = job.get('orig_stem', 'model') if job else 'model'
     mime = {'glb': 'model/gltf-binary', 'obj': 'text/plain',
             'stl': 'application/octet-stream'}.get(fmt, 'application/octet-stream')
-    stem = job.get('orig_stem', 'model') if job else 'model'
 
-    # Try disk file first (survives restarts, allows re-download)
+    # 1. Disk file recorded in job dict
     out_path = job.get('out_path') if job else None
     if out_path and Path(out_path).exists():
         return send_file(out_path, mimetype=mime,
                          as_attachment=True, download_name=f'{stem}.{fmt}')
 
-    # Fallback: in-memory result (legacy / same-session)
+    # 2. Disk file by convention (survives server restarts / instance switches)
+    for ext in ('glb', 'obj', 'stl'):
+        candidate = Path(tempfile.gettempdir()) / f'{jid}.{ext}'
+        if candidate.exists():
+            m = {'glb':'model/gltf-binary','obj':'text/plain',
+                 'stl':'application/octet-stream'}.get(ext,'application/octet-stream')
+            return send_file(str(candidate), mimetype=m,
+                             as_attachment=True, download_name=f'{stem}.{ext}')
+
+    # 3. Legacy in-memory result
     data = job.get('result') if job else None
     if data:
         with _jobs_lock:
@@ -1224,7 +1228,7 @@ def download(jid):
         return send_file(io.BytesIO(data), mimetype=mime,
                          as_attachment=True, download_name=f'{stem}.{fmt}')
 
-    return jsonify(detail='File not found. Please convert again.'), 404
+    return jsonify(detail='File not found — please convert again.'), 404
 
 
 if __name__ == '__main__':
