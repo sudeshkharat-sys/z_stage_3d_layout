@@ -1104,9 +1104,13 @@ def _run_job(jid, tmp_path, out_format, max_faces, color_mode):
         else:
             out_bytes = bytes(raw)
 
+        # Write to disk so download survives server restarts and works multiple times
+        out_path = tmp_path.parent / f'{jid}.{out_format}'
+        out_path.write_bytes(out_bytes)
+
         _job_set(jid, pct=100, label='Done!', status='done',
-                 result=out_bytes, parts=len(meshes), size=len(out_bytes))
-        logger.info('Job %s done: %.2f MB', jid, len(out_bytes) / 1e6)
+                 out_path=str(out_path), parts=len(meshes), size=len(out_bytes))
+        logger.info('Job %s done: %.2f MB → %s', jid, len(out_bytes) / 1e6, out_path)
 
     except Exception:
         logger.error('Job %s failed:\n%s', jid, traceback.format_exc())
@@ -1200,18 +1204,27 @@ def progress_once(jid):
 @app.route('/download/<jid>')
 def download(jid):
     job = _job_get(jid)
-    if not job or job.get('status') != 'done':
-        return jsonify(detail='Not ready.'), 404
-    fmt  = job.get('format', 'glb')
+    fmt  = job.get('format', 'glb') if job else 'glb'
     mime = {'glb': 'model/gltf-binary', 'obj': 'text/plain',
             'stl': 'application/octet-stream'}.get(fmt, 'application/octet-stream')
-    stem = job.get('orig_stem', 'model')
-    data = job['result']
-    with _jobs_lock:
-        if jid in _jobs:
-            _jobs[jid]['result'] = None
-    return send_file(io.BytesIO(data), mimetype=mime,
-                     as_attachment=True, download_name=f'{stem}.{fmt}')
+    stem = job.get('orig_stem', 'model') if job else 'model'
+
+    # Try disk file first (survives restarts, allows re-download)
+    out_path = job.get('out_path') if job else None
+    if out_path and Path(out_path).exists():
+        return send_file(out_path, mimetype=mime,
+                         as_attachment=True, download_name=f'{stem}.{fmt}')
+
+    # Fallback: in-memory result (legacy / same-session)
+    data = job.get('result') if job else None
+    if data:
+        with _jobs_lock:
+            if jid in _jobs:
+                _jobs[jid]['result'] = None
+        return send_file(io.BytesIO(data), mimetype=mime,
+                         as_attachment=True, download_name=f'{stem}.{fmt}')
+
+    return jsonify(detail='File not found. Please convert again.'), 404
 
 
 if __name__ == '__main__':
