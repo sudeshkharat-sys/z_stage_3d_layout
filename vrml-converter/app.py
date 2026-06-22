@@ -29,7 +29,7 @@ from pathlib import Path
 import numpy as np
 from flask import Flask, Response, jsonify, make_response, render_template_string, request, send_file
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
+logging.basicConfig(level=logging.DEBUG, format="%(levelname)s  %(message)s")
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
@@ -629,20 +629,41 @@ class _MeshCollector:
             faces = cached_faces[valid]
             return (parent_coord, faces) if len(faces) > 0 else None
 
+        _dbg_size = nce - ncs
+        _dbg_t0 = time.time()
+        logger.debug('parse_geo START key=(%d,%d) body_size=%d', ncs, nce, _dbg_size)
+
         ifs_coord = _inline_coord(text, ncs, nce, brace_idx, def_map)
+        _dbg_t1 = time.time()
+        logger.debug('parse_geo inline_coord done: coord=%s  dt=%.3fs',
+                     None if ifs_coord is None else ifs_coord.shape, _dbg_t1 - _dbg_t0)
+
         ci_m = _CI_RE.search(text, ncs, nce)
+        _dbg_t2 = time.time()
+        logger.debug('parse_geo CI_RE.search done: found=%s  dt=%.3fs', ci_m is not None, _dbg_t2 - _dbg_t1)
         if ci_m is None:
             self._geo_cache[key] = None
             return None
+
         ci_pp = _bracket_pos(text, ci_m.start(), nce)
+        _dbg_t3 = time.time()
+        logger.debug('parse_geo bracket_pos done: found=%s  dt=%.3fs', ci_pp is not None, _dbg_t3 - _dbg_t2)
         if ci_pp is None:
             self._geo_cache[key] = None
             return None
+
+        _ci_size = ci_pp[1] - ci_pp[0]
         indices = _parse_face_indices(text, ci_pp[0], ci_pp[1])
+        _dbg_t4 = time.time()
+        logger.debug('parse_geo face_indices done: n_idx=%d ci_size=%d  dt=%.3fs',
+                     len(indices), _ci_size, _dbg_t4 - _dbg_t3)
         if len(indices) == 0:
             self._geo_cache[key] = None
             return None
+
         faces = _build_faces(indices)
+        _dbg_t5 = time.time()
+        logger.debug('parse_geo build_faces done: n_faces=%d  dt=%.3fs', len(faces), _dbg_t5 - _dbg_t4)
         if len(faces) == 0:
             self._geo_cache[key] = None
             return None
