@@ -1044,14 +1044,49 @@ def _parse_vrml(src: Path, color_mode: str, max_faces: int = 500_000, progress_c
     if progress_cb:
         progress_cb(15, 100, 'Parsing geometry…')
 
-    # Build IFS position index for geometry reachability pruning.
-    # Only text positions where 'IndexedFaceSet {' appears are kept.
-    # _walk uses this to skip container nodes whose subtree has no geometry,
-    # turning an O(5M-node) traversal into O(IFS-count × depth).
+    # Build geometry-reachable position index for container pruning.
+    #
+    # Naively checking only inline IndexedFaceSet positions would MISS the common
+    # VRML2 pattern where geometry lives in DEF bodies referenced by USE:
+    #   DEF Part1 Shape { geometry IndexedFaceSet { ... } }   ← IFS here
+    #   Transform { children [ USE Part1  USE Part2 ] }       ← no IFS inline
+    # A simple IFS-position check would incorrectly prune the Transform.
+    #
+    # Fix: iteratively expand the reachable-position set by adding the text
+    # position of every USE statement whose DEF body already contains a reachable
+    # position.  After convergence, any container whose brace body contains at
+    # least one reachable position is known to lead (possibly via USE chains) to
+    # real geometry.  The loop terminates in at most N_defs iterations.
     _p_arr, _nt_list, _cs_arr, _ce_arr, _iu_arr = prescan
+
+    # Level 0 — direct IFS positions
     _ifs_mask = np.array([nt == 'IndexedFaceSet' for nt in _nt_list], dtype=bool)
     ifs_positions = np.sort(_p_arr[_ifs_mask])
-    logger.info('IFS nodes in prescan: %d (will prune containers with no geometry)',
+    logger.info('Direct IFS nodes in prescan: %d', len(ifs_positions))
+
+    # USE entries: (position-of-USE-in-text, DEF-body-start, DEF-body-end)
+    _use_mask = _iu_arr
+    if _use_mask.any() and len(ifs_positions) > 0:
+        _use_pos = _p_arr[_use_mask]
+        _use_dcs = _cs_arr[_use_mask]
+        _use_dce = _ce_arr[_use_mask]
+        geo_pos = ifs_positions
+        for _lvl in range(50):   # 50 levels covers any realistic DEF nesting depth
+            # Vectorised: for each USE, does its DEF body [dcs, dce] contain a geo pos?
+            _idx   = np.searchsorted(geo_pos, _use_dcs)
+            _idx_c = np.minimum(_idx, len(geo_pos) - 1)
+            _hit   = (_idx < len(geo_pos)) & (geo_pos[_idx_c] <= _use_dce)
+            _new   = _use_pos[_hit]
+            if len(_new) == 0:
+                break
+            _combined = np.unique(np.concatenate([geo_pos, _new]))
+            if len(_combined) == len(geo_pos):
+                break
+            geo_pos = _combined
+            logger.info('Geo reachability level %d: %d reachable positions', _lvl + 1, len(geo_pos))
+        ifs_positions = geo_pos
+
+    logger.info('Geometry-reachable positions: %d (container pruning index ready)',
                 len(ifs_positions))
 
     collector = _MeshCollector(max_faces=max_faces)
