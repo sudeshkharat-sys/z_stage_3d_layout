@@ -296,9 +296,9 @@ def _build_brace_index(text):
     — saves ~400 MB RAM and is ~2× faster to build for 10M+ brace pairs.
     """
     logger.info('Building brace index …')
-    opens_arr  = _array.array('l')
-    closes_arr = _array.array('l')
-    stack = _array.array('l')
+    opens_arr  = _array.array('q')   # 'q' = signed long long, always 8 bytes on all platforms
+    closes_arr = _array.array('q')   # 'l' would be 4 bytes on Windows → wrong np.frombuffer
+    stack = []
     for m in _BRACE_RE.finditer(text):
         if m.group() == '{':
             stack.append(m.start())
