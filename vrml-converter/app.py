@@ -401,8 +401,23 @@ def _axis_angle_to_mat4(x, y, z, angle):
 
 
 def _parse_floats(text, pos_tuple):
+    p0, p1 = pos_tuple
+    chunk_size = p1 - p0
+    # Guard: skip degenerate nodes whose coord data exceeds 50 MB.
+    # text[p0:p1] + .replace() creates two copies = 2× chunk_size RAM.
+    # A legitimate IFS coord array over 50 MB (~2 M vertices) is not renderable anyway.
+    if chunk_size > 50_000_000:
+        logger.warning('_parse_floats: skipping %d MB array (too large, likely degenerate)',
+                       chunk_size // 1_000_000)
+        return None
     # np.fromstring is 10-20x faster than findall+np.array for large coord arrays
-    chunk = text[pos_tuple[0]:pos_tuple[1]].replace(',', ' ')
+    chunk = text[p0:p1].replace(',', ' ')
+    try:
+        arr = np.fromstring(chunk, dtype=np.float64, sep=' ')
+        if len(arr) > 0:
+            return arr
+    except Exception:
+        pass
     try:
         arr = np.fromstring(chunk, dtype=np.float64, sep=' ')
         if len(arr) > 0:
@@ -415,6 +430,11 @@ def _parse_floats(text, pos_tuple):
 
 
 def _parse_face_indices(text, start, end):
+    chunk_size = end - start
+    if chunk_size > 100_000_000:  # 100 MB cap — same reasoning as _parse_floats
+        logger.warning('_parse_face_indices: skipping %d MB coordIndex (too large)',
+                       chunk_size // 1_000_000)
+        return np.array([], dtype=np.int32)
     raw = text[start:end].replace(',', ' ')
     arr = np.fromstring(raw, dtype=np.int32, sep=' ')
     return arr if len(arr) > 0 else np.array([], dtype=np.int32)
@@ -631,7 +651,11 @@ class _MeshCollector:
 
         _dbg_size = nce - ncs
         _dbg_t0 = time.time()
-        logger.debug('parse_geo START key=(%d,%d) body_size=%d', ncs, nce, _dbg_size)
+        if _dbg_size > 1_000_000:
+            logger.info('parse_geo START key=(%d,%d) body_size=%.1f MB (#cache=%d)',
+                        ncs, nce, _dbg_size / 1e6, len(self._geo_cache))
+        else:
+            logger.debug('parse_geo START key=(%d,%d) body_size=%d', ncs, nce, _dbg_size)
 
         ifs_coord = _inline_coord(text, ncs, nce, brace_idx, def_map)
         _dbg_t1 = time.time()
