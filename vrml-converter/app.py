@@ -665,7 +665,7 @@ class _MeshCollector:
 
     def add_ifs(self, text, ncs, nce, brace_idx, def_map, transform, color, parent_coord):
         self._n_calls += 1
-        if self._n_calls % 10_000 == 0:
+        if self._n_calls % 1_000 == 0:
             logger.info('Progress: %d IFS processed, %d faces, %d geo cached, %.1fs elapsed',
                         self._n_calls, self.total_faces, len(self._geo_cache),
                         time.time() - self._t_start)
@@ -755,9 +755,22 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
         idx = int(np.searchsorted(_ifs, ncs))
         return idx < len(_ifs) and int(_ifs[idx]) <= nce
 
+    _walk_start = time.time()
+    _last_log   = [_walk_start]
+
     while stack:
         cs, ce, parent_matrix, parent_coord, parent_color = stack.pop()
         _stack_pops[0] += 1
+
+        # Time-based heartbeat — always fires every 30 s so you can tell if
+        # the walker is alive even when IFS count is low.
+        _now = time.time()
+        if _now - _last_log[0] >= 30:
+            _last_log[0] = _now
+            logger.info('Walker alive: %.0fs elapsed | scopes=%d IFS=%d faces=%d stack=%d',
+                        _now - _walk_start, _stack_pops[0],
+                        total_tried, collector.total_faces, len(stack))
+
         if _stack_pops[0] % 100_000 == 0:
             logger.info('Walker: %d scopes processed, %d IFS found, stack depth %d',
                         _stack_pops[0], total_tried, len(stack))
