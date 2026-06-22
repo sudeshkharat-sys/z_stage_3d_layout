@@ -665,9 +665,8 @@ class _MeshCollector:
 
     def add_ifs(self, text, ncs, nce, brace_idx, def_map, transform, color, parent_coord):
         self._n_calls += 1
-        if self._n_calls % 50_000 == 0:
-            logger.info('Progress heartbeat: %d Shape instances processed, '
-                        '%d faces so far, %d distinct geometries cached, %.1fs elapsed',
+        if self._n_calls % 10_000 == 0:
+            logger.info('Progress: %d IFS processed, %d faces, %d geo cached, %.1fs elapsed',
                         self._n_calls, self.total_faces, len(self._geo_cache),
                         time.time() - self._t_start)
         if self.total_faces >= self.max_faces:
@@ -733,18 +732,35 @@ _CONTAINERS_V1 = frozenset({'Separator', 'Group', 'Switch', 'TransformSeparator'
 
 
 def _walk(text, collector, brace_idx, def_map, field_use_positions,
-          color_mode, prescan, progress_cb=None, is_vrml2=False):
+          color_mode, prescan, progress_cb=None, is_vrml2=False, ifs_positions=None):
     stack = [(0, len(text), np.eye(4), None, list(_DEFAULT_COLOR))]
     total_tried = 0
     text_len = len(text)
-    _mtx_parsed = [0]   # MatrixTransform nodes successfully parsed
-    _mtx_failed = [0]   # MatrixTransform nodes where regex failed (comma issue?)
-    field_use_geo_resolved = [0]   # "geometry USE X" instances resolved to a mesh
-    field_use_geo_missing  = [0]   # "geometry USE X" pointing at an unknown/unparsed DEF
-    field_use_app_resolved = [0]   # "appearance USE X" / "material USE X" colors resolved
+    _mtx_parsed = [0]
+    _mtx_failed = [0]
+    field_use_geo_resolved = [0]
+    field_use_geo_missing  = [0]
+    field_use_app_resolved = [0]
+    _stack_pops = [0]
+
+    # Geometry reachability check: returns True if any IndexedFaceSet text position
+    # falls within [ncs, nce]. Skipping containers with no IFS in their subtree
+    # eliminates the O(N) traversal of millions of purely-structural nodes.
+    # Falls back to True (no pruning) if ifs_positions is empty or None.
+    _ifs = ifs_positions if (ifs_positions is not None and len(ifs_positions) > 0) else None
+
+    def _has_geo(ncs, nce):
+        if _ifs is None:
+            return True
+        idx = int(np.searchsorted(_ifs, ncs))
+        return idx < len(_ifs) and int(_ifs[idx]) <= nce
 
     while stack:
         cs, ce, parent_matrix, parent_coord, parent_color = stack.pop()
+        _stack_pops[0] += 1
+        if _stack_pops[0] % 100_000 == 0:
+            logger.info('Walker: %d scopes processed, %d IFS found, stack depth %d',
+                        _stack_pops[0], total_tried, len(stack))
 
         if collector.total_faces >= collector.max_faces:
             collector.skipped += 1
@@ -777,7 +793,8 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                     if _mtx_failed[0] <= 3:
                         logger.warning('MatrixTransform regex FAILED — snippet: %r',
                                        text[ncs:min(ncs+120, nce)])
-                stack.append((ncs, nce, current_matrix, current_coord, list(current_color)))
+                if _has_geo(ncs, nce):
+                    stack.append((ncs, nce, current_matrix, current_coord, list(current_color)))
 
             elif node == 'Transform':
                 # Restrict the field search to text BEFORE the first nested '{' —
@@ -841,10 +858,12 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                 # VRML2 nodes that use only field-level USE references (children [USE X])
                 # have no prescan children and would be misclassified as VRML1.
                 if is_vrml2:
-                    stack.append((ncs, nce, current_matrix @ M, current_coord, list(current_color)))
+                    if _has_geo(ncs, nce):
+                        stack.append((ncs, nce, current_matrix @ M, current_coord, list(current_color)))
                 else:
                     current_matrix = current_matrix @ M
-                    stack.append((ncs, nce, current_matrix, current_coord, list(current_color)))
+                    if _has_geo(ncs, nce):
+                        stack.append((ncs, nce, current_matrix, current_coord, list(current_color)))
 
             elif node == 'Coordinate3':
                 pt_m = _PT_RE.search(text, ncs, nce)
@@ -873,7 +892,8 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                 current_color = _appearance_color(text, prescan, def_map, ncs, nce, current_color)
 
             elif node in _CONTAINERS_V1:
-                stack.append((ncs, nce, current_matrix, current_coord, list(current_color)))
+                if _has_geo(ncs, nce):
+                    stack.append((ncs, nce, current_matrix, current_coord, list(current_color)))
 
             elif node == 'Shape':
                 shape_color = list(current_color)
@@ -939,7 +959,8 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                 # geometry volume and causes phantom floating copies.
                 # No type-filter: the first child may be Shape/Transform/Group.
                 for _, _, ccs, cce in _direct_children(prescan, ncs, nce):
-                    stack.append((ccs, cce, current_matrix, current_coord, list(current_color)))
+                    if _has_geo(ccs, cce):
+                        stack.append((ccs, cce, current_matrix, current_coord, list(current_color)))
                     break
 
             elif node == 'IndexedFaceSet':
@@ -1023,6 +1044,16 @@ def _parse_vrml(src: Path, color_mode: str, max_faces: int = 500_000, progress_c
     if progress_cb:
         progress_cb(15, 100, 'Parsing geometry…')
 
+    # Build IFS position index for geometry reachability pruning.
+    # Only text positions where 'IndexedFaceSet {' appears are kept.
+    # _walk uses this to skip container nodes whose subtree has no geometry,
+    # turning an O(5M-node) traversal into O(IFS-count × depth).
+    _p_arr, _nt_list, _cs_arr, _ce_arr, _iu_arr = prescan
+    _ifs_mask = np.array([nt == 'IndexedFaceSet' for nt in _nt_list], dtype=bool)
+    ifs_positions = np.sort(_p_arr[_ifs_mask])
+    logger.info('IFS nodes in prescan: %d (will prune containers with no geometry)',
+                len(ifs_positions))
+
     collector = _MeshCollector(max_faces=max_faces)
     last_pct  = [15]
     max_pos   = [0]
@@ -1037,7 +1068,8 @@ def _parse_vrml(src: Path, color_mode: str, max_faces: int = 500_000, progress_c
                 progress_cb(pct, 100, f'Parsing… {pct}%')
 
     _walk(text, collector, brace_idx, def_map, field_use_positions,
-          color_mode, prescan=prescan, progress_cb=_walker_cb, is_vrml2=is_vrml2)
+          color_mode, prescan=prescan, progress_cb=_walker_cb,
+          is_vrml2=is_vrml2, ifs_positions=ifs_positions)
 
     sample_colors = list(collector._groups.keys())[:5]
     logger.info('Walk done: total_faces=%d geo_cache=%d groups=%d skipped=%d colors=%s',
