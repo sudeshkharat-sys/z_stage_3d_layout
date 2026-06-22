@@ -364,15 +364,26 @@ def _bracket_pos(text, start, end, bracket_idx=None):
     p = text.find('[', start)
     if p == -1 or p >= end:
         return None
-    # Walk forward to find the matching ] (local scan, not full-file index)
+    # Fast C-level scan: find all '[' and ']' in the slice, walk them in order.
+    # Avoids a Python character-by-character loop over potentially 100MB+ text.
+    chunk = text[p:end]
     depth = 0
-    for i in range(p, end):
-        if text[i] == '[':
+    i_open = 0  # position of next '[' relative to chunk start
+    # Use find() in a tight loop — all C-level, far faster than iterating chars.
+    pos = 0
+    while pos < len(chunk):
+        next_open  = chunk.find('[', pos)
+        next_close = chunk.find(']', pos)
+        if next_close == -1:
+            return None  # unmatched
+        if next_open != -1 and next_open < next_close:
             depth += 1
-        elif text[i] == ']':
+            pos = next_open + 1
+        else:
             depth -= 1
             if depth == 0:
-                return (p + 1, i)
+                return (p + 1, p + next_close)
+            pos = next_close + 1
     return None
 
 
@@ -786,7 +797,17 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
         current_coord  = parent_coord
         current_color  = list(parent_color)
 
+        _inner_n = [0]
         for node, node_pos, ncs, nce in _direct_children(prescan, cs, ce):
+            _inner_n[0] += 1
+            # Inner heartbeat: fires even when one scope has many children
+            # (e.g. top-level file scope with 100K+ direct nodes)
+            _now2 = time.time()
+            if _now2 - _last_log[0] >= 30:
+                _last_log[0] = _now2
+                logger.info('Walker alive (inner): %.0fs | scope=[%d,%d] child#%d node=%s IFS=%d faces=%d stack=%d',
+                            _now2 - _walk_start, cs, ce, _inner_n[0], node,
+                            total_tried, collector.total_faces, len(stack))
 
             if node == 'MatrixTransform':
                 vm = _MTX_VALS_RE.search(text, ncs, nce)
