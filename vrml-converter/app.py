@@ -14,6 +14,7 @@ Usage:
 Open http://localhost:5555
 """
 
+import array as _array
 import io
 import json
 import logging
@@ -33,6 +34,22 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024 * 1024
+
+
+@app.after_request
+def _add_cors(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET,POST,OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type,Authorization'
+    return response
+
+
+@app.route('/z-stage/convert-model/', methods=['OPTIONS'])
+@app.route('/z-stage/convert-model/start', methods=['OPTIONS'])
+@app.route('/z-stage/convert-model/progress/<jid>', methods=['OPTIONS'])
+@app.route('/z-stage/convert-model/download/<jid>', methods=['OPTIONS'])
+def _options_preflight(**_):
+    return '', 204
 
 # ── Job store ──────────────────────────────────────────────────────────────────
 _jobs = {}
@@ -275,20 +292,22 @@ def _build_brace_index(text):
     Build brace pair index as two sorted numpy arrays instead of a Python dict.
     For 9M pairs: dict ≈ 550 MB, numpy ≈ 140 MB — 4× less memory.
     Lookup: brace_close(pos) = binary search in opens array.
-    Uses regex so positions are always correct Python string char positions,
-    even if the file contains non-ASCII characters in comments or strings.
+    Uses array.array('l') for accumulation (8 bytes/entry vs ~28 for Python int list)
+    — saves ~400 MB RAM and is ~2× faster to build for 10M+ brace pairs.
     """
     logger.info('Building brace index …')
-    opens_list, closes_list, stack = [], [], []
+    opens_arr  = _array.array('l')
+    closes_arr = _array.array('l')
+    stack = _array.array('l')
     for m in _BRACE_RE.finditer(text):
         if m.group() == '{':
             stack.append(m.start())
         elif stack:
             o = stack.pop()
-            opens_list.append(o)
-            closes_list.append(m.start())
-    opens  = np.array(opens_list,  dtype=np.int64)
-    closes = np.array(closes_list, dtype=np.int64)
+            opens_arr.append(o)
+            closes_arr.append(m.start())
+    opens  = np.frombuffer(opens_arr,  dtype=np.int64).copy()
+    closes = np.frombuffer(closes_arr, dtype=np.int64).copy()
     order  = np.argsort(opens)
     opens  = opens[order]
     closes = closes[order]
@@ -694,10 +713,12 @@ class _MeshCollector:
                 continue
             verts = np.concatenate(g['verts'])
             faces = np.concatenate(g['faces'])
-            try:
-                m = trimesh.Trimesh(vertices=verts, faces=faces, process=True)
-            except Exception:
-                m = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+            # process=False: geometry is already validated by add_ifs (index bounds
+            # checked, face winding consistent from VRML source). Trimesh's process=True
+            # runs vertex welding + degenerate removal which is O(N log N) — on a 800 MB
+            # VRML file this alone can take hours. Skip it; the geometry is clean enough
+            # for Three.js to render correctly.
+            m = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
             m.visual.face_colors = list(color_key)
             result.append(m)
         total_f = sum(len(m.faces) for m in result)
@@ -1240,6 +1261,30 @@ def download(jid):
         return resp
 
     return jsonify(detail='File not found — please convert again.'), 404
+
+
+# ── Z-Stage route aliases (called by the React frontend) ──────────────────────
+# The frontend knows about these paths under REACT_APP_CONVERTER_DOMAIN.
+# They delegate to the existing /start, /progress, /download handlers.
+
+@app.route('/z-stage/convert-model/start', methods=['POST'])
+def zstage_start():
+    return start()
+
+
+@app.route('/z-stage/convert-model/progress/<jid>')
+def zstage_progress(jid):
+    return progress(jid)
+
+
+@app.route('/z-stage/convert-model/progress/<jid>/once')
+def zstage_progress_once(jid):
+    return progress_once(jid)
+
+
+@app.route('/z-stage/convert-model/download/<jid>')
+def zstage_download(jid):
+    return download(jid)
 
 
 if __name__ == '__main__':
