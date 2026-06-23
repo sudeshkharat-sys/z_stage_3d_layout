@@ -729,23 +729,29 @@ class _MeshCollector:
         verts, faces = geo
 
         # Apply transform — GL convention (translation in last column): h @ M.T
-        if not np.allclose(transform, np.eye(4)):
-            h = np.hstack([verts, np.ones((len(verts), 1), dtype=np.float64)])
-            verts = (h @ transform.T)[:, :3]
-            if len(self._geo_cache) <= 2:
-                logger.info('IFS transform: v[0] %s -> %s',
-                            geo[0][0].tolist(), verts[0].tolist())
-        else:
-            verts = verts.copy()
+        try:
+            if not np.allclose(transform, np.eye(4)):
+                h = np.hstack([verts, np.ones((len(verts), 1), dtype=np.float64)])
+                verts = (h @ transform.T)[:, :3]
+                if len(self._geo_cache) <= 2:
+                    logger.info('IFS transform: v[0] %s -> %s',
+                                geo[0][0].tolist(), verts[0].tolist())
+            else:
+                verts = verts.copy()
 
-        color_key = tuple(color)
-        if color_key not in self._groups:
-            self._groups[color_key] = {'verts': [], 'faces': [], 'offset': 0}
-        g = self._groups[color_key]
-        g['faces'].append(faces + g['offset'])
-        g['verts'].append(verts)
-        g['offset'] += len(verts)
-        self.total_faces += len(faces)
+            color_key = tuple(color)
+            if color_key not in self._groups:
+                self._groups[color_key] = {'verts': [], 'faces': [], 'offset': 0}
+            g = self._groups[color_key]
+            g['faces'].append(faces + g['offset'])
+            g['verts'].append(verts)
+            g['offset'] += len(verts)
+            self.total_faces += len(faces)
+        except MemoryError:
+            # System RAM exhausted — stop collecting new geometry and export what we have.
+            logger.warning('MemoryError accumulating IFS at pos %d (%d faces so far) — '
+                           'stopping collection and exporting partial result', ncs, self.total_faces)
+            self.total_faces = self.max_faces  # trip the face cap so walker skips remaining nodes
         return True
 
     def finalize(self):
