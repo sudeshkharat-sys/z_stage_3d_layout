@@ -1214,6 +1214,66 @@ def _build_glb_scene(meshes):
     return bytes(raw) if not isinstance(raw, bytes) else raw
 
 
+def _convert_via_pymeshlab(src: Path, out_format: str, progress_cb=None) -> bytes:
+    """
+    Use PyMeshLab (MeshLab C++ engine) to load WRL and export to GLB/OBJ/STL.
+    Handles files of any size — no Python memory limits on the parse step.
+    Returns raw bytes of the output file.
+    Raises ImportError if pymeshlab is not installed.
+    Raises RuntimeError on conversion failure.
+    """
+    import pymeshlab  # noqa: F401 — intentional late import; fails fast if not installed
+
+    if progress_cb:
+        progress_cb(5, 100)
+
+    logger.info('PyMeshLab: loading %s (%.1f MB) …', src.name, src.stat().st_size / 1e6)
+    ms = pymeshlab.MeshSet()
+    try:
+        ms.load_new_mesh(str(src))
+    except Exception as exc:
+        raise RuntimeError(f'PyMeshLab failed to load {src.name}: {exc}') from exc
+
+    n_meshes = len(ms)
+    logger.info('PyMeshLab: loaded %d mesh(es)', n_meshes)
+    if n_meshes == 0:
+        raise RuntimeError('PyMeshLab loaded 0 meshes from file.')
+
+    if progress_cb:
+        progress_cb(60, 100)
+
+    # Merge all layers into one before export
+    if n_meshes > 1:
+        try:
+            ms.generate_by_merging_visible_meshes()
+            logger.info('PyMeshLab: merged to 1 mesh')
+        except Exception as exc:
+            logger.warning('PyMeshLab merge failed (%s), exporting top layer only', exc)
+
+    if progress_cb:
+        progress_cb(80, 100)
+
+    import tempfile
+    suffix = f'.{out_format}'
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tf:
+        out_path = Path(tf.name)
+
+    try:
+        ms.save_current_mesh(str(out_path))
+        logger.info('PyMeshLab: exported to %s (%.2f MB)', out_format, out_path.stat().st_size / 1e6)
+        raw = out_path.read_bytes()
+    finally:
+        try:
+            out_path.unlink()
+        except Exception:
+            pass
+
+    if progress_cb:
+        progress_cb(95, 100)
+
+    return raw
+
+
 # ── Background job ─────────────────────────────────────────────────────────────
 def _run_job(jid, tmp_path, out_format, max_faces, color_mode):
     try:
@@ -1225,22 +1285,36 @@ def _run_job(jid, tmp_path, out_format, max_faces, color_mode):
             last_pct[0] = pct
             _job_set(jid, pct=pct, label=label)
 
-        meshes = _parse_vrml(tmp_path, color_mode, max_faces=max_faces, progress_cb=cb)
+        ext = tmp_path.suffix.lower().lstrip('.')
+        is_wrl = ext in ('wrl', 'vrml')
 
-        _job_set(jid, pct=93, label=f'Exporting {out_format.upper()}…')
+        raw = None
+        # For WRL files: try PyMeshLab first (C++ engine, handles 800MB+ without OOM).
+        # Fall back to custom Python parser if PyMeshLab is not installed or fails.
+        if is_wrl:
+            try:
+                _job_set(jid, pct=5, label='Loading with PyMeshLab…')
+                raw = _convert_via_pymeshlab(tmp_path, out_format, progress_cb=cb)
+                logger.info('PyMeshLab conversion succeeded')
+            except ImportError:
+                logger.info('pymeshlab not installed — falling back to built-in parser')
+                raw = None
+            except Exception as pml_exc:
+                logger.warning('PyMeshLab failed (%s) — falling back to built-in parser', pml_exc)
+                raw = None
 
-        if out_format == 'glb':
-            raw = _build_glb_scene(meshes)
-        else:
-            import trimesh as _trimesh
-            combined = _trimesh.util.concatenate(meshes)
-            combined = _simplify(combined, max_faces)
-            # OBJ's per-vertex color extension (extra r g b columns on "v" lines)
-            # is read by MeshLab but not by Blender's importer, which then
-            # silently drops the geometry. GLB already carries color via
-            # proper materials, so disable it here for universal compatibility.
-            export_kwargs = {'include_color': False} if out_format == 'obj' else {}
-            raw = combined.export(file_type=out_format, **export_kwargs)
+        if raw is None:
+            # Built-in Python/trimesh parser (used for non-WRL, or WRL PyMeshLab fallback)
+            meshes = _parse_vrml(tmp_path, color_mode, max_faces=max_faces, progress_cb=cb)
+            _job_set(jid, pct=93, label=f'Exporting {out_format.upper()}…')
+            if out_format == 'glb':
+                raw = _build_glb_scene(meshes)
+            else:
+                import trimesh as _trimesh
+                combined = _trimesh.util.concatenate(meshes)
+                combined = _simplify(combined, max_faces)
+                export_kwargs = {'include_color': False} if out_format == 'obj' else {}
+                raw = combined.export(file_type=out_format, **export_kwargs)
 
         if isinstance(raw, bytes):
             out_bytes = raw
@@ -1253,8 +1327,9 @@ def _run_job(jid, tmp_path, out_format, max_faces, color_mode):
         out_path = tmp_path.parent / f'{jid}.{out_format}'
         out_path.write_bytes(out_bytes)
 
+        n_parts = len(meshes) if 'meshes' in dir() else 1
         _job_set(jid, pct=100, label='Done!', status='done',
-                 out_path=str(out_path), parts=len(meshes), size=len(out_bytes))
+                 out_path=str(out_path), parts=n_parts, size=len(out_bytes))
         logger.info('Job %s done: %.2f MB → %s', jid, len(out_bytes) / 1e6, out_path)
 
     except Exception:
