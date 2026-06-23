@@ -718,7 +718,12 @@ class _MeshCollector:
             return True
         self._inst_cnt[key] = cnt + 1
 
-        geo = self._parse_geo(text, ncs, nce, brace_idx, def_map, parent_coord)
+        try:
+            geo = self._parse_geo(text, ncs, nce, brace_idx, def_map, parent_coord)
+        except MemoryError:
+            logger.warning('IFS at pos %d skipped — MemoryError during parse', ncs)
+            self._geo_cache[(ncs, nce)] = None
+            return True
         if geo is None:
             return True
         verts, faces = geo
@@ -932,18 +937,24 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                 if pt_m:
                     pp = _bracket_pos(text, pt_m.start(), nce)
                     if pp:
-                        floats = _parse_floats(text, pp)
-                        if floats is not None and len(floats) >= 9 and len(floats) % 3 == 0:
-                            current_coord = floats.reshape(-1, 3)
+                        try:
+                            floats = _parse_floats(text, pp)
+                            if floats is not None and len(floats) >= 9 and len(floats) % 3 == 0:
+                                current_coord = floats.reshape(-1, 3)
+                        except MemoryError:
+                            logger.warning('Coordinate3 too large to parse (pos %d), skipping', ncs)
 
             elif node == 'Coordinate':
                 pt_m = _PT_RE.search(text, ncs, nce)
                 if pt_m:
                     pp = _bracket_pos(text, pt_m.start(), nce)
                     if pp:
-                        floats = _parse_floats(text, pp)
-                        if floats is not None and len(floats) >= 9 and len(floats) % 3 == 0:
-                            current_coord = floats.reshape(-1, 3)
+                        try:
+                            floats = _parse_floats(text, pp)
+                            if floats is not None and len(floats) >= 9 and len(floats) % 3 == 0:
+                                current_coord = floats.reshape(-1, 3)
+                        except MemoryError:
+                            logger.warning('Coordinate too large to parse (pos %d), skipping', ncs)
 
             elif node == 'Material':
                 col = _extract_diffuse(text, ncs, nce)
@@ -1289,32 +1300,18 @@ def _run_job(jid, tmp_path, out_format, max_faces, color_mode):
         is_wrl = ext in ('wrl', 'vrml')
 
         raw = None
-        # For WRL files: try PyMeshLab first (C++ engine, handles 800MB+ without OOM).
-        # Fall back to custom Python parser if PyMeshLab is not installed or fails.
-        if is_wrl:
-            try:
-                _job_set(jid, pct=5, label='Loading with PyMeshLab…')
-                raw = _convert_via_pymeshlab(tmp_path, out_format, progress_cb=cb)
-                logger.info('PyMeshLab conversion succeeded')
-            except ImportError:
-                logger.info('pymeshlab not installed — falling back to built-in parser')
-                raw = None
-            except Exception as pml_exc:
-                logger.warning('PyMeshLab failed (%s) — falling back to built-in parser', pml_exc)
-                raw = None
-
-        if raw is None:
-            # Built-in Python/trimesh parser (used for non-WRL, or WRL PyMeshLab fallback)
-            meshes = _parse_vrml(tmp_path, color_mode, max_faces=max_faces, progress_cb=cb)
-            _job_set(jid, pct=93, label=f'Exporting {out_format.upper()}…')
-            if out_format == 'glb':
-                raw = _build_glb_scene(meshes)
-            else:
-                import trimesh as _trimesh
-                combined = _trimesh.util.concatenate(meshes)
-                combined = _simplify(combined, max_faces)
-                export_kwargs = {'include_color': False} if out_format == 'obj' else {}
-                raw = combined.export(file_type=out_format, **export_kwargs)
+        # Use built-in Python/trimesh parser directly.
+        # PyMeshLab was tried but also stalls on 800MB+ WRL files.
+        meshes = _parse_vrml(tmp_path, color_mode, max_faces=max_faces, progress_cb=cb)
+        _job_set(jid, pct=93, label=f'Exporting {out_format.upper()}…')
+        if out_format == 'glb':
+            raw = _build_glb_scene(meshes)
+        else:
+            import trimesh as _trimesh
+            combined = _trimesh.util.concatenate(meshes)
+            combined = _simplify(combined, max_faces)
+            export_kwargs = {'include_color': False} if out_format == 'obj' else {}
+            raw = combined.export(file_type=out_format, **export_kwargs)
 
         if isinstance(raw, bytes):
             out_bytes = raw
@@ -1332,7 +1329,7 @@ def _run_job(jid, tmp_path, out_format, max_faces, color_mode):
                  out_path=str(out_path), parts=n_parts, size=len(out_bytes))
         logger.info('Job %s done: %.2f MB → %s', jid, len(out_bytes) / 1e6, out_path)
 
-    except Exception:
+    except (Exception, MemoryError):
         logger.error('Job %s failed:\n%s', jid, traceback.format_exc())
         _job_set(jid, status='error', error='Conversion failed — check server log.')
     finally:
