@@ -1174,31 +1174,6 @@ def _parse_vrml(src: Path, color_mode: str, max_faces: int = 500_000, progress_c
 
     collector = _MeshCollector(max_faces=max_faces)
 
-    # ── Parallel IFS pre-parse ──────────────────────────────────────────────────
-    # Parse all unique IFS bodies (coord + coordIndex) upfront using a thread pool
-    # so the walk itself only does fast cache lookups instead of parsing each one.
-    # CPython's GIL is released during numpy/regex C operations, so threads run
-    # concurrently on the slow parts (np.fromstring, str.split, re.search).
-    # _geo_cache dict writes are GIL-protected (atomic in CPython) — no explicit
-    # lock needed; worst case two threads parse the same DEF twice (harmless).
-    import os
-    from concurrent.futures import ThreadPoolExecutor
-
-    _ifs_indices = [i for i, nt in enumerate(_nt_list) if nt == 'IndexedFaceSet']
-    n_workers = min(8, max(1, (os.cpu_count() or 4)))
-    logger.info('Pre-parsing %d IFS bodies with %d threads …', len(_ifs_indices), n_workers)
-
-    def _prefetch(i):
-        ncs, nce = int(_cs_arr[i]), int(_ce_arr[i])
-        if (ncs, nce) not in collector._geo_cache:
-            collector._parse_geo(text, ncs, nce, brace_idx, def_map, None)
-
-    with ThreadPoolExecutor(max_workers=n_workers) as _pool:
-        list(_pool.map(_prefetch, _ifs_indices, chunksize=200))
-
-    logger.info('Pre-parse done: %d geo cached', len(collector._geo_cache))
-    # ────────────────────────────────────────────────────────────────────────────
-
     last_pct  = [15]
     max_pos   = [0]
 
