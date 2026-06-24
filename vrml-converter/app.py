@@ -18,6 +18,7 @@ import array as _array
 import io
 import json
 import logging
+import mmap as _mmap_mod
 import re
 import tempfile
 import threading
@@ -231,6 +232,51 @@ async function convert(){
 </script>
 </body></html>
 """
+
+
+# ── Memory-mapped text proxy ───────────────────────────────────────────────────
+class _MMapText:
+    """
+    Read-only file proxy: text[i:j] decodes bytes i..j on demand from mmap.
+    The file is never loaded into the Python heap — the OS manages pages and can
+    evict them under memory pressure, eliminating the 'pinned 821 MB string' OOM.
+
+    Requires the file to be decoded with latin-1 (1 byte = 1 char) so that every
+    character position built during prescan matches the corresponding byte offset.
+    VRML files are ASCII, so latin-1 and UTF-8 give identical results in practice.
+    """
+    __slots__ = ('_mm', '_f', '_len')
+
+    def __init__(self, path):
+        self._f   = open(str(path), 'rb')
+        self._mm  = _mmap_mod.mmap(self._f.fileno(), 0, access=_mmap_mod.ACCESS_READ)
+        self._len = len(self._mm)
+
+    def __len__(self):
+        return self._len
+
+    def __getitem__(self, key):
+        data = self._mm[key]
+        if isinstance(data, int):
+            return chr(data)
+        return data.decode('latin-1')
+
+    def find(self, sub, start=0, end=None):
+        b = sub.encode('latin-1') if isinstance(sub, str) else sub
+        return self._mm.find(b, start, self._len if end is None else end)
+
+    def close(self):
+        try:
+            self._mm.close()
+        except Exception:
+            pass
+        try:
+            self._f.close()
+        except Exception:
+            pass
+
+    def __del__(self):
+        self.close()
 
 
 # ── Compiled patterns ──────────────────────────────────────────────────────────
@@ -485,7 +531,7 @@ def _appearance_color(text, prescan, def_map, acs, ace, fallback):
         if sub == 'Material':
             col = _extract_diffuse(text, scs, sce)
             return col if col else fallback
-    fm = _FIELD_USE_NAMED_RE.search(text, acs, ace)
+    fm = _FIELD_USE_NAMED_RE.search(text[acs:ace])
     if fm and fm.group(1) == 'material':
         entry = def_map.get(fm.group(2))
         if entry:
@@ -571,27 +617,30 @@ def _direct_children(prescan, scope_cs, scope_ce):
 
 # ── Inline coord resolver ──────────────────────────────────────────────────────
 def _inline_coord(text, ncs, nce, brace_idx, def_map):
-    cm = _COORD_FIELD_RE.search(text, ncs, nce)
+    _local = text[ncs:nce]
+    cm = _COORD_FIELD_RE.search(_local)
     if cm:
-        bo = text.find('{', cm.start())
+        bo = text.find('{', ncs + cm.start())
         if bo != -1 and bo < nce:
             bc = _brace_close(brace_idx, bo)
             if bc is not None and bc <= nce:
-                pm = _PT_RE.search(text, bo + 1, bc)
+                _inner = text[bo + 1:bc]
+                pm = _PT_RE.search(_inner)
                 if pm:
-                    pp = _bracket_pos(text, pm.start(), bc)
+                    pp = _bracket_pos(text, bo + 1 + pm.start(), bc)
                     if pp:
                         floats = _parse_floats(text, pp)
                         if floats is not None and len(floats) >= 9 and len(floats) % 3 == 0:
                             return floats.reshape(-1, 3)
-    um = _COORD_USE_RE.search(text, ncs, nce)
+    um = _COORD_USE_RE.search(_local)
     if um:
         entry = def_map.get(um.group(1))
         if entry:
             _, dcs, dce = entry
-            pm = _PT_RE.search(text, dcs, dce)
+            _dlocal = text[dcs:dce]
+            pm = _PT_RE.search(_dlocal)
             if pm:
-                pp = _bracket_pos(text, pm.start(), dce)
+                pp = _bracket_pos(text, dcs + pm.start(), dce)
                 if pp:
                     floats = _parse_floats(text, pp)
                     if floats is not None and len(floats) >= 9 and len(floats) % 3 == 0:
@@ -649,12 +698,13 @@ class _MeshCollector:
                         _dbg_size / 1e6, len(self._geo_cache))
 
         ifs_coord = _inline_coord(text, ncs, nce, brace_idx, def_map)
-        ci_m = _CI_RE.search(text, ncs, nce)
+        _ifs_local = text[ncs:nce]
+        ci_m = _CI_RE.search(_ifs_local)
         if ci_m is None:
             self._geo_cache[key] = None
             return None
 
-        ci_pp = _bracket_pos(text, ci_m.start(), nce)
+        ci_pp = _bracket_pos(text, ncs + ci_m.start(), nce)
         if ci_pp is None:
             self._geo_cache[key] = None
             return None
@@ -876,7 +926,8 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                             total_tried, collector.total_faces, len(stack))
 
             if node == 'MatrixTransform':
-                vm = _MTX_VALS_RE.search(text, ncs, nce)
+                _mtx_local = text[ncs:nce]
+                vm = _MTX_VALS_RE.search(_mtx_local)
                 if vm:
                     mat = np.array([float(vm.group(i)) for i in range(1, 17)],
                                    dtype=np.float64).reshape(4, 4)
@@ -966,9 +1017,10 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                         stack.append((ncs, nce, current_matrix, current_coord, list(current_color)))
 
             elif node == 'Coordinate3':
-                pt_m = _PT_RE.search(text, ncs, nce)
+                _c3_local = text[ncs:nce]
+                pt_m = _PT_RE.search(_c3_local)
                 if pt_m:
-                    pp = _bracket_pos(text, pt_m.start(), nce)
+                    pp = _bracket_pos(text, ncs + pt_m.start(), nce)
                     if pp:
                         try:
                             floats = _parse_floats(text, pp)
@@ -978,9 +1030,10 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                             logger.warning('Coordinate3 too large to parse (pos %d), skipping', ncs)
 
             elif node == 'Coordinate':
-                pt_m = _PT_RE.search(text, ncs, nce)
+                _coord_local = text[ncs:nce]
+                pt_m = _PT_RE.search(_coord_local)
                 if pt_m:
-                    pp = _bracket_pos(text, pt_m.start(), nce)
+                    pp = _bracket_pos(text, ncs + pt_m.start(), nce)
                     if pp:
                         try:
                             floats = _parse_floats(text, pp)
@@ -1011,8 +1064,9 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                 # color before a later "geometry USE Y" consumes it.
                 events = [(p, 'node', nt, ccs, cce)
                           for nt, p, ccs, cce in _direct_children(prescan, ncs, nce)]
-                events += [(fm.start(), 'use', fm.group(1), fm.group(2), None)
-                           for fm in _FIELD_USE_NAMED_RE.finditer(text, ncs, nce)]
+                _shape_local = text[ncs:nce]
+                events += [(ncs + fm.start(), 'use', fm.group(1), fm.group(2), None)
+                           for fm in _FIELD_USE_NAMED_RE.finditer(_shape_local)]
                 events.sort(key=lambda e: e[0])
 
                 for _, kind, a, b, c in events:
@@ -1021,9 +1075,10 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                         if child_node == 'Appearance':
                             shape_color = _appearance_color(text, prescan, def_map, ccs, cce, shape_color)
                         elif child_node == 'Coordinate':
-                            pt_m = _PT_RE.search(text, ccs, cce)
+                            _sc_local = text[ccs:cce]
+                            pt_m = _PT_RE.search(_sc_local)
                             if pt_m:
-                                pp = _bracket_pos(text, pt_m.start(), cce)
+                                pp = _bracket_pos(text, ccs + pt_m.start(), cce)
                                 if pp:
                                     floats = _parse_floats(text, pp)
                                     if floats is not None and len(floats) >= 9 and len(floats) % 3 == 0:
@@ -1051,9 +1106,10 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                             collector.add_ifs(text, dcs, dce, brace_idx, def_map,
                                               current_matrix, color, shape_coord)
                         elif field_name == 'coord' and ent_type in ('Coordinate', 'Coordinate3'):
-                            pt_m = _PT_RE.search(text, dcs, dce)
+                            _cu_local = text[dcs:dce]
+                            pt_m = _PT_RE.search(_cu_local)
                             if pt_m:
-                                pp = _bracket_pos(text, pt_m.start(), dce)
+                                pp = _bracket_pos(text, dcs + pt_m.start(), dce)
                                 if pp:
                                     floats = _parse_floats(text, pp)
                                     if floats is not None and len(floats) >= 9 and len(floats) % 3 == 0:
@@ -1080,12 +1136,13 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                 total_tried, _mtx_parsed[0], _mtx_failed[0],
                 field_use_geo_resolved[0], field_use_geo_missing[0], field_use_app_resolved[0])
 
-    # Free the 821 MB source string before finalize/export so numpy concatenation
-    # has room to build the output arrays without competing for RAM.
+    # Close mmap (or free string) before finalize so numpy concatenation has RAM headroom.
     import gc
+    if hasattr(text, 'close'):
+        text.close()
     del text, brace_idx, prescan, def_map
     gc.collect()
-    logger.info('Source text freed — running finalize …')
+    logger.info('Source text / mmap closed — running finalize …')
 
 
 # ── Post-processing ────────────────────────────────────────────────────────────
@@ -1136,7 +1193,9 @@ def _simplify(mesh, max_faces):
 def _parse_vrml(src: Path, color_mode: str, max_faces: int = 500_000, progress_cb=None):
     import trimesh
     logger.info('Reading %s (%.1f MB) …', src.name, src.stat().st_size / 1e6)
-    text = src.read_text(encoding='utf-8', errors='replace')
+    # latin-1: 1 byte = 1 char always — guarantees character positions from prescan
+    # match mmap byte offsets exactly. VRML is ASCII so latin-1 ≡ UTF-8 for all tokens.
+    text = src.read_text(encoding='latin-1')
 
     # Detect VRML version from header — used to choose Transform scoping behavior.
     # VRML 2.0 Transform is a grouping node (tree-scoped); VRML 1.0 is stateful.
@@ -1201,6 +1260,19 @@ def _parse_vrml(src: Path, color_mode: str, max_faces: int = 500_000, progress_c
 
     logger.info('Geometry-reachable positions: %d (container pruning index ready)',
                 len(ifs_positions))
+
+    # ── Switch from heap string to memory-mapped file ──────────────────────────
+    # The 821 MB Python string is no longer needed — all positions are indexed.
+    # Replacing it with _MMapText lets the OS evict file pages under memory
+    # pressure, eliminating the 'pinned 821 MB' root cause of all OOM crashes.
+    # _parse_floats / _parse_face_indices receive text[p0:p1] which returns a
+    # transient decoded str that is GC'd immediately after parsing.
+    import gc
+    del text
+    gc.collect()
+    _mmap_handle = _MMapText(src)
+    text = _mmap_handle
+    logger.info('Switched to mmap — heap string freed, OS can now evict file pages')
 
     collector = _MeshCollector(max_faces=max_faces)
 
