@@ -139,7 +139,7 @@ HTML = r"""
     </div>
     <div class="field">
       <label>3. Max faces <span style="color:#64748b;font-size:.78rem">(use 5M+ for large files)</span></label>
-      <input type="number" id="maxFaces" value="1000000" min="5000" max="5000000" step="100000"/>
+      <input type="number" id="maxFaces" value="5000000" min="5000" max="20000000" step="500000"/>
     </div>
   </div>
   <div style="margin-bottom:1.5rem">
@@ -1566,7 +1566,7 @@ def start():
     out_format = request.form.get('out_format', 'glb').lower()
     if out_format not in ('glb', 'obj', 'stl'):
         out_format = 'glb'
-    max_faces  = max(5000, min(int(request.form.get('max_faces', 1_000_000)), 5_000_000))
+    max_faces  = max(5000, min(int(request.form.get('max_faces', 5_000_000)), 20_000_000))
     color_mode = request.form.get('color_mode', 'actual')
     if color_mode not in ('actual', 'gray'):
         color_mode = 'actual'
