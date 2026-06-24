@@ -747,11 +747,14 @@ class _MeshCollector:
             g['verts'].append(verts)
             g['offset'] += len(verts)
             self.total_faces += len(faces)
-        except MemoryError:
-            # System RAM exhausted — stop collecting new geometry and export what we have.
-            logger.warning('MemoryError accumulating IFS at pos %d (%d faces so far) — '
-                           'stopping collection and exporting partial result', ncs, self.total_faces)
-            self.total_faces = self.max_faces  # trip the face cap so walker skips remaining nodes
+        except (MemoryError, Exception) as _oom:
+            # Catches both Python MemoryError and numpy._ArrayMemoryError (NumPy 2.x subclass).
+            if 'memory' in type(_oom).__name__.lower() or 'alloc' in str(_oom).lower() or isinstance(_oom, MemoryError):
+                logger.warning('OOM accumulating IFS at pos %d (%d faces so far) — '
+                               'stopping collection and exporting partial result', ncs, self.total_faces)
+                self.total_faces = self.max_faces  # trip face cap → walker skips remaining
+            else:
+                raise  # re-raise non-memory errors
         return True
 
     def finalize(self):
@@ -1052,6 +1055,13 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                 'field-USE: geometry resolved=%d missing=%d  appearance/material resolved=%d',
                 total_tried, _mtx_parsed[0], _mtx_failed[0],
                 field_use_geo_resolved[0], field_use_geo_missing[0], field_use_app_resolved[0])
+
+    # Free the 821 MB source string before finalize/export so numpy concatenation
+    # has room to build the output arrays without competing for RAM.
+    import gc
+    del text, brace_idx, prescan, def_map
+    gc.collect()
+    logger.info('Source text freed — running finalize …')
 
 
 # ── Post-processing ────────────────────────────────────────────────────────────
