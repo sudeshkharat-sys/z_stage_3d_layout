@@ -757,14 +757,44 @@ class _MeshCollector:
         for color_key, g in self._groups.items():
             if not g['verts']:
                 continue
-            verts = np.concatenate(g['verts'])
-            faces = np.concatenate(g['faces'])
+            try:
+                verts = np.concatenate(g['verts'])
+                g['verts'] = None  # free the list of small arrays immediately
+                faces = np.concatenate(g['faces'])
+                g['faces'] = None
+            except (MemoryError, Exception) as _e:
+                if 'memory' in type(_e).__name__.lower() or isinstance(_e, MemoryError):
+                    logger.warning('finalize OOM concatenating color group — trying chunk merge')
+                    # Chunk-merge: concatenate in batches of 10K arrays, free as we go
+                    verts_chunks, faces_chunks = [], []
+                    batch_v, batch_f = [], []
+                    offset = 0
+                    for v_arr, f_arr in zip(g['verts'] or [], g['faces'] or []):
+                        batch_v.append(v_arr)
+                        batch_f.append(f_arr)
+                        if len(batch_v) >= 5000:
+                            verts_chunks.append(np.concatenate(batch_v))
+                            faces_chunks.append(np.concatenate(batch_f))
+                            batch_v, batch_f = [], []
+                    if batch_v:
+                        verts_chunks.append(np.concatenate(batch_v))
+                        faces_chunks.append(np.concatenate(batch_f))
+                    g['verts'] = g['faces'] = None
+                    if not verts_chunks:
+                        continue
+                    verts = np.concatenate(verts_chunks)
+                    faces = np.concatenate(faces_chunks)
+                else:
+                    raise
             # process=False: geometry is already validated by add_ifs (index bounds
             # checked, face winding consistent from VRML source). Trimesh's process=True
             # runs vertex welding + degenerate removal which is O(N log N) — on a 800 MB
             # VRML file this alone can take hours. Skip it; the geometry is clean enough
             # for Three.js to render correctly.
+            del g  # free the dict entry before building trimesh
+            import gc; gc.collect()
             m = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+            del verts, faces
             m.visual.face_colors = list(color_key)
             result.append(m)
         total_f = sum(len(m.faces) for m in result)
