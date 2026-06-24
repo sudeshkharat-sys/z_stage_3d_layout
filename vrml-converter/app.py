@@ -1362,21 +1362,17 @@ def _parse_vrml(src: Path, color_mode: str, max_faces: int = 500_000, progress_c
 
     collector = _MeshCollector(max_faces=max_faces)
 
-    if progress_cb:
-        progress_cb(18, 100, 'Pre-parsing geometry (parallel)…')
-    _prefill_geo_cache(collector, text, brace_idx, def_map, prescan, n_workers=4)
-
-    last_pct  = [20]
+    last_pct  = [15]
     max_pos   = [0]
 
     def _walker_cb(pos, total):
         if pos > max_pos[0]:
             max_pos[0] = pos
-        pct = int(20 + 60 * max_pos[0] / max(total, 1))
+        pct = int(15 + 65 * max_pos[0] / max(total, 1))
         if pct > last_pct[0]:
             last_pct[0] = pct
             if progress_cb:
-                progress_cb(pct, 100, f'Walking… {pct}%')
+                progress_cb(pct, 100, f'Parsing… {pct}%')
 
     _walk(text, collector, brace_idx, def_map, field_use_positions,
           color_mode, prescan=prescan, progress_cb=_walker_cb,
