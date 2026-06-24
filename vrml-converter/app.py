@@ -803,39 +803,67 @@ class _MeshCollector:
 
     def finalize(self):
         import trimesh
+        import gc
         result = []
         for color_key, g in self._groups.items():
-            if not g['verts']:
+            v_list = g['verts']
+            f_list = g['faces']
+            if not v_list:
                 continue
+
+            # Pre-allocate output arrays and copy each sub-array in, freeing as
+            # we go.  This keeps peak memory at 1× the final size rather than 2×
+            # (np.concatenate holds all source arrays + the output simultaneously).
             try:
-                verts = np.concatenate(g['verts'])
-                g['verts'] = None  # free the list of small arrays immediately
-                faces = np.concatenate(g['faces'])
-                g['faces'] = None
+                total_v = sum(len(v) for v in v_list)
+                total_f = sum(len(f) for f in f_list)
+                verts = np.empty((total_v, 3), dtype=v_list[0].dtype)
+                faces = np.empty((total_f, 3), dtype=f_list[0].dtype)
+                v_off = 0
+                f_off = 0
+                for i in range(len(v_list)):
+                    va = v_list[i]; v_n = len(va)
+                    verts[v_off:v_off + v_n] = va
+                    v_off += v_n
+                    v_list[i] = None  # release source array immediately
+
+                    fa = f_list[i]; f_n = len(fa)
+                    faces[f_off:f_off + f_n] = fa
+                    f_off += f_n
+                    f_list[i] = None
             except (MemoryError, Exception) as _e:
-                if 'memory' in type(_e).__name__.lower() or isinstance(_e, MemoryError):
-                    logger.warning('finalize OOM concatenating color group — trying chunk merge')
-                    # Chunk-merge: concatenate in batches of 10K arrays, free as we go
-                    verts_chunks, faces_chunks = [], []
-                    batch_v, batch_f = [], []
-                    offset = 0
-                    for v_arr, f_arr in zip(g['verts'] or [], g['faces'] or []):
-                        batch_v.append(v_arr)
-                        batch_f.append(f_arr)
-                        if len(batch_v) >= 5000:
-                            verts_chunks.append(np.concatenate(batch_v))
-                            faces_chunks.append(np.concatenate(batch_f))
-                            batch_v, batch_f = [], []
-                    if batch_v:
-                        verts_chunks.append(np.concatenate(batch_v))
-                        faces_chunks.append(np.concatenate(batch_f))
-                    g['verts'] = g['faces'] = None
-                    if not verts_chunks:
-                        continue
-                    verts = np.concatenate(verts_chunks)
-                    faces = np.concatenate(faces_chunks)
-                else:
+                is_oom = ('memory' in type(_e).__name__.lower()
+                          or 'alloc' in str(_e).lower()
+                          or isinstance(_e, MemoryError))
+                if not is_oom:
                     raise
+                logger.warning('finalize OOM for color group (%d faces so far) — '
+                               'trying chunked fallback', self.total_faces)
+                # Chunked fallback: collect what sub-arrays are still non-None,
+                # concatenate in batches of 1000, then concatenate the chunks.
+                surviving_v = [a for a in (v_list or []) if a is not None]
+                surviving_f = [a for a in (f_list or []) if a is not None]
+                if not surviving_v:
+                    g['verts'] = g['faces'] = None
+                    gc.collect()
+                    continue
+                chunk_v, chunk_f = [], []
+                batch_v, batch_f = [], []
+                for va, fa in zip(surviving_v, surviving_f):
+                    batch_v.append(va); batch_f.append(fa)
+                    if len(batch_v) >= 1000:
+                        chunk_v.append(np.concatenate(batch_v))
+                        chunk_f.append(np.concatenate(batch_f))
+                        batch_v, batch_f = [], []
+                if batch_v:
+                    chunk_v.append(np.concatenate(batch_v))
+                    chunk_f.append(np.concatenate(batch_f))
+                del surviving_v, surviving_f, batch_v, batch_f
+                verts = np.concatenate(chunk_v); del chunk_v
+                faces = np.concatenate(chunk_f); del chunk_f
+            finally:
+                g['verts'] = None
+                g['faces'] = None
             # process=False: geometry is already validated by add_ifs (index bounds
             # checked, face winding consistent from VRML source). Trimesh's process=True
             # runs vertex welding + degenerate removal which is O(N log N) — on a 800 MB
@@ -1296,6 +1324,17 @@ def _parse_vrml(src: Path, color_mode: str, max_faces: int = 500_000, progress_c
     logger.info('Walk done: total_faces=%d geo_cache=%d groups=%d skipped=%d colors=%s',
                 collector.total_faces, len(collector._geo_cache),
                 len(collector._groups), collector.skipped, sample_colors)
+
+    # Free the 800MB+ text buffer and the geometry cache before finalize so that
+    # peak memory during concatenation is the final geometry size only, not 2-3×.
+    import gc
+    text_mb = len(text) / 1e6
+    cache_entries = len(collector._geo_cache)
+    del text, brace_idx, def_map, field_use_positions, prescan, ifs_positions
+    collector._geo_cache.clear()
+    collector._inst_cnt.clear()
+    gc.collect()
+    logger.info('Pre-finalize: freed %.1f MB text + %d cache entries', text_mb, cache_entries)
 
     if progress_cb:
         progress_cb(82, 100, 'Finalizing meshes…')
