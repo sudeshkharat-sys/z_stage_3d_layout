@@ -10,12 +10,12 @@ import re
 import sys
 from pathlib import Path
 
-_FLOAT_RE = re.compile(r'-?\d+\.\d{5,}(?:[eE][+-]?\d+)?')
+_FLOAT_RE = re.compile(r'-?\d+\.\d{4,}(?:[eE][+-]?\d+)?')
 
 def _round_float(m):
     try:
         val = float(m.group(0))
-        s = f'{val:.4f}'.rstrip('0').rstrip('.')
+        s = f'{val:.3f}'.rstrip('0').rstrip('.')
         return s if s else '0'
     except Exception:
         return m.group(0)
