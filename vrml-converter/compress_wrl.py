@@ -76,8 +76,34 @@ def compress_wrl(src_path, dst_path=None):
     else:
         print(f"Still {new_size/1e6:.0f} MB. May need further reduction.")
 
+def gzip_wrl(src_path, dst_path=None):
+    import gzip
+    src = Path(src_path)
+    dst = Path(dst_path) if dst_path else src.with_suffix('.wrz')
+    orig_size = src.stat().st_size
+    print(f"Input:  {src} ({orig_size/1e6:.1f} MB)")
+    print("Gzip compressing...")
+    with open(str(src), 'rb') as fin, gzip.open(str(dst), 'wb', compresslevel=9) as fout:
+        while True:
+            chunk = fin.read(4 * 1024 * 1024)
+            if not chunk:
+                break
+            fout.write(chunk)
+    new_size = dst.stat().st_size
+    ratio = (1 - new_size / orig_size) * 100
+    print(f"Output: {dst} ({new_size/1e6:.1f} MB)")
+    print(f"Saved:  {ratio:.1f}% reduction")
+    if new_size < 500_000_000:
+        print("Under 500 MB!")
+    else:
+        print(f"Still {new_size/1e6:.0f} MB")
+
 if __name__ == '__main__':
     if len(sys.argv) < 2:
         print("Usage: python compress_wrl.py input.wrl [output.wrl]")
+        print("       python compress_wrl.py input.wrl --gzip   (gzip to .wrz)")
         sys.exit(1)
-    compress_wrl(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None)
+    if '--gzip' in sys.argv:
+        gzip_wrl(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] != '--gzip' else None)
+    else:
+        compress_wrl(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None)
