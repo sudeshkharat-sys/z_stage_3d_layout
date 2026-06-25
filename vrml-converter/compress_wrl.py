@@ -1,10 +1,6 @@
 """
-WRL compressor — reduces VRML file size without losing geometry or structure.
-Techniques (in order):
-  1. Strip comments
-  2. Remove blank lines
-  3. Reduce float precision (6 → 4 decimal places)
-  4. Compact whitespace
+WRL compressor — processes line by line to avoid OOM on large files.
+Reduces float precision and strips comments/whitespace.
 
 Usage:
   python compress_wrl.py input.wrl output.wrl
@@ -12,82 +8,73 @@ Usage:
 """
 import re
 import sys
-import os
 from pathlib import Path
 
-_FLOAT_RE = re.compile(
-    r'(?<![a-zA-Z0-9_])(-?\d+\.\d{5,})(?:[eE][+-]?\d+)?'
-)
+_FLOAT_RE = re.compile(r'-?\d+\.\d{5,}(?:[eE][+-]?\d+)?')
+
+def _round_float(m):
+    try:
+        val = float(m.group(0))
+        s = f'{val:.4f}'.rstrip('0').rstrip('.')
+        return s if s else '0'
+    except Exception:
+        return m.group(0)
 
 def compress_wrl(src_path, dst_path=None):
     src = Path(src_path)
-    if dst_path is None:
-        dst = src.with_stem(src.stem + '_compressed')
-    else:
-        dst = Path(dst_path)
+    dst = Path(dst_path) if dst_path else src.with_stem(src.stem + '_compressed')
 
     orig_size = src.stat().st_size
     print(f"Input:  {src} ({orig_size/1e6:.1f} MB)")
+    print("Processing line by line (low memory)...")
 
-    print("Reading...")
-    text = src.read_bytes().decode('latin-1')
+    written = 0
+    with open(str(src), 'rb') as fin, open(str(dst), 'wb') as fout:
+        for i, raw_line in enumerate(fin):
+            line = raw_line.decode('latin-1')
 
-    # Step 1: strip # comments (but keep the first line #VRML header)
-    print("Stripping comments...")
-    lines = text.split('\n')
-    out_lines = []
-    for i, line in enumerate(lines):
-        if i == 0:
-            out_lines.append(line)
-            continue
-        stripped = line.lstrip()
-        if stripped.startswith('#'):
-            continue
-        # Remove inline comments
-        idx = line.find('#')
-        if idx != -1:
-            line = line[:idx]
-        out_lines.append(line)
-    text = '\n'.join(out_lines)
+            # Keep VRML header on line 0
+            if i == 0:
+                fout.write(line.encode('latin-1'))
+                continue
 
-    # Step 2: remove blank lines
-    print("Removing blank lines...")
-    text = re.sub(r'\n\s*\n', '\n', text)
+            # Strip full-line comments
+            stripped = line.lstrip()
+            if stripped.startswith('#'):
+                continue
 
-    # Step 3: reduce float precision (keep 4 decimal places)
-    print("Reducing float precision...")
-    def _round_float(m):
-        try:
-            val = float(m.group(0))
-            # Format with 4 decimal places, strip trailing zeros
-            s = f'{val:.4f}'.rstrip('0').rstrip('.')
-            return s if s else '0'
-        except Exception:
-            return m.group(0)
-    text = _FLOAT_RE.sub(_round_float, text)
+            # Remove inline comments
+            ci = line.find('#')
+            if ci != -1:
+                line = line[:ci]
 
-    # Step 4: compact whitespace inside [ ] arrays (coord/index data)
-    # Replace sequences of spaces/tabs with single space
-    print("Compacting whitespace...")
-    text = re.sub(r'[ \t]+', ' ', text)
-    # Remove spaces around brackets and braces
-    text = re.sub(r' *([\[\]{},]) *', r'\1', text)
-    # But keep space after node keywords (before {)
-    text = re.sub(r'\b(\w+)\{', r'\1 {', text)
+            # Skip blank lines
+            if not line.strip():
+                continue
 
-    print("Writing...")
-    out_bytes = text.encode('latin-1', errors='replace')
-    dst.write_bytes(out_bytes)
+            # Reduce float precision
+            line = _FLOAT_RE.sub(_round_float, line)
+
+            # Compact whitespace (tabs/multiple spaces → single space)
+            line = re.sub(r'[ \t]+', ' ', line).strip()
+
+            if not line:
+                continue
+
+            fout.write((line + '\n').encode('latin-1'))
+            written += 1
+            if written % 1_000_000 == 0:
+                print(f"  {written/1e6:.0f}M lines written...")
 
     new_size = dst.stat().st_size
     ratio = (1 - new_size / orig_size) * 100
     print(f"Output: {dst} ({new_size/1e6:.1f} MB)")
-    print(f"Saved:  {ratio:.1f}% reduction ({orig_size/1e6:.1f} MB → {new_size/1e6:.1f} MB)")
+    print(f"Saved:  {ratio:.1f}% reduction  ({orig_size/1e6:.1f} MB → {new_size/1e6:.1f} MB)")
 
     if new_size < 500_000_000:
-        print("✓ Under 500 MB — ready for external converter!")
+        print("Under 500 MB — ready for external converter!")
     else:
-        print(f"Still {new_size/1e6:.0f} MB. Try reducing precision further or splitting the file.")
+        print(f"Still {new_size/1e6:.0f} MB. May need further reduction.")
 
 if __name__ == '__main__':
     if len(sys.argv) < 2:
