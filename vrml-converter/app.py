@@ -767,6 +767,13 @@ class _MeshCollector:
             return True
         self._inst_cnt[key] = cnt + 1
 
+        if self._n_calls <= 5:
+            _cv = self._geo_cache.get((ncs, nce), 'MISS')
+            _cv_desc = 'MISS' if _cv == 'MISS' else ('None' if _cv is None else f'({type(_cv[0]).__name__},{len(_cv[1])}faces)')
+            logger.info('add_ifs #%d: key=(%d,%d) parent_coord=%s cache=%s',
+                        self._n_calls, ncs, nce,
+                        'None' if parent_coord is None else f'{len(parent_coord)}pts',
+                        _cv_desc)
         try:
             geo = self._parse_geo(text, ncs, nce, brace_idx, def_map, parent_coord)
         except MemoryError:
@@ -1394,6 +1401,16 @@ def _parse_vrml(src: Path, color_mode: str, max_faces: int = 500_000, progress_c
         list(_pool.map(_prefetch, _ifs_indices, chunksize=200))
 
     logger.info('Pre-parse done: %d geo cached in %.1fs', len(collector._geo_cache), time.time() - _t_pre)
+    _n_none   = sum(1 for v in collector._geo_cache.values() if v is None)
+    _n_nocoord = sum(1 for v in collector._geo_cache.values() if v is not None and v[0] is None)
+    _n_full   = sum(1 for v in collector._geo_cache.values() if v is not None and v[0] is not None)
+    logger.info('Cache breakdown: None=%d (no coordIndex), (None,faces)=%d (external coord), (coord,faces)=%d (inline coord)',
+                _n_none, _n_nocoord, _n_full)
+    # Sample first IFS body to debug
+    if _ifs_indices:
+        _si = _ifs_indices[0]
+        _sncs, _snce = int(_cs_arr2[_si]), int(_ce_arr2[_si])
+        logger.info('First IFS body size=%d bytes, snippet: %r', _snce - _sncs, text[_sncs:min(_sncs+200, _snce)])
     # ────────────────────────────────────────────────────────────────────────────
 
     last_pct  = [15]
