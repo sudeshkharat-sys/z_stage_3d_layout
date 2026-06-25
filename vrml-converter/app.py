@@ -166,7 +166,8 @@ function showDone(d,jid){
   pf.style.width='100%';pl.textContent='Done!';
   const fname=(chosenFile?chosenFile.name.replace(/\.[^.]+$/,''):'model')+'.'+document.getElementById('outFmt').value;
   rb.className='result ok';rb.style.display='block';
-  rb.innerHTML='✅ Converted!<div class="stats">Output size: '+fmt(d.size)+'<br/>Parts merged: '+d.parts+'<br/>Color mode: '+(colorMode==='actual'?'Actual VRML colors':'Uniform light gray')+'</div>'
+  const warn=d.skipped>0?'<div style="margin-top:.5rem;color:#fbbf24;font-size:.82rem">⚠ Face budget hit ('+d.skipped+' groups skipped) — increase Max Faces for a more complete model.</div>':'';
+  rb.innerHTML='✅ Converted!<div class="stats">Output size: '+fmt(d.size)+'<br/>Parts merged: '+d.parts+'<br/>Color mode: '+(colorMode==='actual'?'Actual VRML colors':'Uniform light gray')+'</div>'+warn
     +'<a href="/download/'+jid+'" download="'+fname+'" style="display:inline-block;margin-top:12px;padding:10px 24px;background:#4caf50;color:#fff;border-radius:6px;text-decoration:none;font-weight:bold;">⬇ Download '+fname+'</a>';
   btn.disabled=false;
 }
@@ -447,10 +448,9 @@ def _axis_angle_to_mat4(x, y, z, angle):
 def _parse_floats(text, pos_tuple):
     p0, p1 = pos_tuple
     chunk_size = p1 - p0
-    # Guard: skip degenerate nodes whose coord data exceeds 50 MB.
-    # text[p0:p1] + .replace() creates two copies = 2× chunk_size RAM.
-    # A legitimate IFS coord array over 50 MB (~2 M vertices) is not renderable anyway.
-    if chunk_size > 50_000_000:
+    # Guard: skip degenerate nodes whose coord data exceeds 400 MB.
+    # Raised from 50 MB to handle large 800 MB+ VRML files with multi-million-vertex meshes.
+    if chunk_size > 400_000_000:
         logger.warning('_parse_floats: skipping %d MB array (too large, likely degenerate)',
                        chunk_size // 1_000_000)
         return None
@@ -469,7 +469,7 @@ def _parse_floats(text, pos_tuple):
 
 def _parse_face_indices(text, start, end):
     chunk_size = end - start
-    if chunk_size > 100_000_000:  # 100 MB cap — same reasoning as _parse_floats
+    if chunk_size > 800_000_000:  # 800 MB cap — raised from 100 MB for large VRML files
         logger.warning('_parse_face_indices: skipping %d MB coordIndex (too large)',
                        chunk_size // 1_000_000)
         return np.array([], dtype=np.int32)
@@ -1279,14 +1279,17 @@ def _simplify(mesh, max_faces):
 def _parse_vrml(src: Path, color_mode: str, max_faces: int = 500_000, progress_cb=None):
     import trimesh
     logger.info('Reading %s (%.1f MB) …', src.name, src.stat().st_size / 1e6)
-    # latin-1: 1 byte = 1 char always — guarantees character positions from prescan
-    # match mmap byte offsets exactly. VRML is ASCII so latin-1 ≡ UTF-8 for all tokens.
-    text = src.read_text(encoding='latin-1')
+
+    # Use mmap from the start — avoids loading 800 MB into the Python heap.
+    # latin-1 decoding (1 byte = 1 char) ensures character positions match byte offsets.
+    _mmap_handle = _MMapText(src)
+    text = _mmap_handle
 
     # Detect VRML version from header — used to choose Transform scoping behavior.
     # VRML 2.0 Transform is a grouping node (tree-scoped); VRML 1.0 is stateful.
     is_vrml2 = bool(re.match(r'\s*#VRML\s+V2', text[:120]))
     logger.info('VRML version: %s', '2.0' if is_vrml2 else '1.0')
+    logger.info('Using mmap from start — heap string never allocated')
 
     if progress_cb:
         progress_cb(5, 100, 'Building index…')
@@ -1347,18 +1350,10 @@ def _parse_vrml(src: Path, color_mode: str, max_faces: int = 500_000, progress_c
     logger.info('Geometry-reachable positions: %d (container pruning index ready)',
                 len(ifs_positions))
 
-    # ── Switch from heap string to memory-mapped file ──────────────────────────
-    # The 821 MB Python string is no longer needed — all positions are indexed.
-    # Replacing it with _MMapText lets the OS evict file pages under memory
-    # pressure, eliminating the 'pinned 821 MB' root cause of all OOM crashes.
-    # _parse_floats / _parse_face_indices receive text[p0:p1] which returns a
-    # transient decoded str that is GC'd immediately after parsing.
+    # mmap was opened at the start — no heap string to free here.
     import gc
-    del text
     gc.collect()
-    _mmap_handle = _MMapText(src)
-    text = _mmap_handle
-    logger.info('Switched to mmap — heap string freed, OS can now evict file pages')
+    logger.info('Mmap already active — OS can evict file pages under memory pressure')
 
     collector = _MeshCollector(max_faces=max_faces)
 
@@ -1383,24 +1378,25 @@ def _parse_vrml(src: Path, color_mode: str, max_faces: int = 500_000, progress_c
                 collector.total_faces, len(collector._geo_cache),
                 len(collector._groups), collector.skipped, sample_colors)
 
-    # Free the 800MB+ text buffer and the geometry cache before finalize so that
-    # peak memory during concatenation is the final geometry size only, not 2-3×.
+    # Close mmap and free caches before finalize so peak memory is the final geometry size only.
     import gc
     text_mb = len(text) / 1e6
     cache_entries = len(collector._geo_cache)
+    if hasattr(text, 'close'):
+        text.close()
     del text, brace_idx, def_map, field_use_positions, prescan, ifs_positions
     collector._geo_cache.clear()
     collector._inst_cnt.clear()
     gc.collect()
-    logger.info('Pre-finalize: freed %.1f MB text + %d cache entries', text_mb, cache_entries)
+    logger.info('Pre-finalize: closed %.1f MB mmap + %d cache entries', text_mb, cache_entries)
 
     if progress_cb:
         progress_cb(82, 100, 'Finalizing meshes…')
     meshes = collector.finalize()
     if not meshes:
         raise ValueError('No geometry found in file.')
-    logger.info('Final: %d color groups', len(meshes))
-    return meshes
+    logger.info('Final: %d color groups, %d skipped', len(meshes), collector.skipped)
+    return meshes, collector.skipped
 
 def _build_glb_scene(meshes):
     """
@@ -1509,10 +1505,11 @@ def _run_job(jid, tmp_path, out_format, max_faces, color_mode):
         ext = tmp_path.suffix.lower().lstrip('.')
         is_wrl = ext in ('wrl', 'vrml')
 
-        raw = None
+        raw    = None
+        n_skip = 0
         # Use built-in Python/trimesh parser directly.
         # PyMeshLab was tried but also stalls on 800MB+ WRL files.
-        meshes = _parse_vrml(tmp_path, color_mode, max_faces=max_faces, progress_cb=cb)
+        meshes, n_skip = _parse_vrml(tmp_path, color_mode, max_faces=max_faces, progress_cb=cb)
         _job_set(jid, pct=93, label=f'Exporting {out_format.upper()}…')
         if out_format == 'glb':
             raw = _build_glb_scene(meshes)
@@ -1536,7 +1533,7 @@ def _run_job(jid, tmp_path, out_format, max_faces, color_mode):
 
         n_parts = len(meshes) if 'meshes' in dir() else 1
         _job_set(jid, pct=100, label='Done!', status='done',
-                 out_path=str(out_path), parts=n_parts, size=len(out_bytes))
+                 out_path=str(out_path), parts=n_parts, size=len(out_bytes), skipped=n_skip)
         logger.info('Job %s done: %.2f MB → %s', jid, len(out_bytes) / 1e6, out_path)
 
     except (Exception, MemoryError):
@@ -1597,12 +1594,13 @@ def progress(jid):
                 yield f'data: {json.dumps({"status":"error","error":"Job not found","pct":0,"label":"Error"})}\n\n'
                 return
             payload = {
-                'pct':    job.get('pct', 0),
-                'label':  job.get('label', '…'),
-                'status': job.get('status', 'running'),
-                'parts':  job.get('parts', 0),
-                'size':   job.get('size', 0),
-                'error':  job.get('error', ''),
+                'pct':     job.get('pct', 0),
+                'label':   job.get('label', '…'),
+                'status':  job.get('status', 'running'),
+                'parts':   job.get('parts', 0),
+                'size':    job.get('size', 0),
+                'error':   job.get('error', ''),
+                'skipped': job.get('skipped', 0),
             }
             yield f'data: {json.dumps(payload)}\n\n'
             if job.get('status') in ('done', 'error'):
@@ -1625,7 +1623,8 @@ def progress_once(jid):
         return jsonify(status='error', error='Job not found', pct=0, label='Error')
     return jsonify(pct=job.get('pct',0), label=job.get('label','…'),
                    status=job.get('status','running'), parts=job.get('parts',0),
-                   size=job.get('size',0), error=job.get('error',''))
+                   size=job.get('size',0), error=job.get('error',''),
+                   skipped=job.get('skipped',0))
 
 
 @app.route('/download/<jid>')
