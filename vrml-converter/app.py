@@ -1372,48 +1372,11 @@ def _parse_vrml(src: Path, color_mode: str, max_faces: int = 500_000, progress_c
 
     collector = _MeshCollector(max_faces=max_faces)
 
-    # ── Parallel IFS pre-parse ──────────────────────────────────────────────────
-    # Pre-populate geo_cache for all unique IFS bodies using a thread pool.
-    # Safe now that the 821MB heap string is freed — the OOM that caused the
-    # original revert (7b99880) no longer applies.
-    # GIL is released during numpy/regex C ops so threads run concurrently.
-    import os
-    from concurrent.futures import ThreadPoolExecutor
-    _p_arr2, _nt_list2, _cs_arr2, _ce_arr2, _ = prescan
-    _seen_keys = set()
-    _ifs_indices = []
-    for _i, _nt in enumerate(_nt_list2):
-        if _nt == 'IndexedFaceSet':
-            _k = (int(_cs_arr2[_i]), int(_ce_arr2[_i]))
-            if _k not in _seen_keys:
-                _seen_keys.add(_k)
-                _ifs_indices.append(_i)
-    n_workers = min(8, max(1, os.cpu_count() or 4))
-    logger.info('Parallel IFS pre-parse: %d unique bodies, %d threads …', len(_ifs_indices), n_workers)
-    _t_pre = time.time()
-
-    def _prefetch(i):
-        ncs, nce = int(_cs_arr2[i]), int(_ce_arr2[i])
-        if (ncs, nce) not in collector._geo_cache:
-            try:
-                collector._parse_geo(text, ncs, nce, brace_idx, def_map, None)
-            except Exception:
-                pass  # leave cache empty — walk will parse it sequentially
-
-    with ThreadPoolExecutor(max_workers=n_workers) as _pool:
-        list(_pool.map(_prefetch, _ifs_indices, chunksize=200))
-
-    logger.info('Pre-parse done: %d geo cached in %.1fs', len(collector._geo_cache), time.time() - _t_pre)
-    _n_none   = sum(1 for v in collector._geo_cache.values() if v is None)
-    _n_nocoord = sum(1 for v in collector._geo_cache.values() if v is not None and v[0] is None)
-    _n_full   = sum(1 for v in collector._geo_cache.values() if v is not None and v[0] is not None)
-    logger.info('Cache breakdown: None=%d (no coordIndex), (None,faces)=%d (external coord), (coord,faces)=%d (inline coord)',
-                _n_none, _n_nocoord, _n_full)
-    # Sample first IFS body to debug
-    if _ifs_indices:
-        _si = _ifs_indices[0]
-        _sncs, _snce = int(_cs_arr2[_si]), int(_ce_arr2[_si])
-        logger.info('First IFS body size=%d bytes, snippet: %r', _snce - _sncs, text[_sncs:min(_sncs+200, _snce)])
+    # ── Parallel IFS pre-parse DISABLED — saves ~2GB RAM on large files ───────────
+    # Pre-parse cached 589K coord+face arrays simultaneously, causing silent OOM
+    # on Windows. Walk now parses each IFS on demand; the geo_cache still dedups
+    # repeated bodies (USE references) so each unique body is only parsed once.
+    logger.info('Skipping pre-parse — walk will parse IFS bodies on demand (lower RAM)')
     # ────────────────────────────────────────────────────────────────────────────
 
     last_pct  = [15]
