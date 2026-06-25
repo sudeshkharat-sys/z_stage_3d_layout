@@ -1388,7 +1388,7 @@ def _parse_vrml(src: Path, color_mode: str, max_faces: int = 500_000, progress_c
             try:
                 collector._parse_geo(text, ncs, nce, brace_idx, def_map, None)
             except Exception:
-                collector._geo_cache[(ncs, nce)] = None
+                pass  # leave cache empty — walk will parse it sequentially
 
     with ThreadPoolExecutor(max_workers=n_workers) as _pool:
         list(_pool.map(_prefetch, _ifs_indices, chunksize=200))
