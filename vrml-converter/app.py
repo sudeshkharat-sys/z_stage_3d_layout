@@ -1362,6 +1362,40 @@ def _parse_vrml(src: Path, color_mode: str, max_faces: int = 500_000, progress_c
 
     collector = _MeshCollector(max_faces=max_faces)
 
+    # ── Parallel IFS pre-parse ──────────────────────────────────────────────────
+    # Pre-populate geo_cache for all unique IFS bodies using a thread pool.
+    # Safe now that the 821MB heap string is freed — the OOM that caused the
+    # original revert (7b99880) no longer applies.
+    # GIL is released during numpy/regex C ops so threads run concurrently.
+    import os
+    from concurrent.futures import ThreadPoolExecutor
+    _p_arr2, _nt_list2, _cs_arr2, _ce_arr2, _ = prescan
+    _seen_keys = set()
+    _ifs_indices = []
+    for _i, _nt in enumerate(_nt_list2):
+        if _nt == 'IndexedFaceSet':
+            _k = (int(_cs_arr2[_i]), int(_ce_arr2[_i]))
+            if _k not in _seen_keys:
+                _seen_keys.add(_k)
+                _ifs_indices.append(_i)
+    n_workers = min(8, max(1, os.cpu_count() or 4))
+    logger.info('Parallel IFS pre-parse: %d unique bodies, %d threads …', len(_ifs_indices), n_workers)
+    _t_pre = time.time()
+
+    def _prefetch(i):
+        ncs, nce = int(_cs_arr2[i]), int(_ce_arr2[i])
+        if (ncs, nce) not in collector._geo_cache:
+            try:
+                collector._parse_geo(text, ncs, nce, brace_idx, def_map, None)
+            except Exception:
+                collector._geo_cache[(ncs, nce)] = None
+
+    with ThreadPoolExecutor(max_workers=n_workers) as _pool:
+        list(_pool.map(_prefetch, _ifs_indices, chunksize=200))
+
+    logger.info('Pre-parse done: %d geo cached in %.1fs', len(collector._geo_cache), time.time() - _t_pre)
+    # ────────────────────────────────────────────────────────────────────────────
+
     last_pct  = [15]
     max_pos   = [0]
 
