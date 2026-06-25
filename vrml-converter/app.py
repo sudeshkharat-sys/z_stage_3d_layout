@@ -1286,9 +1286,12 @@ def _simplify(mesh, max_faces):
 def _parse_vrml(src: Path, color_mode: str, max_faces: int = 500_000, progress_cb=None):
     import trimesh
     logger.info('Reading %s (%.1f MB) …', src.name, src.stat().st_size / 1e6)
-    # latin-1: 1 byte = 1 char always — guarantees character positions from prescan
-    # match mmap byte offsets exactly. VRML is ASCII so latin-1 ≡ UTF-8 for all tokens.
-    text = src.read_text(encoding='latin-1')
+    # Read in BINARY mode and decode manually — critical for Windows CRLF files.
+    # read_text() on Windows converts \r\n → \n, making heap string positions diverge
+    # from mmap byte offsets and breaking brace_idx lookups for every brace after
+    # the first CRLF. read_bytes().decode('latin-1') preserves \r\n as 2 chars so
+    # positions in heap string == byte offsets in mmap exactly.
+    text = src.read_bytes().decode('latin-1')
 
     # Detect VRML version from header — used to choose Transform scoping behavior.
     # VRML 2.0 Transform is a grouping node (tree-scoped); VRML 1.0 is stateful.
