@@ -1,12 +1,18 @@
 """
-Quick VRML diagnostic — runs in seconds.
+Deep VRML diagnostic — simulates _parse_geo on first IFS bodies.
 Usage: python diagnose_vrml.py yourfile.wrl
+Runs in seconds.
 """
 import re
 import sys
+import numpy as np
+
+_NUM_RE = re.compile(r'[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?')
+_CI_RE  = re.compile(r'\bcoordIndex\s*\[')
+_COORD_FIELD_RE = re.compile(r'\bcoord\s+(?:DEF\s+\S+\s+)?Coordinate\s*\{')
+_PT_RE  = re.compile(r'\bpoint\s*\[')
 
 def find_matching_brace(text, start):
-    """Find the closing } for opening { at position start."""
     depth = 0
     i = start
     while i < len(text):
@@ -19,7 +25,6 @@ def find_matching_brace(text, start):
     return -1
 
 def find_matching_bracket(text, start):
-    """Find the closing ] for opening [ at position start."""
     depth = 0
     i = start
     while i < len(text):
@@ -31,104 +36,182 @@ def find_matching_bracket(text, start):
         i += 1
     return -1
 
+def parse_floats(text, p0, p1):
+    chunk = text[p0:p1]
+    vals = _NUM_RE.findall(chunk)
+    if not vals:
+        return None
+    return np.array([float(v) for v in vals], dtype=np.float64)
+
+def parse_face_indices(text, p0, p1):
+    chunk = text[p0:p1]
+    vals = _NUM_RE.findall(chunk)
+    if not vals:
+        return np.empty(0, dtype=np.int32)
+    return np.array([int(float(v)) for v in vals], dtype=np.int32)
+
+def build_faces(indices):
+    faces = []
+    fan = []
+    for idx in indices:
+        if idx < 0:
+            if len(fan) >= 3:
+                v0 = fan[0]
+                for j in range(1, len(fan) - 1):
+                    faces.append((v0, fan[j], fan[j+1]))
+            fan = []
+        else:
+            fan.append(int(idx))
+    if len(fan) >= 3:
+        v0 = fan[0]
+        for j in range(1, len(fan) - 1):
+            faces.append((v0, fan[j], fan[j+1]))
+    return np.array(faces, dtype=np.int32) if faces else np.empty((0,3), dtype=np.int32)
+
+def simulate_parse_geo(text, ncs, nce, body_label):
+    """Simulate what _parse_geo does and report each step."""
+    print(f"\n  {body_label} body [{ncs}:{nce}], size={nce-ncs}")
+    body = text[ncs:nce]
+
+    # Step 1: find coordIndex
+    ci_m = _CI_RE.search(body)
+    if ci_m is None:
+        print("  FAIL: coordIndex not found in body")
+        return False
+    print(f"  OK: coordIndex found at body[{ci_m.start()}]")
+
+    # Step 2: find [ ] for coordIndex
+    ci_abs = ncs + ci_m.start()
+    bracket_open = text.find('[', ci_abs)
+    if bracket_open == -1 or bracket_open >= nce:
+        print(f"  FAIL: [ not found after coordIndex (abs pos {ci_abs})")
+        return False
+    bracket_close = find_matching_bracket(text, bracket_open)
+    if bracket_close == -1 or bracket_close > nce:
+        print(f"  FAIL: ] not found for coordIndex [")
+        return False
+    print(f"  OK: coordIndex[{bracket_open}:{bracket_close}], len={bracket_close-bracket_open}")
+
+    # Step 3: parse indices
+    indices = parse_face_indices(text, bracket_open+1, bracket_close)
+    print(f"  OK: parsed {len(indices)} raw indices")
+    if len(indices) == 0:
+        print("  FAIL: no indices parsed")
+        return False
+
+    # Step 4: build faces
+    faces = build_faces(indices)
+    print(f"  OK: built {len(faces)} triangles")
+    if len(faces) == 0:
+        print("  FAIL: no faces built")
+        return False
+
+    # Step 5: find inline coord
+    cm = _COORD_FIELD_RE.search(body)
+    if cm is None:
+        print("  INFO: no inline 'coord Coordinate {' found — needs parent_coord")
+        return True  # Not a failure, but no inline coord
+
+    coord_abs = ncs + cm.start()
+    brace_open = text.find('{', coord_abs)
+    if brace_open == -1 or brace_open >= nce:
+        print(f"  FAIL: {{ not found for coord Coordinate")
+        return False
+    brace_close = find_matching_brace(text, brace_open)
+    if brace_close == -1 or brace_close > nce:
+        print(f"  FAIL: }} not found for coord Coordinate (searched from {brace_open})")
+        return False
+    print(f"  OK: Coordinate body [{brace_open+1}:{brace_close}], len={brace_close-brace_open}")
+
+    inner = text[brace_open+1:brace_close]
+    pt_m = _PT_RE.search(inner)
+    if pt_m is None:
+        print(f"  FAIL: 'point [' not found inside Coordinate body")
+        return False
+    pt_abs = brace_open + 1 + pt_m.start()
+    pt_bracket = text.find('[', pt_abs)
+    if pt_bracket == -1 or pt_bracket >= brace_close:
+        print(f"  FAIL: [ not found after 'point'")
+        return False
+    pt_bracket_close = find_matching_bracket(text, pt_bracket)
+    if pt_bracket_close == -1 or pt_bracket_close > brace_close:
+        print(f"  FAIL: ] not found for point [")
+        return False
+    print(f"  OK: point[{pt_bracket+1}:{pt_bracket_close}], len={pt_bracket_close-pt_bracket}")
+
+    floats = parse_floats(text, pt_bracket+1, pt_bracket_close)
+    if floats is None or len(floats) < 3 or len(floats) % 3 != 0:
+        print(f"  FAIL: bad float count: {len(floats) if floats is not None else 0}")
+        return False
+    coord = floats.reshape(-1, 3)
+    print(f"  OK: coord has {len(coord)} points")
+
+    # Step 6: validate face indices against coord
+    valid = np.all((faces >= 0) & (faces < len(coord)), axis=1)
+    valid_faces = faces[valid]
+    print(f"  OK: {len(valid_faces)}/{len(faces)} faces pass index validation (coord size={len(coord)})")
+    if len(valid_faces) == 0:
+        print(f"  FAIL: ALL faces out of range! Max index={faces.max() if len(faces)>0 else 'N/A'}, coord={len(coord)}")
+        return False
+
+    print(f"  SUCCESS: would produce {len(valid_faces)} faces, {len(coord)} verts")
+    return True
+
+
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else None
     if not path:
         print("Usage: python diagnose_vrml.py yourfile.wrl")
         sys.exit(1)
 
-    print(f"Reading first 5MB of {path} ...")
+    print(f"Reading first 10MB of {path} ...")
     with open(path, 'rb') as f:
-        raw = f.read(5_000_000)
+        raw = f.read(10_000_000)
     text = raw.decode('latin-1', errors='replace')
+    print(f"Read {len(text)} chars. File: {'VRML 2.0' if '#VRML V2.0' in text[:100] else 'VRML 1.0' if '#VRML V1.0' in text[:100] else 'unknown'}")
 
-    # Header
-    print(f"\n--- FILE HEADER ---")
-    print(text[:150].strip())
-
-    if '#VRML V1.0' in text[:100]:
-        print("\nFile type: VRML 1.0")
-    elif '#VRML V2.0' in text[:100]:
-        print("\nFile type: VRML 2.0")
-    else:
-        print("\nFile type: UNKNOWN")
-
+    # Find all IFS in first 10MB
     ifs_re = re.compile(r'\bIndexedFaceSet\s*\{')
+    matches = list(ifs_re.finditer(text))
+    print(f"\nFound {len(matches)} IFS nodes in first 10MB")
 
-    # Find and analyze first 5 IFS bodies
-    print("\n--- IndexedFaceSet bodies ---")
-    found = 0
-    search_start = 0
-    while found < 5:
-        m = ifs_re.search(text, search_start)
-        if not m:
-            break
-        ifs_open = m.end() - 1  # position of {
+    # Simulate _parse_geo on first 10
+    print("\n--- Simulating _parse_geo on first 10 IFS bodies ---")
+    ok = 0
+    fail = 0
+    for i, m in enumerate(matches[:10]):
+        ifs_open = m.end() - 1
         ifs_close = find_matching_brace(text, ifs_open)
         if ifs_close == -1:
-            print(f"IFS #{found+1} at {m.start()}: can't find closing brace")
-            search_start = m.end()
+            print(f"\n  IFS #{i+1}: can't find closing brace")
+            fail += 1
             continue
+        result = simulate_parse_geo(text, ifs_open+1, ifs_close, f"IFS #{i+1}")
+        if result:
+            ok += 1
+        else:
+            fail += 1
 
-        body = text[ifs_open+1:ifs_close]
-        body_len = len(body)
+    print(f"\nResult: {ok} OK, {fail} FAILED out of first 10 IFS bodies")
 
-        has_coord_inline = bool(re.search(r'\bcoord\s+(?:DEF\s+\S+\s+)?Coordinate\s*\{', body))
-        has_coord_use = bool(re.search(r'\bcoord\s+USE\s+', body))
-        has_ci = bool(re.search(r'\bcoordIndex\s*\[', body))
-        has_point = bool(re.search(r'\bpoint\s*\[', body))
-
-        # Count points if inline
-        n_points = 0
-        pt_m = re.search(r'\bpoint\s*\[', body)
-        if pt_m:
-            pb = ifs_open + 1 + pt_m.start()
-            pb_open = text.find('[', pb)
-            if pb_open != -1:
-                pb_close = find_matching_bracket(text, pb_open)
-                if pb_close != -1:
-                    pts_text = text[pb_open+1:pb_close]
-                    n_points = pts_text.count(',') // 3 + 1  # rough estimate
-
-        # Count face indices
-        n_faces = 0
-        ci_m = re.search(r'\bcoordIndex\s*\[', body)
-        if ci_m:
-            ci_pos = ifs_open + 1 + ci_m.start()
-            ci_open = text.find('[', ci_pos)
-            if ci_open != -1 and ci_open < ifs_close:
-                ci_close = find_matching_bracket(text, ci_open)
-                if ci_close != -1 and ci_close < ifs_close:
-                    ci_text = text[ci_open+1:ci_close]
-                    n_faces = ci_text.count('-1')
-
-        print(f"\nIFS #{found+1} at offset {m.start()}, body_size={body_len}")
-        print(f"  coord inline: {has_coord_inline}, coord USE: {has_coord_use}, point[]: {has_point}")
-        print(f"  coordIndex[]: {has_ci}")
-        print(f"  approx points: {n_points}, approx faces: {n_faces}")
-        print(f"  first 150 chars: {body[:150].replace(chr(13),'').replace(chr(10),' ')!r}")
-
-        search_start = ifs_close + 1
-        found += 1
-
-    if found == 0:
-        print("No IndexedFaceSet found in first 5MB!")
-
-    # Count totals
-    total_ifs = len(ifs_re.findall(text))
-    total_coord = len(re.findall(r'\bCoordinate\s*\{', text))
-    total_coordIndex = len(re.findall(r'\bcoordIndex\s*\[', text))
-    print(f"\n--- Counts in first 5MB ---")
-    print(f"  IndexedFaceSet: {total_ifs}")
-    print(f"  Coordinate nodes: {total_coord}")
-    print(f"  coordIndex fields: {total_coordIndex}")
-    print(f"  (coordIndex == IFS ratio): {total_coordIndex}/{total_ifs} = {total_coordIndex/max(1,total_ifs):.2f}")
-
-    # Check for USE/DEF patterns
-    n_def_ifs = len(re.findall(r'\bDEF\s+\S+\s+IndexedFaceSet\s*\{', text))
-    n_use = len(re.findall(r'(?<!\w)USE\s+\S+', text))
-    print(f"  DEF-named IFS: {n_def_ifs}")
-    print(f"  USE references: {n_use}")
+    # Check if Shape wraps the IFS
+    print("\n--- Checking Shape → IFS nesting ---")
+    shape_re = re.compile(r'\bShape\s*\{')
+    sm = shape_re.search(text)
+    if sm:
+        shape_open = sm.end() - 1
+        shape_close = find_matching_brace(text, shape_open)
+        shape_body = text[shape_open+1:shape_close] if shape_close != -1 else ''
+        has_geo = bool(re.search(r'\bgeometry\b', shape_body[:500]))
+        has_ifs = bool(ifs_re.search(shape_body))
+        has_app = bool(re.search(r'\bappearance\b', shape_body[:500]))
+        print(f"First Shape at {sm.start()}, body_size={shape_close-shape_open if shape_close!=-1 else '?'}")
+        print(f"  has 'geometry': {has_geo}")
+        print(f"  has IndexedFaceSet: {has_ifs}")
+        print(f"  has 'appearance': {has_app}")
+        print(f"  first 300 chars: {shape_body[:300].replace(chr(13),'').replace(chr(10),' ')!r}")
+    else:
+        print("No Shape node found in first 10MB")
 
     print("\nDone.")
 
