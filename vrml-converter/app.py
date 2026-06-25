@@ -783,6 +783,11 @@ class _MeshCollector:
         if geo is None:
             return True
         verts, faces = geo
+        # Evict cache entry after use — frees RAM immediately, USE refs re-parse
+        # (cheap: body is tiny). Keeps peak cache RAM near zero during walk.
+        key = (ncs, nce)
+        if key in self._geo_cache:
+            del self._geo_cache[key]
 
         # Apply transform — GL convention (translation in last column): h @ M.T
         try:
@@ -1372,11 +1377,34 @@ def _parse_vrml(src: Path, color_mode: str, max_faces: int = 500_000, progress_c
 
     collector = _MeshCollector(max_faces=max_faces)
 
-    # ── Parallel IFS pre-parse DISABLED — saves ~2GB RAM on large files ───────────
-    # Pre-parse cached 589K coord+face arrays simultaneously, causing silent OOM
-    # on Windows. Walk now parses each IFS on demand; the geo_cache still dedups
-    # repeated bodies (USE references) so each unique body is only parsed once.
-    logger.info('Skipping pre-parse — walk will parse IFS bodies on demand (lower RAM)')
+    # ── Parallel IFS pre-parse ──────────────────────────────────────────────────
+    import os
+    from concurrent.futures import ThreadPoolExecutor
+    _p_arr2, _nt_list2, _cs_arr2, _ce_arr2, _ = prescan
+    _seen_keys = set()
+    _ifs_indices = []
+    for _i, _nt in enumerate(_nt_list2):
+        if _nt == 'IndexedFaceSet':
+            _k = (int(_cs_arr2[_i]), int(_ce_arr2[_i]))
+            if _k not in _seen_keys:
+                _seen_keys.add(_k)
+                _ifs_indices.append(_i)
+    n_workers = min(8, max(1, os.cpu_count() or 4))
+    logger.info('Parallel IFS pre-parse: %d unique bodies, %d threads …', len(_ifs_indices), n_workers)
+    _t_pre = time.time()
+
+    def _prefetch(i):
+        ncs, nce = int(_cs_arr2[i]), int(_ce_arr2[i])
+        if (ncs, nce) not in collector._geo_cache:
+            try:
+                collector._parse_geo(text, ncs, nce, brace_idx, def_map, None)
+            except Exception:
+                pass
+
+    with ThreadPoolExecutor(max_workers=n_workers) as _pool:
+        list(_pool.map(_prefetch, _ifs_indices, chunksize=200))
+
+    logger.info('Pre-parse done: %d geo cached in %.1fs', len(collector._geo_cache), time.time() - _t_pre)
     # ────────────────────────────────────────────────────────────────────────────
 
     last_pct  = [15]
