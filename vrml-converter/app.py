@@ -19,6 +19,7 @@ import io
 import json
 import logging
 import mmap as _mmap_mod
+import os
 import re
 import tempfile
 import threading
@@ -26,6 +27,10 @@ import time
 import traceback
 import uuid
 from pathlib import Path
+
+# Suppress VTK "no display" warnings — we run headless for file parsing only
+os.environ.setdefault('VTK_SILENCE_GET_VOID_POINTER_WARNINGS', '1')
+os.environ.setdefault('DISPLAY', '')
 
 import numpy as np
 from flask import Flask, Response, jsonify, make_response, render_template_string, request, send_file
@@ -1540,33 +1545,170 @@ def _convert_via_pymeshlab(src: Path, out_format: str, progress_cb=None) -> byte
     return raw
 
 
+# ── VTK-based fast converter (primary path) ────────────────────────────────────
+def _convert_via_vtk(src: Path, out_format: str, progress_cb=None) -> bytes:
+    """
+    Use VTK's C++ vtkVRMLImporter to load WRL, then export via trimesh.
+    VTK reads the file in C++ — no Python heap allocation for the file content,
+    no mmap juggling, no OOM on 800MB+ files.
+    Raises ImportError if vtk is not installed; RuntimeError on failure.
+    """
+    import vtk  # noqa: F401
+
+    if progress_cb:
+        progress_cb(10, 100, 'Loading with VTK…')
+
+    # vtkVRMLImporter works headless — no render window needed
+    importer = vtk.vtkVRMLImporter()
+    importer.SetFileName(str(src))
+    importer.Update()
+
+    if progress_cb:
+        progress_cb(40, 100, 'Extracting geometry…')
+
+    actors = importer.GetImportedActors()
+    actors.InitTraversal()
+
+    all_verts = []
+    all_faces = []
+    all_colors = []
+    vert_offset = 0
+    n_actors = actors.GetNumberOfItems()
+    logger.info('VTK: %d actors in scene', n_actors)
+
+    for _ in range(n_actors):
+        actor = actors.GetNextActor()
+        mapper = actor.GetMapper()
+        if mapper is None:
+            continue
+
+        # Force the pipeline to execute so we get polydata
+        mapper.Update()
+        pd = mapper.GetInput()
+        if pd is None or not pd.IsA('vtkPolyData'):
+            continue
+
+        # Triangulate any non-triangle cells
+        tri = vtk.vtkTriangleFilter()
+        tri.SetInputData(pd)
+        tri.Update()
+        pd = tri.GetOutput()
+
+        n_pts = pd.GetNumberOfPoints()
+        n_cells = pd.GetNumberOfCells()
+        if n_pts == 0 or n_cells == 0:
+            continue
+
+        # Vertices
+        pts_vtk = pd.GetPoints()
+        verts = np.array(
+            [pts_vtk.GetPoint(i) for i in range(n_pts)], dtype=np.float64
+        )
+
+        # Faces (triangles only after vtkTriangleFilter)
+        faces = []
+        for ci in range(n_cells):
+            cell = pd.GetCell(ci)
+            if cell.GetNumberOfPoints() == 3:
+                faces.append([
+                    cell.GetPointId(0),
+                    cell.GetPointId(1),
+                    cell.GetPointId(2),
+                ])
+        if not faces:
+            continue
+        faces = np.array(faces, dtype=np.int32)
+
+        # Actor color
+        prop = actor.GetProperty()
+        r, g, b = prop.GetColor()
+        color = (int(r * 255), int(g * 255), int(b * 255), 255)
+
+        all_verts.append(verts)
+        all_faces.append(faces + vert_offset)
+        all_colors.append((color, len(faces)))
+        vert_offset += n_pts
+
+    if not all_verts:
+        raise RuntimeError('VTK found no geometry in file.')
+
+    if progress_cb:
+        progress_cb(70, 100, f'Exporting {out_format.upper()}…')
+
+    import trimesh
+
+    # Build per-color meshes for GLB (preserves color); single mesh for OBJ/STL
+    if out_format == 'glb':
+        # Group by color, build trimesh, export scene
+        color_groups: dict = {}
+        for (color, nf), v_arr, f_arr in zip(all_colors, all_verts, all_faces):
+            color_groups.setdefault(color, ([], []))
+            color_groups[color][0].append(v_arr)
+            color_groups[color][1].append(f_arr)
+
+        meshes = []
+        for color, (vs, fs) in color_groups.items():
+            total_v = sum(len(v) for v in vs)
+            verts_out = np.empty((total_v, 3), dtype=np.float64)
+            off = 0
+            for v in vs:
+                verts_out[off:off+len(v)] = v; off += len(v)
+            faces_out = np.concatenate(fs) if fs else np.empty((0, 3), dtype=np.int32)
+            m = trimesh.Trimesh(vertices=verts_out, faces=faces_out, process=False)
+            m.visual.face_colors = list(color)
+            meshes.append(m)
+
+        raw = _build_glb_scene(meshes)
+    else:
+        verts_all = np.concatenate(all_verts, axis=0)
+        faces_all = np.concatenate(all_faces, axis=0)
+        mesh = trimesh.Trimesh(vertices=verts_all, faces=faces_all, process=False)
+        export_kwargs = {'include_color': False} if out_format == 'obj' else {}
+        raw = mesh.export(file_type=out_format, **export_kwargs)
+
+    if isinstance(raw, bytes):
+        return raw
+    if isinstance(raw, str):
+        return raw.encode('utf-8')
+    return bytes(raw)
+
+
 # ── Background job ─────────────────────────────────────────────────────────────
 def _run_job(jid, tmp_path, out_format, max_faces, color_mode):
     try:
-        import trimesh
-
         last_pct = [0]
         def cb(cur, total, label='Converting…'):
             pct = max(cur if total == 100 else int(cur / max(total, 1) * 100), last_pct[0])
             last_pct[0] = pct
             _job_set(jid, pct=pct, label=label)
 
-        ext = tmp_path.suffix.lower().lstrip('.')
-        is_wrl = ext in ('wrl', 'vrml')
-
         raw = None
-        # Use built-in Python/trimesh parser directly.
-        # PyMeshLab was tried but also stalls on 800MB+ WRL files.
-        meshes = _parse_vrml(tmp_path, color_mode, max_faces=max_faces, progress_cb=cb)
-        _job_set(jid, pct=93, label=f'Exporting {out_format.upper()}…')
-        if out_format == 'glb':
-            raw = _build_glb_scene(meshes)
-        else:
-            import trimesh as _trimesh
-            combined = _trimesh.util.concatenate(meshes)
-            combined = _simplify(combined, max_faces)
-            export_kwargs = {'include_color': False} if out_format == 'obj' else {}
-            raw = combined.export(file_type=out_format, **export_kwargs)
+        n_parts = 1
+
+        # ── Primary: VTK C++ VRML importer (no Python heap OOM, any file size) ──
+        try:
+            _job_set(jid, pct=5, label='Converting with VTK (fast path)…')
+            raw = _convert_via_vtk(tmp_path, out_format, progress_cb=cb)
+            logger.info('Job %s: VTK fast path succeeded', jid)
+        except Exception as vtk_err:
+            logger.warning('Job %s: VTK failed (%s) — falling back to Python parser',
+                           jid, vtk_err)
+            raw = None
+
+        # ── Fallback: Python VRML parser (handles color, VRML 1.0/2.0 quirks) ──
+        if raw is None:
+            _job_set(jid, pct=5, label='Parsing VRML (Python fallback)…')
+            meshes = _parse_vrml(tmp_path, color_mode, max_faces=max_faces, progress_cb=cb)
+            n_parts = len(meshes)
+            _job_set(jid, pct=93, label=f'Exporting {out_format.upper()}…')
+            if out_format == 'glb':
+                raw = _build_glb_scene(meshes)
+            else:
+                import trimesh as _trimesh
+                combined = _trimesh.util.concatenate(meshes)
+                combined = _simplify(combined, max_faces)
+                export_kwargs = {'include_color': False} if out_format == 'obj' else {}
+                raw = combined.export(file_type=out_format, **export_kwargs)
 
         if isinstance(raw, bytes):
             out_bytes = raw
@@ -1575,11 +1717,9 @@ def _run_job(jid, tmp_path, out_format, max_faces, color_mode):
         else:
             out_bytes = bytes(raw)
 
-        # Write to disk so download survives server restarts and works multiple times
         out_path = tmp_path.parent / f'{jid}.{out_format}'
         out_path.write_bytes(out_bytes)
 
-        n_parts = len(meshes) if 'meshes' in dir() else 1
         _job_set(jid, pct=100, label='Done!', status='done',
                  out_path=str(out_path), parts=n_parts, size=len(out_bytes))
         logger.info('Job %s done: %.2f MB → %s', jid, len(out_bytes) / 1e6, out_path)
