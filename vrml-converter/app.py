@@ -1248,6 +1248,36 @@ def _compress_material_textures(material, max_size, quality):
     return changed
 
 
+# Matches Blender's own viewport default for objects with no material
+# assigned — not a real material, just what Blender happens to display.
+_NO_MATERIAL_FALLBACK_COLOR = [0.8, 0.8, 0.8, 1.0]
+
+
+def _ensure_material(mesh):
+    """Assign an explicit neutral material to a mesh that has none.
+
+    A glTF primitive with no material falls back to each *viewer's own*
+    default — per spec that's fully metallic with no diffuse, which many
+    viewers render as solid black without a proper environment map. Blender
+    happens to show these objects as a plain gray in its own viewport, which
+    is just Blender's convention, not an actual material in the file — so
+    the same object can look fine in Blender and black everywhere else.
+    Assigning an explicit non-metallic gray material makes the appearance
+    consistent across viewers instead of depending on that fallback.
+    """
+    import trimesh
+
+    visual = mesh.visual
+    has_material = hasattr(visual, 'material') and visual.material is not None
+    has_vertex_color = visual.kind == 'vertex'
+    if has_material or has_vertex_color:
+        return mesh
+    mat = trimesh.visual.material.PBRMaterial(
+        baseColorFactor=_NO_MATERIAL_FALLBACK_COLOR, metallicFactor=0.0, roughnessFactor=0.8)
+    mesh.visual = trimesh.visual.texture.TextureVisuals(material=mat)
+    return mesh
+
+
 def _average_by_mapping(values, mapping, n_new):
     """Average per-vertex attribute rows into n_new groups given a mapping array."""
     values = np.asarray(values, dtype=np.float64)
@@ -1367,7 +1397,10 @@ def _run_compress_job(jid, tmp_path, tex_max_size, tex_quality, geo_reduce_pct, 
             if target_reduction > 0:
                 new_mesh, changed = _decimate_mesh(mesh, target_reduction)
                 if changed:
-                    scene.geometry[name] = new_mesh
+                    mesh = new_mesh
+                    scene.geometry[name] = mesh
+
+            scene.geometry[name] = _ensure_material(mesh)
 
         faces_after = sum(len(g.faces) for g in scene.geometry.values())
 
