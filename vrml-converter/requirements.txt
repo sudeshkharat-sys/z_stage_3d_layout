@@ -3,3 +3,4 @@ trimesh[easy]
 numpy
 pillow
 fast-simplification
+dracox

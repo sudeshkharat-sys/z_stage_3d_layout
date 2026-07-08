@@ -35,6 +35,18 @@ from PIL import Image
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 logger = logging.getLogger(__name__)
 
+try:
+    # Registers KHR_draco_mesh_compression handlers with trimesh's glTF
+    # loader/exporter on import. This makes trimesh transparently decode
+    # Draco-compressed GLBs (e.g. from Blender's "Draco mesh compression"
+    # export option) and lets us optionally re-encode with Draco too.
+    import dracox  # noqa: F401
+    _HAS_DRACO = True
+except ImportError:
+    _HAS_DRACO = False
+    logger.warning('dracox not installed — Draco-compressed GLBs will fail to load; '
+                    'run: pip install dracox')
+
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024 * 1024
 
@@ -111,6 +123,9 @@ HTML = r"""
   .stats { margin-top: .5rem; font-size: .82rem; color: #64748b; line-height: 1.6; }
   .dl-btn { display: inline-block; margin-top: 12px; padding: 10px 24px; background: #4caf50;
     color: #fff; border-radius: 6px; text-decoration: none; font-weight: bold; }
+  .checkbox-row { display: flex; align-items: flex-start; gap: .6rem; font-size: .85rem;
+    color: #94a3b8; cursor: pointer; }
+  .checkbox-row input[type=checkbox] { margin-top: .2rem; accent-color: #7dd3fc; flex-shrink: 0; }
 </style>
 </head>
 <body>
@@ -166,7 +181,7 @@ HTML = r"""
       <input type="file" id="glbInput" accept=".glb" onchange="onGlbChosen(this)"/>
       <div class="icon">&#128230;</div>
       <div>Click to browse or drag &amp; drop</div>
-      <div class="hint">.glb only</div>
+      <div class="hint">.glb only &mdash; plain or Draco-compressed, both work</div>
       <div class="chosen" id="chosenGlbName"></div>
     </div>
     <div class="row">
@@ -191,6 +206,11 @@ HTML = r"""
         <span style="color:#64748b;font-size:.78rem">(simplifies mesh shape &mdash; 0 = off)</span></label>
       <input type="range" id="geoReduce" min="0" max="90" value="0"
         oninput="document.getElementById('geoReduceVal').textContent=this.value+'%'"/>
+    </div>
+    <div class="checkbox-row" style="margin-bottom:1.5rem" onclick="document.getElementById('dracoOutput').click()">
+      <input type="checkbox" id="dracoOutput" onclick="event.stopPropagation()"/>
+      <span>5. Apply Draco geometry compression on output
+        <span style="color:#64748b;font-size:.78rem">(smaller file, but needs a Draco-aware viewer/importer &mdash; Blender &amp; three.js support it)</span></span>
     </div>
     <button id="compressBtn" onclick="compress()" disabled>Compress</button>
     <div class="progress-wrap" id="progressWrapCompress">
@@ -294,6 +314,7 @@ function compress(){
   form.append('tex_max_size',document.getElementById('texMaxSize').value);
   form.append('tex_quality',document.getElementById('texQuality').value);
   form.append('geo_reduce',document.getElementById('geoReduce').value);
+  form.append('draco_output',document.getElementById('dracoOutput').checked?'1':'0');
   compressEls.btn=document.getElementById('compressBtn');
   compressEls.pw=document.getElementById('progressWrapCompress');
   compressEls.pf=document.getElementById('progressFillCompress');
@@ -304,7 +325,7 @@ function compress(){
     const rb=compressEls.rb;
     const pct=d.orig_size?Math.round((1-d.size/d.orig_size)*100):0;
     rb.className='result ok';rb.style.display='block';
-    rb.innerHTML='✅ Compressed!<div class="stats">'+fmt(d.orig_size)+' &rarr; '+fmt(d.size)+' ('+pct+'% smaller)<br/>Faces: '+d.faces_before+' &rarr; '+d.faces_after+'<br/>Textures processed: '+d.textures_processed+'</div>'
+    rb.innerHTML='✅ Compressed!<div class="stats">'+fmt(d.orig_size)+' &rarr; '+fmt(d.size)+' ('+pct+'% smaller)<br/>Faces: '+d.faces_before+' &rarr; '+d.faces_after+'<br/>Textures processed: '+d.textures_processed+(d.used_draco?'<br/>Draco geometry compression: applied':'')+'</div>'
       +'<a href="/download/'+jid+'" download="'+fname+'" class="dl-btn">⬇ Download '+fname+'</a>';
   });
 }
@@ -1288,11 +1309,14 @@ def _decimate_mesh(mesh, target_reduction, agg=7.0):
     return new_mesh, True
 
 
-def _run_compress_job(jid, tmp_path, tex_max_size, tex_quality, geo_reduce_pct):
+def _run_compress_job(jid, tmp_path, tex_max_size, tex_quality, geo_reduce_pct, draco_output):
     try:
         import trimesh
 
         orig_size = tmp_path.stat().st_size
+        # A Draco-compressed input (e.g. Blender's "Draco mesh compression"
+        # export option) is decoded transparently here — dracox registers
+        # itself with trimesh's glTF loader at import time (see top of file).
         _job_set(jid, pct=8, label='Loading GLB…')
         scene = trimesh.load(tmp_path, file_type='glb', process=False, force='scene')
 
@@ -1316,8 +1340,12 @@ def _run_compress_job(jid, tmp_path, tex_max_size, tex_quality, geo_reduce_pct):
 
         faces_after = sum(len(g.faces) for g in scene.geometry.values())
 
+        use_draco = bool(draco_output and _HAS_DRACO)
+        if draco_output and not _HAS_DRACO:
+            logger.warning('Draco output requested but dracox is not installed — exporting without it.')
+
         _job_set(jid, pct=92, label='Exporting GLB…')
-        raw = scene.export(file_type='glb')
+        raw = scene.export(file_type='glb', extension_draco=use_draco)
         out_bytes = bytes(raw) if not isinstance(raw, bytes) else raw
 
         out_path = tmp_path.parent / f'{jid}.glb'
@@ -1326,9 +1354,9 @@ def _run_compress_job(jid, tmp_path, tex_max_size, tex_quality, geo_reduce_pct):
         _job_set(jid, pct=100, label='Done!', status='done', out_path=str(out_path),
                  size=len(out_bytes), orig_size=orig_size,
                  faces_before=faces_before, faces_after=faces_after,
-                 textures_processed=textures_processed)
-        logger.info('Compress job %s done: %.2f MB -> %.2f MB (%d -> %d faces)',
-                    jid, orig_size / 1e6, len(out_bytes) / 1e6, faces_before, faces_after)
+                 textures_processed=textures_processed, used_draco=use_draco)
+        logger.info('Compress job %s done: %.2f MB -> %.2f MB (%d -> %d faces, draco=%s)',
+                    jid, orig_size / 1e6, len(out_bytes) / 1e6, faces_before, faces_after, use_draco)
 
     except Exception:
         logger.error('Compress job %s failed:\n%s', jid, traceback.format_exc())
@@ -1443,6 +1471,7 @@ def start_compress():
     tex_max_size = max(0, min(int(request.form.get('tex_max_size', 1024) or 0), 8192))
     tex_quality  = max(30, min(int(request.form.get('tex_quality', 75)), 95))
     geo_reduce   = max(0, min(int(request.form.get('geo_reduce', 0)), 90))
+    draco_output = request.form.get('draco_output', '0') == '1'
 
     with tempfile.NamedTemporaryFile(suffix='.glb', delete=False) as tmp:
         tmp_path = Path(tmp.name)
@@ -1454,9 +1483,9 @@ def start_compress():
         _jobs[jid] = {'status': 'running', 'pct': 2, 'label': 'Queued…',
                       'format': 'glb', 'orig_stem': orig_stem, 'size': 0,
                       'orig_size': 0, 'faces_before': 0, 'faces_after': 0,
-                      'textures_processed': 0, 'error': ''}
+                      'textures_processed': 0, 'used_draco': False, 'error': ''}
     threading.Thread(target=_run_compress_job,
-                     args=(jid, tmp_path, tex_max_size, tex_quality, geo_reduce),
+                     args=(jid, tmp_path, tex_max_size, tex_quality, geo_reduce, draco_output),
                      daemon=True).start()
     return jsonify(job_id=jid)
 
@@ -1481,6 +1510,7 @@ def progress(jid):
                 'faces_before':       job.get('faces_before', 0),
                 'faces_after':        job.get('faces_after', 0),
                 'textures_processed': job.get('textures_processed', 0),
+                'used_draco':         job.get('used_draco', False),
             }
             yield f'data: {json.dumps(payload)}\n\n'
             if job.get('status') in ('done', 'error'):
@@ -1505,7 +1535,8 @@ def progress_once(jid):
                    status=job.get('status','running'), parts=job.get('parts',0),
                    size=job.get('size',0), error=job.get('error',''),
                    orig_size=job.get('orig_size',0), faces_before=job.get('faces_before',0),
-                   faces_after=job.get('faces_after',0), textures_processed=job.get('textures_processed',0))
+                   faces_after=job.get('faces_after',0), textures_processed=job.get('textures_processed',0),
+                   used_draco=job.get('used_draco',False))
 
 
 @app.route('/download/<jid>')
