@@ -1266,6 +1266,16 @@ def _decimate_mesh(mesh, target_reduction, agg=7.0):
     vertex colors entirely, which would blank out Blender-exported materials.
     fast_simplification's collapse history lets us replay the same decimation
     against those per-vertex attributes and carry them over.
+
+    glTF/Blender exports duplicate vertices at every hard edge and UV seam so
+    each side can carry its own normal/UV — the raw index buffer therefore
+    understates true connectivity. Decimating on that directly makes the
+    algorithm treat every seam as a mesh boundary, tearing real holes in the
+    surface ("strainer" look) at every hard edge/seam. So positions are welded
+    by coordinate first to recover the true topology, decimation runs on that,
+    and UV/color are carried back to the new mesh via the composed
+    original -> welded -> decimated vertex mapping.
+
     Falls back to the original mesh untouched if anything goes wrong.
     """
     import trimesh
@@ -1279,9 +1289,23 @@ def _decimate_mesh(mesh, target_reduction, agg=7.0):
     pts  = np.asarray(mesh.vertices, dtype=np.float64)
     tris = np.asarray(mesh.faces, dtype=np.int32)
 
+    # Weld same-position vertices (rounded to 1e-5 — far below visual precision)
+    # so the decimator sees the mesh's real connectivity instead of the
+    # seam-duplicated glTF index buffer.
+    weld_pts, weld_inverse = np.unique(np.round(pts, 5), axis=0, return_inverse=True)
+    weld_tris = weld_inverse[tris]
+    degenerate = ((weld_tris[:, 0] == weld_tris[:, 1])
+                  | (weld_tris[:, 1] == weld_tris[:, 2])
+                  | (weld_tris[:, 0] == weld_tris[:, 2]))
+    weld_tris = weld_tris[~degenerate]
+
+    weld_target_count = max(4, int(len(weld_tris) * (1 - target_reduction)))
+    if len(weld_tris) < 12 or weld_target_count >= len(weld_tris):
+        return mesh, False
+
     try:
         dec_pts, dec_tris, collapses = fs.simplify(
-            pts, tris, target_count=target_count, agg=agg, return_collapses=True)
+            weld_pts, weld_tris, target_count=weld_target_count, agg=agg, return_collapses=True)
     except Exception as exc:
         logger.warning('Decimation skipped for a mesh (%d faces): %s', n_faces, exc)
         return mesh, False
@@ -1293,10 +1317,12 @@ def _decimate_mesh(mesh, target_reduction, agg=7.0):
     visual = mesh.visual
 
     try:
+        _, _, welded_to_dec = fs.replay_simplification(weld_pts.astype(np.float32), weld_tris, collapses)
+        orig_to_dec = welded_to_dec[weld_inverse]  # original vertex -> welded -> decimated
+
         if isinstance(visual, trimesh.visual.texture.TextureVisuals):
             if visual.uv is not None and len(visual.uv) == len(pts):
-                _, _, mapping = fs.replay_simplification(pts.astype(np.float32), tris, collapses)
-                new_uv = _average_by_mapping(visual.uv, mapping, len(dec_pts))
+                new_uv = _average_by_mapping(visual.uv, orig_to_dec, len(dec_pts))
                 new_mesh.visual = trimesh.visual.texture.TextureVisuals(uv=new_uv, material=visual.material)
             else:
                 # Flat/solid-color material with no texture image (very common for
@@ -1306,8 +1332,7 @@ def _decimate_mesh(mesh, target_reduction, agg=7.0):
                 new_mesh.visual = trimesh.visual.texture.TextureVisuals(material=visual.material)
         elif (visual.kind == 'vertex' and getattr(visual, 'vertex_colors', None) is not None
                 and len(visual.vertex_colors) == len(pts)):
-            _, _, mapping = fs.replay_simplification(pts.astype(np.float32), tris, collapses)
-            new_colors = _average_by_mapping(visual.vertex_colors, mapping, len(dec_pts))
+            new_colors = _average_by_mapping(visual.vertex_colors, orig_to_dec, len(dec_pts))
             new_mesh.visual.vertex_colors = np.clip(new_colors, 0, 255).astype(np.uint8)
     except Exception as exc:
         logger.warning('Visual remap after decimation failed, keeping geometry only: %s', exc)
