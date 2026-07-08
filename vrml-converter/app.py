@@ -1376,7 +1376,14 @@ def _run_compress_job(jid, tmp_path, tex_max_size, tex_quality, geo_reduce_pct, 
             logger.warning('Draco output requested but dracox is not installed — exporting without it.')
 
         _job_set(jid, pct=92, label='Exporting GLB…')
-        raw = scene.export(file_type='glb', extension_draco=use_draco)
+        # include_normals=True is required: decimated meshes never have
+        # vertex_normals cached (trimesh's exporter only writes NORMAL when
+        # it's already in the cache), so without this every decimated mesh
+        # silently loses its normals. That's harmless for materials with a
+        # real base color, but an object with NO material falls back to the
+        # glTF default (fully metallic, no diffuse) which needs normals to
+        # catch any light at all — without them it renders solid black.
+        raw = scene.export(file_type='glb', extension_draco=use_draco, include_normals=True)
         out_bytes = bytes(raw) if not isinstance(raw, bytes) else raw
 
         out_path = tmp_path.parent / f'{jid}.glb'
