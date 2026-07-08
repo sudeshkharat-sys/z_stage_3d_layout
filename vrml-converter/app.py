@@ -1293,11 +1293,17 @@ def _decimate_mesh(mesh, target_reduction, agg=7.0):
     visual = mesh.visual
 
     try:
-        if (isinstance(visual, trimesh.visual.texture.TextureVisuals)
-                and visual.uv is not None and len(visual.uv) == len(pts)):
-            _, _, mapping = fs.replay_simplification(pts.astype(np.float32), tris, collapses)
-            new_uv = _average_by_mapping(visual.uv, mapping, len(dec_pts))
-            new_mesh.visual = trimesh.visual.texture.TextureVisuals(uv=new_uv, material=visual.material)
+        if isinstance(visual, trimesh.visual.texture.TextureVisuals):
+            if visual.uv is not None and len(visual.uv) == len(pts):
+                _, _, mapping = fs.replay_simplification(pts.astype(np.float32), tris, collapses)
+                new_uv = _average_by_mapping(visual.uv, mapping, len(dec_pts))
+                new_mesh.visual = trimesh.visual.texture.TextureVisuals(uv=new_uv, material=visual.material)
+            else:
+                # Flat/solid-color material with no texture image (very common for
+                # Blender objects that aren't textured) — no UV to remap, but the
+                # material itself must still be carried over or the object exports
+                # with no material at all and renders black/invisible.
+                new_mesh.visual = trimesh.visual.texture.TextureVisuals(material=visual.material)
         elif (visual.kind == 'vertex' and getattr(visual, 'vertex_colors', None) is not None
                 and len(visual.vertex_colors) == len(pts)):
             _, _, mapping = fs.replay_simplification(pts.astype(np.float32), tris, collapses)
