@@ -1,4 +1,4 @@
-"""VRML 1.0 + 2.0 / WRL → GLB / OBJ / STL Converter
+"""VRML 1.0 + 2.0 / WRL → GLB / OBJ / STL Converter, plus a GLB compressor
 
 Handles:
   - VRML 1.0 (Open Inventor) state machine: Coordinate3 + Material + IndexedFaceSet siblings
@@ -7,9 +7,12 @@ Handles:
   - Same-color mesh merging + vertex deduplication for smaller output
   - Server-Sent Events (SSE) real progress stream
   - Color mode: actual VRML colors or uniform light-gray
+  - Compress GLB tab: shrink GLB files (e.g. exported from Blender) by
+    resizing/recompressing textures and optionally decimating geometry
+    while preserving UVs and vertex colors
 
 Usage:
-    pip install flask trimesh[easy] numpy
+    pip install -r requirements.txt
     python app.py
 Open http://localhost:5555
 """
@@ -27,6 +30,7 @@ from pathlib import Path
 
 import numpy as np
 from flask import Flask, Response, jsonify, make_response, render_template_string, request, send_file
+from PIL import Image
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 logger = logging.getLogger(__name__)
@@ -64,7 +68,15 @@ HTML = r"""
   .card { background: #1e293b; border: 1px solid #334155; border-radius: 16px; padding: 2.5rem;
     width: 100%; max-width: 580px; box-shadow: 0 20px 60px rgba(0,0,0,0.5); }
   h1 { font-size: 1.6rem; color: #7dd3fc; margin-bottom: .25rem; }
-  .sub { color: #94a3b8; font-size: .9rem; margin-bottom: 2rem; }
+  .sub { color: #94a3b8; font-size: .9rem; margin-bottom: 1.5rem; }
+  .tabs { display: flex; gap: .5rem; margin-bottom: 1.75rem; border-bottom: 1px solid #334155; }
+  .tab { flex: 1; text-align: center; padding: .75rem .5rem; cursor: pointer; color: #94a3b8;
+    font-size: .92rem; font-weight: 600; border-bottom: 2px solid transparent; margin-bottom: -1px;
+    transition: all .15s; }
+  .tab:hover { color: #cbd5e1; }
+  .tab.active { color: #7dd3fc; border-bottom-color: #7dd3fc; }
+  .panel { display: none; }
+  .panel.active { display: block; }
   label { display: block; font-size: .85rem; color: #94a3b8; margin-bottom: .4rem; }
   .drop-zone { border: 2px dashed #334155; border-radius: 12px; padding: 2.5rem;
     text-align: center; cursor: pointer; transition: border-color .2s,background .2s; margin-bottom: 1.5rem; }
@@ -78,6 +90,7 @@ HTML = r"""
   select,input[type=number] { width: 100%; background: #0f172a; border: 1px solid #334155;
     border-radius: 8px; color: #e2e8f0; padding: .55rem .75rem; font-size: .9rem; }
   select:focus,input[type=number]:focus { outline: none; border-color: #7dd3fc; }
+  input[type=range] { width: 100%; accent-color: #7dd3fc; }
   .color-toggle { display: flex; gap: .5rem; }
   .color-btn { flex: 1; padding: .55rem .5rem; border-radius: 8px; border: 1px solid #334155;
     background: #0f172a; color: #94a3b8; font-size: .82rem; cursor: pointer; text-align: center;
@@ -96,120 +109,204 @@ HTML = r"""
   .result.ok  { background: #052e16; border: 1px solid #16a34a; color: #86efac; }
   .result.err { background: #2d0a0a; border: 1px solid #dc2626; color: #fca5a5; }
   .stats { margin-top: .5rem; font-size: .82rem; color: #64748b; line-height: 1.6; }
+  .dl-btn { display: inline-block; margin-top: 12px; padding: 10px 24px; background: #4caf50;
+    color: #fff; border-radius: 6px; text-decoration: none; font-weight: bold; }
 </style>
 </head>
 <body>
 <div class="card">
-  <h1>&#127922; VRML / WRL Converter</h1>
-  <p class="sub">VRML 1.0 &amp; 2.0 &mdash; runs locally on CPU</p>
-  <label>1. Choose your WRL / VRML file</label>
-  <div class="drop-zone" id="dropZone" onclick="document.getElementById('fileInput').click()">
-    <input type="file" id="fileInput" accept=".wrl,.vrml" onchange="onFileChosen(this)"/>
-    <div class="icon">&#128196;</div>
-    <div>Click to browse or drag &amp; drop</div>
-    <div class="hint">Supports .wrl &amp; .vrml &mdash; VRML 1.0 &amp; 2.0</div>
-    <div class="chosen" id="chosenName"></div>
+  <h1>&#127922; 3D Model Tools</h1>
+  <p class="sub">Runs locally on CPU</p>
+  <div class="tabs">
+    <div class="tab active" id="tabBtnConvert" onclick="showTab('convert')">VRML / WRL &rarr; GLB</div>
+    <div class="tab" id="tabBtnCompress" onclick="showTab('compress')">Compress GLB</div>
   </div>
-  <div class="row">
-    <div class="field">
-      <label>2. Output format</label>
-      <select id="outFmt">
-        <option value="glb">GLB</option>
-        <option value="obj">OBJ</option>
-        <option value="stl">STL</option>
-      </select>
+
+  <div class="panel active" id="panelConvert">
+    <label>1. Choose your WRL / VRML file</label>
+    <div class="drop-zone" id="dropZone" onclick="document.getElementById('fileInput').click()">
+      <input type="file" id="fileInput" accept=".wrl,.vrml" onchange="onFileChosen(this)"/>
+      <div class="icon">&#128196;</div>
+      <div>Click to browse or drag &amp; drop</div>
+      <div class="hint">Supports .wrl &amp; .vrml &mdash; VRML 1.0 &amp; 2.0</div>
+      <div class="chosen" id="chosenName"></div>
     </div>
-    <div class="field">
-      <label>3. Max faces <span style="color:#64748b;font-size:.78rem">(use 5M+ for large files)</span></label>
-      <input type="number" id="maxFaces" value="20000000" min="5000" max="100000000" step="500000"/>
+    <div class="row">
+      <div class="field">
+        <label>2. Output format</label>
+        <select id="outFmt">
+          <option value="glb">GLB</option>
+          <option value="obj">OBJ</option>
+          <option value="stl">STL</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>3. Max faces <span style="color:#64748b;font-size:.78rem">(use 5M+ for large files)</span></label>
+        <input type="number" id="maxFaces" value="20000000" min="5000" max="100000000" step="500000"/>
+      </div>
     </div>
-  </div>
-  <div style="margin-bottom:1.5rem">
-    <label>4. Color mode</label>
-    <div class="color-toggle">
-      <div class="color-btn active" id="btnActual" onclick="setColor('actual')">&#127912; Actual VRML colors</div>
-      <div class="color-btn" id="btnGray" onclick="setColor('gray')">&#9632; Uniform light gray</div>
+    <div style="margin-bottom:1.5rem">
+      <label>4. Color mode</label>
+      <div class="color-toggle">
+        <div class="color-btn active" id="btnActual" onclick="setColor('actual')">&#127912; Actual VRML colors</div>
+        <div class="color-btn" id="btnGray" onclick="setColor('gray')">&#9632; Uniform light gray</div>
+      </div>
     </div>
+    <button id="convertBtn" onclick="convert()" disabled>Convert</button>
+    <div class="progress-wrap" id="progressWrapConvert">
+      <div class="progress-bar"><div class="progress-fill" id="progressFillConvert"></div></div>
+      <div class="progress-label" id="progressLabelConvert">Starting…</div>
+    </div>
+    <div class="result" id="resultBoxConvert"></div>
   </div>
-  <button id="convertBtn" onclick="convert()" disabled>Convert</button>
-  <div class="progress-wrap" id="progressWrap">
-    <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
-    <div class="progress-label" id="progressLabel">Starting…</div>
+
+  <div class="panel" id="panelCompress">
+    <label>1. Choose a GLB file (e.g. exported from Blender)</label>
+    <div class="drop-zone" id="dropZoneGlb" onclick="document.getElementById('glbInput').click()">
+      <input type="file" id="glbInput" accept=".glb" onchange="onGlbChosen(this)"/>
+      <div class="icon">&#128230;</div>
+      <div>Click to browse or drag &amp; drop</div>
+      <div class="hint">.glb only</div>
+      <div class="chosen" id="chosenGlbName"></div>
+    </div>
+    <div class="row">
+      <div class="field">
+        <label>2. Max texture size</label>
+        <select id="texMaxSize">
+          <option value="0">Keep original</option>
+          <option value="2048">2048 px</option>
+          <option value="1024" selected>1024 px</option>
+          <option value="512">512 px</option>
+          <option value="256">256 px</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>3. Texture quality <span id="texQualityVal">75</span></label>
+        <input type="range" id="texQuality" min="30" max="95" value="75"
+          oninput="document.getElementById('texQualityVal').textContent=this.value"/>
+      </div>
+    </div>
+    <div style="margin-bottom:1.5rem">
+      <label>4. Geometry reduction <span id="geoReduceVal">0%</span>
+        <span style="color:#64748b;font-size:.78rem">(simplifies mesh shape &mdash; 0 = off)</span></label>
+      <input type="range" id="geoReduce" min="0" max="90" value="0"
+        oninput="document.getElementById('geoReduceVal').textContent=this.value+'%'"/>
+    </div>
+    <button id="compressBtn" onclick="compress()" disabled>Compress</button>
+    <div class="progress-wrap" id="progressWrapCompress">
+      <div class="progress-bar"><div class="progress-fill" id="progressFillCompress"></div></div>
+      <div class="progress-label" id="progressLabelCompress">Starting…</div>
+    </div>
+    <div class="result" id="resultBoxCompress"></div>
   </div>
-  <div class="result" id="resultBox"></div>
 </div>
 <script>
-let chosenFile=null, colorMode='actual', evtSrc=null;
-function showDone(d,jid){
-  const rb=document.getElementById('resultBox');
-  const btn=document.getElementById('convertBtn');
-  const pf=document.getElementById('progressFill');
-  const pl=document.getElementById('progressLabel');
-  pf.style.width='100%';pl.textContent='Done!';
-  const fname=(chosenFile?chosenFile.name.replace(/\.[^.]+$/,''):'model')+'.'+document.getElementById('outFmt').value;
-  rb.className='result ok';rb.style.display='block';
-  rb.innerHTML='✅ Converted!<div class="stats">Output size: '+fmt(d.size)+'<br/>Parts merged: '+d.parts+'<br/>Color mode: '+(colorMode==='actual'?'Actual VRML colors':'Uniform light gray')+'</div>'
-    +'<a href="/download/'+jid+'" download="'+fname+'" style="display:inline-block;margin-top:12px;padding:10px 24px;background:#4caf50;color:#fff;border-radius:6px;text-decoration:none;font-weight:bold;">⬇ Download '+fname+'</a>';
-  btn.disabled=false;
+function showTab(name){
+  document.getElementById('tabBtnConvert').classList.toggle('active', name==='convert');
+  document.getElementById('tabBtnCompress').classList.toggle('active', name==='compress');
+  document.getElementById('panelConvert').classList.toggle('active', name==='convert');
+  document.getElementById('panelCompress').classList.toggle('active', name==='compress');
 }
+function fmt(b){if(b>1e9)return(b/1e9).toFixed(1)+' GB';if(b>1e6)return(b/1e6).toFixed(1)+' MB';return(b/1e3).toFixed(0)+' KB';}
+
+// ── Shared job runner (upload → SSE progress → done/error) ──────────────────
+function runJob(endpoint, form, els, onDone){
+  if(els.evtSrc){els.evtSrc.close();els.evtSrc=null;}
+  els.btn.disabled=true; els.rb.style.display='none'; els.pw.style.display='block';
+  els.pf.style.width='2%'; els.pl.textContent='Uploading…';
+  (async()=>{
+    let startRes;
+    try{
+      const r=await fetch(endpoint,{method:'POST',body:form});
+      startRes=await r.json();
+      if(!r.ok){fail(startRes.detail||'Upload failed.');return;}
+    }catch(e){fail('Network error during upload.');return;}
+    const jid=startRes.job_id;
+    els.evtSrc=new EventSource('/progress/'+jid);
+    els.evtSrc.onmessage=e=>{
+      const d=JSON.parse(e.data);
+      els.pf.style.width=d.pct+'%'; els.pl.textContent=d.label+' ('+d.pct+'%)';
+      if(d.status==='done'){els.evtSrc.close();els.evtSrc=null;els.pf.style.width='100%';els.pl.textContent='Done!';onDone(d,jid);els.btn.disabled=false;}
+      else if(d.status==='error'){els.evtSrc.close();els.evtSrc=null;fail(d.error);}
+    };
+    els.evtSrc.onerror=()=>{
+      if(els.evtSrc){els.evtSrc.close();els.evtSrc=null;}
+      els.pl.textContent='Reconnecting…';
+      const poll=setInterval(async()=>{
+        try{
+          const r=await fetch('/progress/'+jid+'/once');
+          if(!r.ok)return;
+          const d=await r.json();
+          els.pf.style.width=d.pct+'%';els.pl.textContent=d.label+' ('+d.pct+'%)';
+          if(d.status==='done'){clearInterval(poll);els.pf.style.width='100%';els.pl.textContent='Done!';onDone(d,jid);els.btn.disabled=false;}
+          else if(d.status==='error'){clearInterval(poll);fail(d.error);}
+        }catch(e){}
+      },2000);
+    };
+  })();
+  function fail(msg){els.rb.className='result err';els.rb.style.display='block';els.rb.textContent='✗ '+msg;els.btn.disabled=false;}
+}
+
+// ── Tab 1: VRML/WRL → GLB/OBJ/STL ────────────────────────────────────────────
+let chosenFile=null, colorMode='actual';
+const convertEls={btn:null,pw:null,pf:null,pl:null,rb:null,evtSrc:null};
 const dz=document.getElementById('dropZone');
 dz.addEventListener('dragover',e=>{e.preventDefault();dz.classList.add('dragover');});
 dz.addEventListener('dragleave',()=>dz.classList.remove('dragover'));
 dz.addEventListener('drop',e=>{e.preventDefault();dz.classList.remove('dragover');const f=e.dataTransfer.files[0];if(f)setFile(f);});
 function onFileChosen(i){if(i.files[0])setFile(i.files[0]);}
 function setFile(f){chosenFile=f;document.getElementById('chosenName').textContent=f.name+'  ('+fmt(f.size)+')';document.getElementById('convertBtn').disabled=false;}
-function fmt(b){if(b>1e9)return(b/1e9).toFixed(1)+' GB';if(b>1e6)return(b/1e6).toFixed(1)+' MB';return(b/1e3).toFixed(0)+' KB';}
 function setColor(m){colorMode=m;document.getElementById('btnActual').classList.toggle('active',m==='actual');document.getElementById('btnGray').classList.toggle('active',m==='gray');}
-async function convert(){
+function convert(){
   if(!chosenFile)return;
-  if(evtSrc){evtSrc.close();evtSrc=null;}
-  const btn=document.getElementById('convertBtn'),pw=document.getElementById('progressWrap'),
-    pf=document.getElementById('progressFill'),pl=document.getElementById('progressLabel'),rb=document.getElementById('resultBox');
-  btn.disabled=true;rb.style.display='none';pw.style.display='block';pf.style.width='2%';pl.textContent='Uploading…';
   const form=new FormData();
   form.append('file',chosenFile);
   form.append('out_format',document.getElementById('outFmt').value);
   form.append('max_faces',document.getElementById('maxFaces').value);
   form.append('color_mode',colorMode);
-  let startRes;
-  try{
-    const r=await fetch('/start',{method:'POST',body:form});
-    startRes=await r.json();
-    if(!r.ok){rb.className='result err';rb.style.display='block';rb.textContent='✗ '+(startRes.detail||'Upload failed.');btn.disabled=false;return;}
-  }catch(e){rb.className='result err';rb.style.display='block';rb.textContent='✗ Network error during upload.';btn.disabled=false;return;}
-  const jid=startRes.job_id;
-  evtSrc=new EventSource('/progress/'+jid);
-  evtSrc.onmessage=e=>{
-    const d=JSON.parse(e.data);
-    pf.style.width=d.pct+'%';
-    pl.textContent=d.label+' ('+d.pct+'%)';
-    if(d.status==='done'){
-      evtSrc.close();evtSrc=null;
-      showDone(d,jid);
-    }else if(d.status==='error'){
-      evtSrc.close();evtSrc=null;
-      rb.className='result err';rb.style.display='block';rb.textContent='✗ '+d.error;
-      btn.disabled=false;
-    }
-  };
-  evtSrc.onerror=()=>{
-    if(evtSrc){evtSrc.close();evtSrc=null;}
-    pl.textContent='Reconnecting…';
-    const poll=setInterval(async()=>{
-      try{
-        const r=await fetch('/progress/'+jid+'/once');
-        if(!r.ok)return;
-        const d=await r.json();
-        pf.style.width=d.pct+'%';pl.textContent=d.label+' ('+d.pct+'%)';
-        if(d.status==='done'){clearInterval(poll);showDone(d,jid);}
-        else if(d.status==='error'){
-          clearInterval(poll);
-          rb.className='result err';rb.style.display='block';rb.textContent='✗ '+d.error;
-          btn.disabled=false;
-        }
-      }catch(e){}
-    },2000);
-  };
+  convertEls.btn=document.getElementById('convertBtn');
+  convertEls.pw=document.getElementById('progressWrapConvert');
+  convertEls.pf=document.getElementById('progressFillConvert');
+  convertEls.pl=document.getElementById('progressLabelConvert');
+  convertEls.rb=document.getElementById('resultBoxConvert');
+  runJob('/start', form, convertEls, (d,jid)=>{
+    const fname=(chosenFile.name.replace(/\.[^.]+$/,''))+'.'+document.getElementById('outFmt').value;
+    const rb=convertEls.rb;
+    rb.className='result ok';rb.style.display='block';
+    rb.innerHTML='✅ Converted!<div class="stats">Output size: '+fmt(d.size)+'<br/>Parts merged: '+d.parts+'<br/>Color mode: '+(colorMode==='actual'?'Actual VRML colors':'Uniform light gray')+'</div>'
+      +'<a href="/download/'+jid+'" download="'+fname+'" class="dl-btn">⬇ Download '+fname+'</a>';
+  });
+}
+
+// ── Tab 2: Compress GLB ──────────────────────────────────────────────────────
+let chosenGlb=null;
+const compressEls={btn:null,pw:null,pf:null,pl:null,rb:null,evtSrc:null};
+const dzGlb=document.getElementById('dropZoneGlb');
+dzGlb.addEventListener('dragover',e=>{e.preventDefault();dzGlb.classList.add('dragover');});
+dzGlb.addEventListener('dragleave',()=>dzGlb.classList.remove('dragover'));
+dzGlb.addEventListener('drop',e=>{e.preventDefault();dzGlb.classList.remove('dragover');const f=e.dataTransfer.files[0];if(f)setGlb(f);});
+function onGlbChosen(i){if(i.files[0])setGlb(i.files[0]);}
+function setGlb(f){chosenGlb=f;document.getElementById('chosenGlbName').textContent=f.name+'  ('+fmt(f.size)+')';document.getElementById('compressBtn').disabled=false;}
+function compress(){
+  if(!chosenGlb)return;
+  const form=new FormData();
+  form.append('file',chosenGlb);
+  form.append('tex_max_size',document.getElementById('texMaxSize').value);
+  form.append('tex_quality',document.getElementById('texQuality').value);
+  form.append('geo_reduce',document.getElementById('geoReduce').value);
+  compressEls.btn=document.getElementById('compressBtn');
+  compressEls.pw=document.getElementById('progressWrapCompress');
+  compressEls.pf=document.getElementById('progressFillCompress');
+  compressEls.pl=document.getElementById('progressLabelCompress');
+  compressEls.rb=document.getElementById('resultBoxCompress');
+  runJob('/start_compress', form, compressEls, (d,jid)=>{
+    const fname=(chosenGlb.name.replace(/\.[^.]+$/,''))+'_compressed.glb';
+    const rb=compressEls.rb;
+    const pct=d.orig_size?Math.round((1-d.size/d.orig_size)*100):0;
+    rb.className='result ok';rb.style.display='block';
+    rb.innerHTML='✅ Compressed!<div class="stats">'+fmt(d.orig_size)+' &rarr; '+fmt(d.size)+' ('+pct+'% smaller)<br/>Faces: '+d.faces_before+' &rarr; '+d.faces_after+'<br/>Textures processed: '+d.textures_processed+'</div>'
+      +'<a href="/download/'+jid+'" download="'+fname+'" class="dl-btn">⬇ Download '+fname+'</a>';
+  });
 }
 </script>
 </body></html>
@@ -1064,6 +1161,185 @@ def _build_glb_scene(meshes):
     return bytes(raw) if not isinstance(raw, bytes) else raw
 
 
+# ── GLB compression ─────────────────────────────────────────────────────────────
+def _compress_image(img, max_size, quality):
+    """Resize (if needed) and re-encode a PIL image for a smaller GLB.
+
+    Opaque images are converted to JPEG (lossy, much smaller); images with
+    actual transparency stay PNG so alpha isn't destroyed. Always round-trips
+    through save+reopen so ``img.format`` reflects the new encoding — trimesh's
+    GLB exporter keys off that attribute to decide how to embed the texture.
+    """
+    orig_img = img
+    resized = False
+    w, h = img.size
+    if max_size and max(w, h) > max_size:
+        scale = max_size / max(w, h)
+        img = img.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS)
+        resized = True
+
+    has_alpha = False
+    if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
+        img = img.convert('RGBA')
+        if img.getchannel('A').getextrema()[0] < 255:
+            has_alpha = True
+
+    buf = io.BytesIO()
+    if has_alpha:
+        img.save(buf, format='PNG', optimize=True)
+    else:
+        img.convert('RGB').save(buf, format='JPEG', quality=quality, optimize=True)
+
+    if not resized:
+        # Re-encoding without resizing can backfire on already-small/simple
+        # images (e.g. a flat-color PNG re-encoded as JPEG can grow). Only
+        # keep the new encoding if it's actually smaller than the original.
+        orig_buf = io.BytesIO()
+        try:
+            orig_img.save(orig_buf, format=orig_img.format or ('PNG' if has_alpha else 'JPEG'))
+            if buf.tell() >= orig_buf.tell():
+                return orig_img, False
+        except Exception:
+            pass
+
+    buf.seek(0)
+    new_img = Image.open(buf)
+    new_img.load()
+    return new_img, True
+
+
+def _compress_material_textures(material, max_size, quality):
+    """Resize/recompress every PIL image on a trimesh material in place."""
+    changed = False
+    if hasattr(material, 'image') and material.image is not None:
+        new_img, did = _compress_image(material.image, max_size, quality)
+        if did:
+            material.image = new_img
+            changed = True
+    for attr in ('baseColorTexture', 'metallicRoughnessTexture', 'normalTexture',
+                 'occlusionTexture', 'emissiveTexture'):
+        img = getattr(material, attr, None)
+        if img is not None:
+            new_img, did = _compress_image(img, max_size, quality)
+            if did:
+                setattr(material, attr, new_img)
+                changed = True
+    return changed
+
+
+def _average_by_mapping(values, mapping, n_new):
+    """Average per-vertex attribute rows into n_new groups given a mapping array."""
+    values = np.asarray(values, dtype=np.float64)
+    out = np.zeros((n_new, values.shape[1]), dtype=np.float64)
+    counts = np.zeros(n_new, dtype=np.float64)
+    np.add.at(out, mapping, values)
+    np.add.at(counts, mapping, 1)
+    counts[counts == 0] = 1
+    return out / counts[:, None]
+
+
+def _decimate_mesh(mesh, target_reduction, agg=7.0):
+    """Reduce a mesh's face count while preserving UV / vertex-color data.
+
+    trimesh's built-in simplify_quadric_decimation drops texture UVs and
+    vertex colors entirely, which would blank out Blender-exported materials.
+    fast_simplification's collapse history lets us replay the same decimation
+    against those per-vertex attributes and carry them over.
+    Falls back to the original mesh untouched if anything goes wrong.
+    """
+    import trimesh
+    import fast_simplification as fs
+
+    n_faces = len(mesh.faces)
+    target_count = max(4, int(n_faces * (1 - target_reduction)))
+    if n_faces < 12 or target_count >= n_faces:
+        return mesh, False
+
+    pts  = np.asarray(mesh.vertices, dtype=np.float64)
+    tris = np.asarray(mesh.faces, dtype=np.int32)
+
+    try:
+        dec_pts, dec_tris, collapses = fs.simplify(
+            pts, tris, target_count=target_count, agg=agg, return_collapses=True)
+    except Exception as exc:
+        logger.warning('Decimation skipped for a mesh (%d faces): %s', n_faces, exc)
+        return mesh, False
+
+    if len(dec_tris) == 0 or len(dec_pts) == 0:
+        return mesh, False
+
+    new_mesh = trimesh.Trimesh(vertices=dec_pts, faces=dec_tris, process=False)
+    visual = mesh.visual
+
+    try:
+        if (isinstance(visual, trimesh.visual.texture.TextureVisuals)
+                and visual.uv is not None and len(visual.uv) == len(pts)):
+            _, _, mapping = fs.replay_simplification(pts.astype(np.float32), tris, collapses)
+            new_uv = _average_by_mapping(visual.uv, mapping, len(dec_pts))
+            new_mesh.visual = trimesh.visual.texture.TextureVisuals(uv=new_uv, material=visual.material)
+        elif (visual.kind == 'vertex' and getattr(visual, 'vertex_colors', None) is not None
+                and len(visual.vertex_colors) == len(pts)):
+            _, _, mapping = fs.replay_simplification(pts.astype(np.float32), tris, collapses)
+            new_colors = _average_by_mapping(visual.vertex_colors, mapping, len(dec_pts))
+            new_mesh.visual.vertex_colors = np.clip(new_colors, 0, 255).astype(np.uint8)
+    except Exception as exc:
+        logger.warning('Visual remap after decimation failed, keeping geometry only: %s', exc)
+
+    return new_mesh, True
+
+
+def _run_compress_job(jid, tmp_path, tex_max_size, tex_quality, geo_reduce_pct):
+    try:
+        import trimesh
+
+        orig_size = tmp_path.stat().st_size
+        _job_set(jid, pct=8, label='Loading GLB…')
+        scene = trimesh.load(tmp_path, file_type='glb', process=False, force='scene')
+
+        geoms = list(scene.geometry.items())
+        n = max(len(geoms), 1)
+        faces_before = sum(len(g.faces) for _, g in geoms)
+        textures_processed = 0
+        target_reduction = geo_reduce_pct / 100.0
+
+        for i, (name, mesh) in enumerate(geoms):
+            _job_set(jid, pct=10 + int(80 * i / n), label=f'Processing part {i + 1}/{n}…')
+
+            if hasattr(mesh.visual, 'material') and mesh.visual.material is not None:
+                if _compress_material_textures(mesh.visual.material, tex_max_size, tex_quality):
+                    textures_processed += 1
+
+            if target_reduction > 0:
+                new_mesh, changed = _decimate_mesh(mesh, target_reduction)
+                if changed:
+                    scene.geometry[name] = new_mesh
+
+        faces_after = sum(len(g.faces) for g in scene.geometry.values())
+
+        _job_set(jid, pct=92, label='Exporting GLB…')
+        raw = scene.export(file_type='glb')
+        out_bytes = bytes(raw) if not isinstance(raw, bytes) else raw
+
+        out_path = tmp_path.parent / f'{jid}.glb'
+        out_path.write_bytes(out_bytes)
+
+        _job_set(jid, pct=100, label='Done!', status='done', out_path=str(out_path),
+                 size=len(out_bytes), orig_size=orig_size,
+                 faces_before=faces_before, faces_after=faces_after,
+                 textures_processed=textures_processed)
+        logger.info('Compress job %s done: %.2f MB -> %.2f MB (%d -> %d faces)',
+                    jid, orig_size / 1e6, len(out_bytes) / 1e6, faces_before, faces_after)
+
+    except Exception:
+        logger.error('Compress job %s failed:\n%s', jid, traceback.format_exc())
+        _job_set(jid, status='error', error='Compression failed — check server log.')
+    finally:
+        try:
+            tmp_path.unlink()
+        except Exception:
+            pass
+
+
 # ── Background job ─────────────────────────────────────────────────────────────
 def _run_job(jid, tmp_path, out_format, max_faces, color_mode):
     try:
@@ -1155,6 +1431,36 @@ def start():
     return jsonify(job_id=jid)
 
 
+@app.route('/start_compress', methods=['POST'])
+def start_compress():
+    f = request.files.get('file')
+    if not f or not f.filename:
+        return jsonify(detail='No file received.'), 400
+    ext = f.filename.rsplit('.', 1)[-1].lower()
+    if ext != 'glb':
+        return jsonify(detail=f'Only .glb supported (got .{ext}).'), 400
+
+    tex_max_size = max(0, min(int(request.form.get('tex_max_size', 1024) or 0), 8192))
+    tex_quality  = max(30, min(int(request.form.get('tex_quality', 75)), 95))
+    geo_reduce   = max(0, min(int(request.form.get('geo_reduce', 0)), 90))
+
+    with tempfile.NamedTemporaryFile(suffix='.glb', delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+        f.save(tmp)
+
+    jid = str(uuid.uuid4())
+    orig_stem = f.filename.rsplit('.', 1)[0] + '_compressed'
+    with _jobs_lock:
+        _jobs[jid] = {'status': 'running', 'pct': 2, 'label': 'Queued…',
+                      'format': 'glb', 'orig_stem': orig_stem, 'size': 0,
+                      'orig_size': 0, 'faces_before': 0, 'faces_after': 0,
+                      'textures_processed': 0, 'error': ''}
+    threading.Thread(target=_run_compress_job,
+                     args=(jid, tmp_path, tex_max_size, tex_quality, geo_reduce),
+                     daemon=True).start()
+    return jsonify(job_id=jid)
+
+
 @app.route('/progress/<jid>')
 def progress(jid):
     def generate():
@@ -1171,6 +1477,10 @@ def progress(jid):
                 'parts':  job.get('parts', 0),
                 'size':   job.get('size', 0),
                 'error':  job.get('error', ''),
+                'orig_size':          job.get('orig_size', 0),
+                'faces_before':       job.get('faces_before', 0),
+                'faces_after':        job.get('faces_after', 0),
+                'textures_processed': job.get('textures_processed', 0),
             }
             yield f'data: {json.dumps(payload)}\n\n'
             if job.get('status') in ('done', 'error'):
@@ -1193,7 +1503,9 @@ def progress_once(jid):
         return jsonify(status='error', error='Job not found', pct=0, label='Error')
     return jsonify(pct=job.get('pct',0), label=job.get('label','…'),
                    status=job.get('status','running'), parts=job.get('parts',0),
-                   size=job.get('size',0), error=job.get('error',''))
+                   size=job.get('size',0), error=job.get('error',''),
+                   orig_size=job.get('orig_size',0), faces_before=job.get('faces_before',0),
+                   faces_after=job.get('faces_after',0), textures_processed=job.get('textures_processed',0))
 
 
 @app.route('/download/<jid>')

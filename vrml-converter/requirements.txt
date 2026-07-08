@@ -1,3 +1,5 @@
 flask
 trimesh[easy]
 numpy
+pillow
+fast-simplification
