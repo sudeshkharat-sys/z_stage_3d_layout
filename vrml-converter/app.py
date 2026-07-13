@@ -293,7 +293,12 @@ function convert(){
     const fname=(chosenFile.name.replace(/\.[^.]+$/,''))+'.'+document.getElementById('outFmt').value;
     const rb=convertEls.rb;
     rb.className='result ok';rb.style.display='block';
+    let warnHtml='';
+    if(d.warnings&&d.warnings.length){
+      warnHtml='<div style="margin-top:.6rem;padding:.6rem .8rem;background:#3b2405;border:1px solid #d97706;border-radius:8px;color:#fbbf24;font-size:.82rem;line-height:1.5">⚠ '+d.warnings.join('<br/>⚠ ')+'</div>';
+    }
     rb.innerHTML='✅ Converted!<div class="stats">Output size: '+fmt(d.size)+'<br/>Parts merged: '+d.parts+'<br/>Color mode: '+(colorMode==='actual'?'Actual VRML colors':'Uniform light gray')+'</div>'
+      +warnHtml
       +'<a href="/download/'+jid+'" download="'+fname+'" class="dl-btn">⬇ Download '+fname+'</a>';
   });
 }
@@ -346,12 +351,16 @@ _DIRECT_RE = re.compile(
     r'|Material|MaterialBinding|Normal|NormalBinding|ShapeHints'
     r'|Info|Texture2|Texture2Transform|TextureCoordinate2'
     r'|PointLight|DirectionalLight|SpotLight|OrthographicCamera|PerspectiveCamera'
-    r'|Cube|Sphere|Cone|Cylinder|AsciiText'
+    r'|Cube|Box|Sphere|Cone|Cylinder|AsciiText'
+    r'|Translation|Rotation|Scale'
     r'|FontStyle|DrawStyle|LightModel|BaseColor|PackedColor'
     r'|EnvironmentMap|ShapeKit|WWWAnchor|WWWInline'
     r'|Shape|Appearance|Coordinate|Anchor|Billboard|Collision'
     r')\s*\{'
 )
+
+_PRIMITIVE_NODES = frozenset({'Cube', 'Box', 'Sphere', 'Cone', 'Cylinder'})
+_INLINE_RE = re.compile(r'\b(?:WWWInline|Inline)\s*\{')
 
 _DEF_RE            = re.compile(r'\bDEF\s+(\S+)\s+(\w+)\s*\{')
 _USE_STANDALONE_RE = re.compile(r'(?<!\w)USE\s+(\S+)')
@@ -385,6 +394,26 @@ _COORD_FIELD_RE = re.compile(r'\bcoord\s+(?:DEF\s+\S+\s+)?Coordinate\s*\{')
 _COORD_USE_RE   = re.compile(r'\bcoord\s+USE\s+(\S+)')
 
 _DEFAULT_COLOR = (230, 230, 230, 255)
+
+# Quoted strings are matched first so a '#' inside "..." isn't treated as a
+# comment; comments run to end-of-line.
+_COMMENT_OR_STRING_RE = re.compile(r'"(?:[^"\\\n]|\\.)*"|#[^\r\n]*')
+
+
+def _strip_comments(text):
+    """Blank out VRML comments, preserving every character position.
+
+    CAD exporters commonly emit one '# part name' comment per part. A brace,
+    bracket or number inside a comment corrupts the brace index and the
+    numeric field parsers (np.fromstring stops — or on NumPy >= 2 raises —
+    at the first non-numeric token), which shows up as misplaced/missing
+    geometry or a crash. Comments are replaced with same-length whitespace
+    so all previously computed character offsets stay valid.
+    """
+    def repl(m):
+        s = m.group(0)
+        return s if s[0] == '"' else ' ' * len(s)
+    return _COMMENT_OR_STRING_RE.sub(repl, text)
 
 
 # ── Index builders ─────────────────────────────────────────────────────────────
@@ -504,8 +533,18 @@ def _parse_floats(text, pos_tuple):
 
 def _parse_face_indices(text, start, end):
     raw = text[start:end].replace(',', ' ')
-    arr = np.fromstring(raw, dtype=np.int32, sep=' ')
-    return arr if len(arr) > 0 else np.array([], dtype=np.int32)
+    # NumPy >= 2 raises ValueError (instead of returning a silent partial
+    # parse) when the string contains any non-numeric token — without the
+    # fallback a single stray token killed the whole conversion.
+    try:
+        arr = np.fromstring(raw, dtype=np.int32, sep=' ')
+        if len(arr) > 0:
+            return arr
+    except Exception:
+        pass
+    nums = _NUM_RE.findall(raw)
+    return (np.array(nums, dtype=np.float64).astype(np.int32)
+            if nums else np.array([], dtype=np.int32))
 
 
 def _build_faces(indices):
@@ -529,23 +568,25 @@ def _build_faces(indices):
         t1 = q[:, [0, 1, 2]]
         t2 = q[:, [0, 2, 3]]
         return np.concatenate([t1, t2], axis=0).astype(np.int32)
-    # General fallback — mixed polygon sizes (pentagons etc.)
-    faces = []
-    fan = []
-    for idx in indices:
-        if idx < 0:
-            if len(fan) >= 3:
-                v0 = fan[0]
-                for j in range(1, len(fan) - 1):
-                    faces.append((v0, fan[j], fan[j + 1]))
-            fan = []
-        else:
-            fan.append(int(idx))
-    if len(fan) >= 3:
-        v0 = fan[0]
-        for j in range(1, len(fan) - 1):
-            faces.append((v0, fan[j], fan[j + 1]))
-    return np.array(faces, dtype=np.int32) if faces else np.empty((0, 3), dtype=np.int32)
+    # General fallback — mixed polygon sizes, fully vectorized. The previous
+    # per-index Python loop took minutes-to-hours on assemblies with tens of
+    # millions of indices, which looked like a hang/crash.
+    neg = np.flatnonzero(indices < 0)
+    starts = np.concatenate([[0], neg + 1])
+    ends   = np.concatenate([neg, [len(indices)]])
+    lens   = ends - starts
+    valid  = lens >= 3
+    starts, lens = starts[valid], lens[valid]
+    if len(starts) == 0:
+        return np.empty((0, 3), dtype=np.int32)
+    tri_counts = lens - 2
+    total = int(tri_counts.sum())
+    poly = np.repeat(np.arange(len(starts)), tri_counts)
+    # fan-triangulation offset of each triangle within its polygon
+    t = np.arange(total) - np.repeat(np.cumsum(tri_counts) - tri_counts, tri_counts)
+    s = starts[poly]
+    return np.stack([indices[s], indices[s + t + 1], indices[s + t + 2]],
+                    axis=1).astype(np.int32)
 
 
 def _appearance_color(text, prescan, def_map, acs, ace, fallback):
@@ -641,6 +682,118 @@ def _direct_children(prescan, scope_cs, scope_ce):
             yield nt, pos, ncs, nce
             # Jump past all grandchildren nested inside this child
             idx = int(np.searchsorted(positions, nce + 1))
+
+
+def _mask_braced(s):
+    """Drop any {...} blocks (unknown child nodes) from assembled field text."""
+    if '{' not in s:
+        return s
+    out, depth, last = [], 0, 0
+    for m in _BRACE_RE.finditer(s):
+        if m.group() == '{':
+            if depth == 0:
+                out.append(s[last:m.start()])
+            depth += 1
+        elif depth > 0:
+            depth -= 1
+            if depth == 0:
+                last = m.end()
+    if depth == 0:
+        out.append(s[last:])
+    return ' '.join(out)
+
+
+def _own_field_text(text, prescan, ncs, nce):
+    """Return a node's scope text with all direct-child node bodies removed.
+
+    Used to parse a Transform's own translation/rotation/scale/center fields:
+    - fields written AFTER `children [...]` are still found (the old approach
+      cut off at the first nested '{' and missed them → parts stuck at origin);
+    - fields belonging to descendants (e.g. Texture2Transform's own
+      translation/scale/center) can never be matched by mistake.
+    """
+    positions, node_types, cs_arr, ce_arr, is_use_arr = prescan
+    segs, pos = [], ncs
+    idx = int(np.searchsorted(positions, ncs))
+    while idx < len(positions):
+        p = int(positions[idx])
+        if p >= nce:
+            break
+        if bool(is_use_arr[idx]):
+            idx += 1          # zero-width USE reference — keep scanning
+            continue
+        cce = int(ce_arr[idx])
+        if cce > nce:
+            idx += 1          # spans beyond scope — not a direct child
+            continue
+        if p > pos:
+            segs.append(text[pos:p])
+        pos = cce + 1
+        idx = int(np.searchsorted(positions, cce + 1))
+    if pos < nce:
+        segs.append(text[pos:nce])
+    return _mask_braced(' '.join(segs))
+
+
+_PRIM_SIZE_RE = {}   # field-name regex cache for primitive parsing
+
+
+def _prim_field(hdr, name, default):
+    rx = _PRIM_SIZE_RE.get(name)
+    if rx is None:
+        rx = _PRIM_SIZE_RE[name] = re.compile(rf'\b{name}\s+({_FLT})')
+    m = rx.search(hdr)
+    return float(m.group(1)) if m else default
+
+
+_BOX_SIZE_RE = re.compile(rf'\bsize\s+({_FLT}){_SEP}({_FLT}){_SEP}({_FLT})')
+# Rotate +Z axis to +Y: VRML cylinders/cones are Y-aligned, trimesh's are Z-aligned.
+_Z_TO_Y = np.array([[1, 0, 0, 0],
+                    [0, 0, 1, 0],
+                    [0, -1, 0, 0],
+                    [0, 0, 0, 1]], dtype=np.float64)
+
+
+def _primitive_mesh(node, text, ncs, nce):
+    """Build (vertices, faces) for a VRML primitive node, or None.
+
+    Assembly files often model frames/guards/floors with primitives; skipping
+    them silently loses those parts.
+    """
+    import trimesh
+    hdr = text[ncs:min(nce, ncs + 400)]
+    try:
+        if node in ('Cube', 'Box'):
+            if node == 'Box':
+                m = _BOX_SIZE_RE.search(hdr)
+                dims = [float(m.group(i)) for i in (1, 2, 3)] if m else [2.0, 2.0, 2.0]
+            else:
+                dims = [_prim_field(hdr, 'width', 2.0),
+                        _prim_field(hdr, 'height', 2.0),
+                        _prim_field(hdr, 'depth', 2.0)]
+            mesh = trimesh.creation.box(extents=dims)
+        elif node == 'Sphere':
+            mesh = trimesh.creation.icosphere(subdivisions=2,
+                                              radius=_prim_field(hdr, 'radius', 1.0))
+        elif node == 'Cylinder':
+            mesh = trimesh.creation.cylinder(radius=_prim_field(hdr, 'radius', 1.0),
+                                             height=_prim_field(hdr, 'height', 2.0),
+                                             sections=32)
+            mesh.apply_transform(_Z_TO_Y)
+        elif node == 'Cone':
+            mesh = trimesh.creation.cone(radius=_prim_field(hdr, 'bottomRadius', 1.0),
+                                         height=_prim_field(hdr, 'height', 2.0),
+                                         sections=32)
+            zmin, zmax = mesh.bounds[0][2], mesh.bounds[1][2]
+            mesh.apply_translation([0, 0, -(zmin + zmax) / 2.0])  # VRML cones are centered
+            mesh.apply_transform(_Z_TO_Y)
+        else:
+            return None
+        return (np.asarray(mesh.vertices, dtype=np.float64),
+                np.asarray(mesh.faces, dtype=np.int32))
+    except Exception as exc:
+        logger.warning('Primitive %s failed to build: %s', node, exc)
+        return None
 
 
 # ── Inline coord resolver ──────────────────────────────────────────────────────
@@ -804,6 +957,22 @@ class _MeshCollector:
         self.total_faces += len(faces)
         return True
 
+    def add_raw(self, verts, faces, transform, color):
+        """Add pre-built geometry (e.g. a primitive mesh) to the color groups."""
+        if self.total_faces >= self.max_faces:
+            self.skipped += 1
+            return
+        verts = np.asarray(verts, dtype=np.float64)
+        if not np.allclose(transform, np.eye(4)):
+            h = np.hstack([verts, np.ones((len(verts), 1), dtype=np.float64)])
+            verts = (h @ transform.T)[:, :3]
+        color_key = tuple(color)
+        g = self._groups.setdefault(color_key, {'verts': [], 'faces': [], 'offset': 0})
+        g['faces'].append(np.asarray(faces, dtype=np.int32) + g['offset'])
+        g['verts'].append(verts)
+        g['offset'] += len(verts)
+        self.total_faces += len(faces)
+
     def finalize(self):
         import trimesh
         result = []
@@ -812,6 +981,9 @@ class _MeshCollector:
                 continue
             verts = np.concatenate(g['verts'])
             faces = np.concatenate(g['faces'])
+            # Free the per-chunk arrays as we go — halves peak memory on
+            # multi-GB assemblies.
+            g['verts'] = g['faces'] = None
             try:
                 m = trimesh.Trimesh(vertices=verts, faces=faces, process=True)
             except Exception:
@@ -861,12 +1033,24 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                 if vm:
                     mat = np.array([float(vm.group(i)) for i in range(1, 17)],
                                    dtype=np.float64).reshape(4, 4)
+                    # VRML 1.0 / Open Inventor stores matrices in row-vector
+                    # form: translation in the 4th ROW (elements 13-15). Our
+                    # pipeline is column-vector (translation in the 4th
+                    # column), so the spec form must be transposed — without
+                    # it every MatrixTransform translation was dropped and
+                    # rotations were inverted, scattering parts ("floating").
+                    # Some non-conforming exporters already write the
+                    # column form; detect via which slot holds the affine
+                    # [0 0 0 1] and only skip the transpose when the matrix
+                    # is unambiguously column-form.
+                    row_form = np.allclose(mat[:, 3], (0, 0, 0, 1), atol=1e-9)
+                    col_form = np.allclose(mat[3, :], (0, 0, 0, 1), atol=1e-9)
+                    if not (col_form and not row_form):
+                        mat = mat.T
                     if not hasattr(_walk, '_logged_mtx'):
                         _walk._logged_mtx = True
-                        logger.info('FIRST MatrixTransform raw 4x4:\n%s', mat)
-                        logger.info('  row3(OI translation?) = %s', mat[3, :3])
-                        logger.info('  col3(GL translation?) = %s', mat[:3, 3])
-                        logger.info('  raw text snippet: %r', text[ncs:min(ncs+120, nce)])
+                        logger.info('FIRST MatrixTransform (row_form=%s col_form=%s):\n%s',
+                                    row_form, col_form, mat)
                     _mtx_parsed[0] += 1
                     current_matrix = current_matrix @ mat
                 else:
@@ -877,16 +1061,13 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                 stack.append((ncs, nce, current_matrix, current_coord, list(current_color)))
 
             elif node == 'Transform':
-                # Restrict the field search to text BEFORE the first nested '{' —
-                # Transform's own translation/rotation/scale/center fields are flat
-                # scalars with no braces of their own. Without this cutoff, a 600-char
-                # slice can spill into a child Shape's Appearance/Texture2Transform,
-                # which has its OWN unrelated "center"/"scale"/"translation"/"rotation"
-                # fields (texture-coordinate transform) — picking those up here sends
-                # the part flying to a wrong location (or off into space / "blank").
-                brace_pos = text.find('{', ncs, nce)
-                hdr_end = brace_pos if brace_pos != -1 else nce
-                hdr = text[ncs:hdr_end]
+                # Parse only the Transform's OWN fields: take the scope text
+                # with all direct-child node bodies removed. This both keeps
+                # a child's Texture2Transform "translation"/"scale"/"center"
+                # from being matched by mistake AND still finds fields some
+                # exporters write AFTER `children [...]` (the old first-'{'
+                # cutoff missed those entirely → parts stuck at the origin).
+                hdr = _own_field_text(text, prescan, ncs, nce)
 
                 # VRML2 Transform composition: M = T . C . R . SR . S . SR^-1 . C^-1
                 # "center" sets the local pivot for rotation/scale — a part rotated
@@ -942,6 +1123,41 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                 else:
                     current_matrix = current_matrix @ M
                     stack.append((ncs, nce, current_matrix, current_coord, list(current_color)))
+
+            # VRML 1.0 standalone property nodes — stateful, they apply to all
+            # later siblings in the current separator scope. Files built from
+            # these (instead of Transform/MatrixTransform) previously lost ALL
+            # placement, piling every part at the origin.
+            elif node == 'Translation':
+                tr = _TR1_RE.search(text, ncs, nce)
+                if tr:
+                    T = np.eye(4)
+                    T[0, 3] = float(tr.group(1))
+                    T[1, 3] = float(tr.group(2))
+                    T[2, 3] = float(tr.group(3))
+                    current_matrix = current_matrix @ T
+
+            elif node == 'Rotation':
+                ro = _RO1_RE.search(text, ncs, nce)
+                if ro:
+                    current_matrix = current_matrix @ _axis_angle_to_mat4(
+                        float(ro.group(1)), float(ro.group(2)),
+                        float(ro.group(3)), float(ro.group(4)))
+
+            elif node == 'Scale':
+                sc = _SC1_RE.search(text, ncs, nce)
+                if sc:
+                    sx = float(sc.group(1))
+                    sy = float(sc.group(2)) if sc.group(2) else sx
+                    sz = float(sc.group(3)) if sc.group(3) else sx
+                    current_matrix = current_matrix @ np.diag([sx, sy, sz, 1.0])
+
+            elif node in _PRIMITIVE_NODES:
+                # VRML 1.0 primitive sitting directly in a Separator
+                prim = _primitive_mesh(node, text, ncs, nce)
+                if prim is not None:
+                    color = list(_DEFAULT_COLOR) if color_mode == 'gray' else list(current_color)
+                    collector.add_raw(prim[0], prim[1], current_matrix, color)
 
             elif node == 'Coordinate3':
                 pt_m = _PT_RE.search(text, ncs, nce)
@@ -1004,6 +1220,11 @@ def _walk(text, collector, brace_idx, def_map, field_use_positions,
                             color = list(_DEFAULT_COLOR) if color_mode == 'gray' else list(shape_color)
                             collector.add_ifs(text, ccs, cce, brace_idx, def_map,
                                               current_matrix, color, shape_coord)
+                        elif child_node in _PRIMITIVE_NODES:
+                            prim = _primitive_mesh(child_node, text, ccs, cce)
+                            if prim is not None:
+                                color = list(_DEFAULT_COLOR) if color_mode == 'gray' else list(shape_color)
+                                collector.add_raw(prim[0], prim[1], current_matrix, color)
                     else:
                         field_name, use_name = a, b
                         entry = def_map.get(use_name)
@@ -1099,12 +1320,30 @@ def _simplify(mesh, max_faces):
 def _parse_vrml(src: Path, color_mode: str, max_faces: int = 500_000, progress_cb=None):
     import trimesh
     logger.info('Reading %s (%.1f MB) …', src.name, src.stat().st_size / 1e6)
-    text = src.read_text(encoding='utf-8', errors='replace')
+    # latin-1, not utf-8: geometry is pure ASCII, but part-name comments often
+    # contain stray high bytes (µ, ®, umlauts in legacy encodings). With utf-8
+    # + errors='replace' a single bad byte inserts U+FFFD, which forces Python
+    # to store the WHOLE string at 2 bytes/char — a 4 GB file suddenly needs
+    # 8 GB and the process dies. latin-1 maps every byte 1:1 and stays compact.
+    text = src.read_text(encoding='latin-1')
 
     # Detect VRML version from header — used to choose Transform scoping behavior.
     # VRML 2.0 Transform is a grouping node (tree-scoped); VRML 1.0 is stateful.
+    # Must run before comment stripping (the header line IS a comment).
     is_vrml2 = bool(re.match(r'\s*#VRML\s+V2', text[:120]))
     logger.info('VRML version: %s', '2.0' if is_vrml2 else '1.0')
+
+    if progress_cb:
+        progress_cb(3, 100, 'Stripping comments…')
+    n_inline = len(_INLINE_RE.findall(text))
+    text = _strip_comments(text)
+
+    warnings_out = []
+    if n_inline:
+        warnings_out.append(
+            f'File references {n_inline} external file(s) via Inline/WWWInline — '
+            'those parts are NOT in this file and cannot be converted. '
+            'Re-export the assembly as a single monolithic WRL to include them.')
 
     if progress_cb:
         progress_cb(5, 100, 'Building index…')
@@ -1141,13 +1380,19 @@ def _parse_vrml(src: Path, color_mode: str, max_faces: int = 500_000, progress_c
                 collector.total_faces, len(collector._geo_cache),
                 len(collector._groups), collector.skipped, sample_colors)
 
+    if collector.skipped > 0:
+        warnings_out.append(
+            f'{collector.skipped:,} shape instance(s) were skipped because the '
+            f'face limit ({max_faces:,}) or per-part instance limit was reached — '
+            'some parts are missing from the output. Increase "Max faces" and convert again.')
+
     if progress_cb:
         progress_cb(82, 100, 'Finalizing meshes…')
     meshes = collector.finalize()
     if not meshes:
         raise ValueError('No geometry found in file.')
     logger.info('Final: %d color groups', len(meshes))
-    return meshes
+    return meshes, warnings_out
 
 def _build_glb_scene(meshes):
     """
@@ -1450,7 +1695,8 @@ def _run_job(jid, tmp_path, out_format, max_faces, color_mode):
             last_pct[0] = pct
             _job_set(jid, pct=pct, label=label)
 
-        meshes = _parse_vrml(tmp_path, color_mode, max_faces=max_faces, progress_cb=cb)
+        meshes, parse_warnings = _parse_vrml(tmp_path, color_mode,
+                                             max_faces=max_faces, progress_cb=cb)
 
         _job_set(jid, pct=93, label=f'Exporting {out_format.upper()}…')
 
@@ -1479,9 +1725,17 @@ def _run_job(jid, tmp_path, out_format, max_faces, color_mode):
         out_path.write_bytes(out_bytes)
 
         _job_set(jid, pct=100, label='Done!', status='done',
-                 out_path=str(out_path), parts=len(meshes), size=len(out_bytes))
-        logger.info('Job %s done: %.2f MB → %s', jid, len(out_bytes) / 1e6, out_path)
+                 out_path=str(out_path), parts=len(meshes), size=len(out_bytes),
+                 warnings=parse_warnings)
+        logger.info('Job %s done: %.2f MB → %s (warnings: %d)',
+                    jid, len(out_bytes) / 1e6, out_path, len(parse_warnings))
 
+    except MemoryError:
+        logger.error('Job %s failed: out of memory', jid)
+        _job_set(jid, status='error',
+                 error='Out of memory — the file is too large for the available RAM. '
+                       'Close other applications, use a machine with more memory, '
+                       'or lower "Max faces" and try again.')
     except Exception:
         logger.error('Job %s failed:\n%s', jid, traceback.format_exc())
         _job_set(jid, status='error', error='Conversion failed — check server log.')
@@ -1523,7 +1777,7 @@ def start():
     with _jobs_lock:
         _jobs[jid] = {'status': 'running', 'pct': 2, 'label': 'Queued…',
                       'result': None, 'format': out_format, 'orig_stem': orig_stem,
-                      'parts': 0, 'size': 0, 'error': ''}
+                      'parts': 0, 'size': 0, 'error': '', 'warnings': []}
     threading.Thread(target=_run_job,
                      args=(jid, tmp_path, out_format, max_faces, color_mode),
                      daemon=True).start()
@@ -1577,6 +1831,7 @@ def progress(jid):
                 'parts':  job.get('parts', 0),
                 'size':   job.get('size', 0),
                 'error':  job.get('error', ''),
+                'warnings': job.get('warnings', []),
                 'orig_size':          job.get('orig_size', 0),
                 'faces_before':       job.get('faces_before', 0),
                 'faces_after':        job.get('faces_after', 0),
@@ -1605,6 +1860,7 @@ def progress_once(jid):
     return jsonify(pct=job.get('pct',0), label=job.get('label','…'),
                    status=job.get('status','running'), parts=job.get('parts',0),
                    size=job.get('size',0), error=job.get('error',''),
+                   warnings=job.get('warnings',[]),
                    orig_size=job.get('orig_size',0), faces_before=job.get('faces_before',0),
                    faces_after=job.get('faces_after',0), textures_processed=job.get('textures_processed',0),
                    used_draco=job.get('used_draco',False))
