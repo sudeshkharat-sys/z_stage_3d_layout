@@ -126,6 +126,14 @@ HTML = r"""
   .checkbox-row { display: flex; align-items: flex-start; gap: .6rem; font-size: .85rem;
     color: #94a3b8; cursor: pointer; }
   .checkbox-row input[type=checkbox] { margin-top: .2rem; accent-color: #7dd3fc; flex-shrink: 0; }
+  .swatch-row { display: flex; align-items: center; gap: .75rem; padding: .6rem 0; border-bottom: 1px solid #334155; }
+  .swatch-row:last-child { border-bottom: none; }
+  .swatch-row .old-chip { width: 28px; height: 28px; border-radius: 6px; border: 1px solid #334155; flex-shrink: 0; }
+  .swatch-row .arrow { color: #64748b; }
+  .swatch-row input[type=color] { width: 44px; height: 32px; border: 1px solid #334155; border-radius: 6px;
+    background: #0f172a; padding: 2px; cursor: pointer; }
+  .swatch-row .meta { flex: 1; font-size: .82rem; color: #94a3b8; }
+  .swatch-row .meta .tex-note { color: #d97706; }
 </style>
 </head>
 <body>
@@ -135,6 +143,7 @@ HTML = r"""
   <div class="tabs">
     <div class="tab active" id="tabBtnConvert" onclick="showTab('convert')">VRML / WRL &rarr; GLB</div>
     <div class="tab" id="tabBtnCompress" onclick="showTab('compress')">Compress GLB</div>
+    <div class="tab" id="tabBtnRecolor" onclick="showTab('recolor')">Recolor GLB</div>
   </div>
 
   <div class="panel active" id="panelConvert">
@@ -219,13 +228,37 @@ HTML = r"""
     </div>
     <div class="result" id="resultBoxCompress"></div>
   </div>
+
+  <div class="panel" id="panelRecolor">
+    <label>1. Choose a GLB file</label>
+    <div class="drop-zone" id="dropZoneRecolor" onclick="document.getElementById('recolorInput').click()">
+      <input type="file" id="recolorInput" accept=".glb" onchange="onRecolorChosen(this)"/>
+      <div class="icon">&#127912;</div>
+      <div>Click to browse or drag &amp; drop</div>
+      <div class="hint">.glb only &mdash; detects each part's flat color</div>
+      <div class="chosen" id="chosenRecolorName"></div>
+    </div>
+    <button id="detectBtn" onclick="detectColors()" disabled>Detect colors</button>
+    <div id="swatchWrap" style="display:none;margin-top:1.5rem">
+      <label>2. Pick a new color for each</label>
+      <div id="swatchList"></div>
+      <button id="applyBtn" onclick="applyRecolor()" style="margin-top:1rem">Apply &amp; export</button>
+    </div>
+    <div class="progress-wrap" id="progressWrapRecolor">
+      <div class="progress-bar"><div class="progress-fill" id="progressFillRecolor" style="width:100%"></div></div>
+      <div class="progress-label" id="progressLabelRecolor">Working…</div>
+    </div>
+    <div class="result" id="resultBoxRecolor"></div>
+  </div>
 </div>
 <script>
 function showTab(name){
   document.getElementById('tabBtnConvert').classList.toggle('active', name==='convert');
   document.getElementById('tabBtnCompress').classList.toggle('active', name==='compress');
+  document.getElementById('tabBtnRecolor').classList.toggle('active', name==='recolor');
   document.getElementById('panelConvert').classList.toggle('active', name==='convert');
   document.getElementById('panelCompress').classList.toggle('active', name==='compress');
+  document.getElementById('panelRecolor').classList.toggle('active', name==='recolor');
 }
 function fmt(b){if(b>1e9)return(b/1e9).toFixed(1)+' GB';if(b>1e6)return(b/1e6).toFixed(1)+' MB';return(b/1e3).toFixed(0)+' KB';}
 
@@ -333,6 +366,91 @@ function compress(){
     rb.innerHTML='✅ Compressed!<div class="stats">'+fmt(d.orig_size)+' &rarr; '+fmt(d.size)+' ('+pct+'% smaller)<br/>Faces: '+d.faces_before+' &rarr; '+d.faces_after+'<br/>Textures processed: '+d.textures_processed+(d.used_draco?'<br/>Draco geometry compression: applied':'')+'</div>'
       +'<a href="/download/'+jid+'" download="'+fname+'" class="dl-btn">⬇ Download '+fname+'</a>';
   });
+}
+
+// ── Tab 3: Recolor GLB ────────────────────────────────────────────────────────
+let chosenRecolorFile=null, recolorJobId=null, recolorColors=[];
+const dzRecolor=document.getElementById('dropZoneRecolor');
+dzRecolor.addEventListener('dragover',e=>{e.preventDefault();dzRecolor.classList.add('dragover');});
+dzRecolor.addEventListener('dragleave',()=>dzRecolor.classList.remove('dragover'));
+dzRecolor.addEventListener('drop',e=>{e.preventDefault();dzRecolor.classList.remove('dragover');const f=e.dataTransfer.files[0];if(f)setRecolorFile(f);});
+function onRecolorChosen(i){if(i.files[0])setRecolorFile(i.files[0]);}
+function setRecolorFile(f){
+  chosenRecolorFile=f;
+  document.getElementById('chosenRecolorName').textContent=f.name+'  ('+fmt(f.size)+')';
+  document.getElementById('detectBtn').disabled=false;
+  document.getElementById('swatchWrap').style.display='none';
+  document.getElementById('resultBoxRecolor').style.display='none';
+  recolorJobId=null;
+}
+function recolorFail(msg){
+  const rb=document.getElementById('resultBoxRecolor');
+  rb.className='result err';rb.style.display='block';rb.textContent='✗ '+msg;
+  document.getElementById('progressWrapRecolor').style.display='none';
+}
+async function detectColors(){
+  if(!chosenRecolorFile)return;
+  document.getElementById('detectBtn').disabled=true;
+  document.getElementById('resultBoxRecolor').style.display='none';
+  document.getElementById('progressLabelRecolor').textContent='Reading GLB…';
+  document.getElementById('progressWrapRecolor').style.display='block';
+  const form=new FormData();
+  form.append('file',chosenRecolorFile);
+  try{
+    const r=await fetch('/inspect_colors',{method:'POST',body:form});
+    const d=await r.json();
+    document.getElementById('progressWrapRecolor').style.display='none';
+    document.getElementById('detectBtn').disabled=false;
+    if(!r.ok){recolorFail(d.detail||'Could not read file.');return;}
+    recolorJobId=d.job_id; recolorColors=d.colors;
+    const list=document.getElementById('swatchList');
+    list.innerHTML='';
+    d.colors.forEach((c,i)=>{
+      const row=document.createElement('div'); row.className='swatch-row';
+      row.innerHTML=
+        '<div class="old-chip" style="background:'+c.hex+'"></div>'
+        +'<span class="arrow">&rarr;</span>'
+        +'<input type="color" id="swatch_'+i+'" value="'+c.hex+'"/>'
+        +'<span class="meta">'+c.hex+' &mdash; used by '+c.count+' part(s)'
+        +(c.textured?' <span class="tex-note">(textured &mdash; only the base tint changes)</span>':'')+'</span>';
+      list.appendChild(row);
+    });
+    document.getElementById('swatchWrap').style.display='block';
+  }catch(e){
+    document.getElementById('progressWrapRecolor').style.display='none';
+    document.getElementById('detectBtn').disabled=false;
+    recolorFail('Network error during upload.');
+  }
+}
+async function applyRecolor(){
+  if(!recolorJobId)return;
+  const applyBtn=document.getElementById('applyBtn');
+  applyBtn.disabled=true;
+  document.getElementById('progressLabelRecolor').textContent='Recoloring…';
+  document.getElementById('progressWrapRecolor').style.display='block';
+  document.getElementById('resultBoxRecolor').style.display='none';
+  const colorMap={};
+  recolorColors.forEach((c,i)=>{
+    const picked=document.getElementById('swatch_'+i).value;
+    if(picked.toLowerCase()!==c.hex.toLowerCase())colorMap[c.hex]=picked;
+  });
+  try{
+    const r=await fetch('/recolor',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({job_id:recolorJobId,colors:colorMap})});
+    const d=await r.json();
+    document.getElementById('progressWrapRecolor').style.display='none';
+    applyBtn.disabled=false;
+    if(!r.ok){recolorFail(d.detail||'Recolor failed.');return;}
+    const fname=(chosenRecolorFile.name.replace(/\.[^.]+$/,''))+'_recolored.glb';
+    const rb=document.getElementById('resultBoxRecolor');
+    rb.className='result ok';rb.style.display='block';
+    rb.innerHTML='✅ Recolored!<div class="stats">Output size: '+fmt(d.size)+'<br/>Parts changed: '+d.changed+'</div>'
+      +'<a href="/download/'+d.job_id+'" download="'+fname+'" class="dl-btn">⬇ Download '+fname+'</a>';
+  }catch(e){
+    document.getElementById('progressWrapRecolor').style.display='none';
+    applyBtn.disabled=false;
+    recolorFail('Network error while recoloring.');
+  }
 }
 </script>
 </body></html>
@@ -1523,6 +1641,134 @@ def _ensure_material(mesh):
     return mesh
 
 
+# ── GLB recolor ─────────────────────────────────────────────────────────────────
+def _rgb_to_hex(rgb):
+    r, g, b = (int(round(float(x))) for x in rgb[:3])
+    return '#{:02x}{:02x}{:02x}'.format(max(0, min(255, r)), max(0, min(255, g)), max(0, min(255, b)))
+
+
+def _hex_to_rgb(hexcol):
+    h = hexcol.lstrip('#')
+    return [int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)]
+
+
+def _material_rgba(material):
+    """Return a material's flat color as a 0-255 RGBA list, or None if textured/absent.
+
+    trimesh normalizes PBRMaterial.baseColorFactor and the legacy
+    SimpleMaterial.diffuse to 0-255 uint8 arrays regardless of how they were
+    constructed (0-1 floats or 0-255 ints), so no scale detection is needed.
+    """
+    if material is None:
+        return None
+    bcf = getattr(material, 'baseColorFactor', None)
+    if bcf is not None:
+        bcf = list(bcf)
+        return (bcf + [255])[:4]
+    diff = getattr(material, 'diffuse', None)
+    if diff is not None:
+        diff = list(diff)
+        return (diff + [255])[:4]
+    return None
+
+
+def _material_has_texture(material):
+    if material is None:
+        return False
+    return any(getattr(material, attr, None) is not None
+               for attr in ('image', 'baseColorTexture', 'metallicRoughnessTexture', 'normalTexture'))
+
+
+def _extract_scene_colors(scene):
+    """List the distinct flat colors used across a scene's geometry.
+
+    Groups every part by its rounded RGB hex so e.g. 40 black bolts show up
+    as one 'black' swatch instead of 40 duplicates. Textured parts are
+    listed too (tagged) but their base tint, not the texture image, is what
+    gets edited — recoloring baked-in texture pixels is out of scope.
+    """
+    groups = {}
+    for _, mesh in scene.geometry.items():
+        visual = mesh.visual
+        hexcol, textured = None, False
+        if hasattr(visual, 'material') and visual.material is not None:
+            rgba = _material_rgba(visual.material)
+            if rgba is not None:
+                hexcol = _rgb_to_hex(rgba)
+                textured = _material_has_texture(visual.material)
+        elif getattr(visual, 'kind', None) == 'vertex':
+            vc = getattr(visual, 'vertex_colors', None)
+            if vc is not None and len(vc):
+                vc = np.asarray(vc)
+                uniq, counts = np.unique(vc[:, :3], axis=0, return_counts=True)
+                hexcol = _rgb_to_hex(uniq[np.argmax(counts)])
+        if hexcol is None:
+            continue
+        g = groups.setdefault(hexcol, {'count': 0, 'textured': False})
+        g['count'] += 1
+        g['textured'] = g['textured'] or textured
+    return sorted(
+        [{'hex': h, 'count': v['count'], 'textured': v['textured']} for h, v in groups.items()],
+        key=lambda d: -d['count'])
+
+
+def _apply_recolor(scene, color_map):
+    """Replace every part whose current flat color hex is a key in color_map
+    with the mapped hex. Returns the number of parts actually changed.
+
+    trimesh's glTF loader shares one material object across every geometry
+    that had the same color, so mutating it while iterating would make the
+    second geometry's "current color" already be the new one, undercounting
+    matches. Each geometry's original color is captured in a first pass,
+    before any mutation happens.
+    """
+    original_hexes = []
+    for _, mesh in scene.geometry.items():
+        visual = mesh.visual
+        hexcol = None
+        if hasattr(visual, 'material') and visual.material is not None:
+            rgba = _material_rgba(visual.material)
+            hexcol = _rgb_to_hex(rgba) if rgba is not None else None
+        original_hexes.append(hexcol)
+
+    changed = 0
+    for (_, mesh), old_hex in zip(scene.geometry.items(), original_hexes):
+        visual = mesh.visual
+        if hasattr(visual, 'material') and visual.material is not None:
+            if old_hex is None:
+                continue
+            new_hex = color_map.get(old_hex)
+            if not new_hex:
+                continue
+            material = visual.material
+            rgba = _material_rgba(material)
+            r, g, b = _hex_to_rgb(new_hex)
+            if hasattr(material, 'baseColorFactor') and material.baseColorFactor is not None:
+                material.baseColorFactor = [r, g, b, int(rgba[3])]
+            elif hasattr(material, 'diffuse') and material.diffuse is not None:
+                material.diffuse = [r, g, b, int(rgba[3])]
+            changed += 1
+        elif getattr(visual, 'kind', None) == 'vertex':
+            vc = getattr(visual, 'vertex_colors', None)
+            if vc is None or not len(vc):
+                continue
+            vc = np.array(vc)
+            uniq = np.unique(vc[:, :3], axis=0)
+            touched = False
+            for u in uniq:
+                new_hex = color_map.get(_rgb_to_hex(u))
+                if not new_hex:
+                    continue
+                mask = np.all(vc[:, :3] == u, axis=1)
+                r, g, b = _hex_to_rgb(new_hex)
+                vc[mask, 0], vc[mask, 1], vc[mask, 2] = r, g, b
+                touched = True
+            if touched:
+                visual.vertex_colors = vc
+                changed += 1
+    return changed
+
+
 def _average_by_mapping(values, mapping, n_new):
     """Average per-vertex attribute rows into n_new groups given a mapping array."""
     values = np.asarray(values, dtype=np.float64)
@@ -1813,6 +2059,74 @@ def start_compress():
                      args=(jid, tmp_path, tex_max_size, tex_quality, geo_reduce, draco_output),
                      daemon=True).start()
     return jsonify(job_id=jid)
+
+
+@app.route('/inspect_colors', methods=['POST'])
+def inspect_colors():
+    import trimesh
+
+    f = request.files.get('file')
+    if not f or not f.filename:
+        return jsonify(detail='No file received.'), 400
+    ext = f.filename.rsplit('.', 1)[-1].lower()
+    if ext != 'glb':
+        return jsonify(detail=f'Only .glb supported (got .{ext}).'), 400
+
+    with tempfile.NamedTemporaryFile(suffix='.glb', delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+        f.save(tmp)
+
+    try:
+        scene = trimesh.load(tmp_path, file_type='glb', process=False, force='scene')
+        colors = _extract_scene_colors(scene)
+    except Exception:
+        logger.error('Color inspect failed:\n%s', traceback.format_exc())
+        tmp_path.unlink(missing_ok=True)
+        return jsonify(detail='Could not read GLB — file may be corrupt.'), 400
+
+    if not colors:
+        tmp_path.unlink(missing_ok=True)
+        return jsonify(detail='No flat colors found on this model (all-texture models are not supported).'), 400
+
+    jid = str(uuid.uuid4())
+    with _jobs_lock:
+        _jobs[jid] = {'status': 'inspected', 'tmp_path': str(tmp_path),
+                      'orig_stem': f.filename.rsplit('.', 1)[0]}
+    return jsonify(job_id=jid, colors=colors)
+
+
+@app.route('/recolor', methods=['POST'])
+def recolor():
+    import trimesh
+
+    data = request.get_json(silent=True) or {}
+    src_jid = data.get('job_id')
+    color_map = data.get('colors') or {}
+    job = _job_get(src_jid) if src_jid else None
+    tmp_path = Path(job['tmp_path']) if job and job.get('tmp_path') else None
+    if not tmp_path or not tmp_path.exists():
+        return jsonify(detail='Original upload expired — please choose the file again.'), 400
+
+    try:
+        scene = trimesh.load(tmp_path, file_type='glb', process=False, force='scene')
+        changed = _apply_recolor(scene, color_map)
+        raw = scene.export(file_type='glb')
+        out_bytes = bytes(raw) if not isinstance(raw, bytes) else raw
+    except Exception:
+        logger.error('Recolor failed:\n%s', traceback.format_exc())
+        return jsonify(detail='Recolor failed — check server log.'), 500
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    jid = str(uuid.uuid4())
+    out_path = tmp_path.parent / f'{jid}.glb'
+    out_path.write_bytes(out_bytes)
+    orig_stem = (job.get('orig_stem', 'model') if job else 'model') + '_recolored'
+    with _jobs_lock:
+        _jobs[jid] = {'status': 'done', 'format': 'glb', 'orig_stem': orig_stem,
+                      'out_path': str(out_path), 'size': len(out_bytes)}
+    logger.info('Recolor %s: %d part(s) changed, %.2f MB', jid, changed, len(out_bytes) / 1e6)
+    return jsonify(job_id=jid, size=len(out_bytes), changed=changed)
 
 
 @app.route('/progress/<jid>')
